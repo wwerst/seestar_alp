@@ -85,6 +85,10 @@ from scripts.trajectory.observer import (
     fetch_telescope_lonlat,
     lookup_elevation,
 )
+from scripts.trajectory.terrain_los import (
+    DEFAULT_EYE_HEIGHT_AGL_M,
+    dem_lookup_elevation,
+)
 
 # Re-exports for backwards compatibility with existing tests that
 # import these names from this module. New code should import from
@@ -128,6 +132,37 @@ def _read_encoder(cli: AlpacaClient) -> tuple[float, float]:
     return alt, az
 
 
+def _filter_with_optional_terrain(
+    landmarks: list[Landmark],
+    site: ObserverSite,
+    *,
+    top_n: int = 10,
+    min_el_deg: float = 0.3,
+) -> tuple[list[tuple[Landmark, float, float, float]], list[Landmark]]:
+    """Run ``filter_visible`` first with terrain LoS checking, falling
+    back to the plain horizon+slant filter if the DEM isn't available.
+
+    Returns ``(hits, dropped_by_terrain)`` — ``dropped_by_terrain`` is
+    the set of landmarks that the horizon+slant filter kept but the
+    terrain filter rejected, so the REPL can show them in a "dropped
+    because behind terrain" list.
+    """
+    plain = filter_visible(landmarks, site, min_el_deg=min_el_deg,
+                           top_n=top_n)
+    try:
+        terrain_hits = filter_visible(
+            landmarks, site, min_el_deg=min_el_deg, top_n=top_n,
+            check_terrain=True,
+        )
+    except Exception as exc:
+        _print(f"[calibrate] [warn] terrain LoS unavailable ({exc}); "
+               "continuing without it")
+        return plain, []
+    terrain_oas = {h[0].oas for h in terrain_hits}
+    dropped = [h[0] for h in plain if h[0].oas not in terrain_oas]
+    return terrain_hits, dropped
+
+
 def _choose_targets(
     site: ObserverSite,
     *,
@@ -135,8 +170,11 @@ def _choose_targets(
 ) -> list[tuple[Landmark, float, float, float]]:
     """Decide which landmarks to sight. Prefer the two hardcoded
     defaults when both are above-horizon; otherwise fetch DOF and
-    offer up to 10 visible candidates."""
-    default_hits = filter_visible(list(DEFAULT_LANDMARKS), site, min_el_deg=0.3)
+    offer up to 10 visible candidates. When a DEM is available,
+    terrain LoS rejects candidates behind intervening ridges."""
+    default_hits, _default_dropped = _filter_with_optional_terrain(
+        list(DEFAULT_LANDMARKS), site, min_el_deg=0.3,
+    )
     if len(default_hits) >= 2:
         _print("[calibrate] using default landmarks: "
                + ", ".join(h[0].oas for h in default_hits[:2]))
@@ -151,7 +189,9 @@ def _choose_targets(
             f"Either connect to the internet or pre-download the zip to\n"
             f"  {_repo_cache_hint()}"
         ) from exc
-    hits = filter_visible(candidates, site, top_n=10)
+    hits, dropped_terrain = _filter_with_optional_terrain(
+        candidates, site, top_n=10, min_el_deg=0.3,
+    )
     if not hits:
         raise SystemExit("no visible DOF landmarks within 20 km — move the site?")
 
@@ -161,6 +201,9 @@ def _choose_targets(
         _print(f"  [{i:2d}] {lm.oas}  {lm.name[:35]:<35}  "
                f"az={az:6.2f}°  el={el:5.2f}°  slant={slant/1000:4.1f}km  "
                f"{lit_flag}")
+    if dropped_terrain:
+        _print("[calibrate] dropped because terrain blocks the path: "
+               + ", ".join(lm.oas for lm in dropped_terrain))
     if not interactive:
         return hits[:2]
     picks: list[int] = []
@@ -347,12 +390,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="calibration output path (default device/mount_calibration.json)")
     parser.add_argument("--altitude-m", type=float, default=None,
                         help="Observer altitude in metres AMSL. Overrides --altitude-source.")
-    parser.add_argument("--altitude-source", choices=("menu", "lookup", "prior", "prompt"),
+    parser.add_argument("--altitude-source",
+                        choices=("menu", "dem_lookup", "lookup", "prior", "prompt"),
                         default="menu",
                         help="Where to get the altitude from when --altitude-m is absent. "
                              "'menu' (default) shows an interactive chooser with a smart "
-                             "default; 'lookup' hits Open-Meteo; 'prior' reuses the last "
-                             "calibration's altitude; 'prompt' asks the user.")
+                             "default; 'dem_lookup' reads the SRTM DEM tile covering the "
+                             "observer and adds a 1.6 m eye-height; 'lookup' hits "
+                             "Open-Meteo; 'prior' reuses the last calibration's altitude; "
+                             "'prompt' asks the user.")
     parser.add_argument("--yes-clear", action="store_true",
                         help="Non-interactive: clear prior calibration (backup to .bak) "
                              "before starting.")
@@ -488,6 +534,14 @@ def _resolve_altitude(
                f"{prior.observer_alt_m:.2f} m AMSL")
         return float(prior.observer_alt_m)
 
+    if source == "dem_lookup":
+        ground = dem_lookup_elevation(lat_deg, lon_deg)
+        eye = float(ground) + DEFAULT_EYE_HEIGHT_AGL_M
+        _print(f"[calibrate] altitude from DEM (SRTM): ground "
+               f"{ground:.2f} m + eye {DEFAULT_EYE_HEIGHT_AGL_M:.1f} m "
+               f"= {eye:.2f} m AMSL")
+        return eye
+
     if source == "lookup":
         elev = lookup_elevation(lat_deg, lon_deg)
         _print(f"[calibrate] altitude from Open-Meteo: {elev:.2f} m AMSL")
@@ -504,14 +558,30 @@ def _altitude_menu(
     lat_deg: float, lon_deg: float,
     prior: PriorInfo | None, prior_available: bool,
 ) -> float:
-    """Interactive altitude source chooser. Default is 'prior' if
-    available (most accurate for re-runs), else 'lookup' if network
-    is present, else 'manual'."""
-    options: list[tuple[str, str]] = [("lookup", "elevation lookup (Open-Meteo)")]
+    """Interactive altitude source chooser.
+
+    Options (in order):
+        [1] DEM lookup (recommended) — SRTM tile + 1.6 m eye height.
+            Same DEM feeds terrain-LoS, so the observer is guaranteed
+            not to be below ground by construction.
+        [2] Open-Meteo elevation lookup.
+        [3] (if local prior present) prior calibration altitude.
+        [4] manual entry.
+
+    The default is [1] DEM lookup; the menu re-displays on lookup
+    failure so the user can fall back.
+    """
+    options: list[tuple[str, str]] = [
+        ("dem_lookup", "DEM lookup (recommended, SRTM + 1.6 m eye)"),
+        ("lookup", "elevation lookup (Open-Meteo)"),
+    ]
     if prior_available:
-        options.append(("prior", f"use prior calibration ({prior.observer_alt_m:.2f} m)"))
+        options.append((
+            "prior",
+            f"use prior calibration ({prior.observer_alt_m:.2f} m)",
+        ))
     options.append(("manual", "enter manually"))
-    default_idx = 1 + (options.index(("prior", options[1][1])) if prior_available else 0)
+    default_idx = 1  # DEM lookup
     while True:
         _print("Observer altitude — pick a source:")
         for i, (_key, desc) in enumerate(options, start=1):
@@ -529,6 +599,16 @@ def _altitude_menu(
             _print("  out of range; try again")
             continue
         key = options[idx - 1][0]
+        if key == "dem_lookup":
+            try:
+                ground = dem_lookup_elevation(lat_deg, lon_deg)
+            except RuntimeError as exc:
+                _print(f"  [DEM lookup failed] {exc}")
+                continue  # re-show menu
+            eye = float(ground) + DEFAULT_EYE_HEIGHT_AGL_M
+            _print(f"  → DEM {ground:.2f} m + eye "
+                   f"{DEFAULT_EYE_HEIGHT_AGL_M:.1f} m = {eye:.2f} m AMSL")
+            return eye
         if key == "lookup":
             try:
                 elev = lookup_elevation(lat_deg, lon_deg)

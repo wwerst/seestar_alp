@@ -51,6 +51,14 @@ class ObserverSite:
     ecef_y: float
     ecef_z: float
     enu_rotation: np.ndarray  # shape (3, 3), dtype float64. Rows are E, N, U in ECEF.
+    # Height of the tripod base above the local DEM-defined ground
+    # (m). Default 0.0 means "tripod is on the ground"; nonzero values
+    # are for jetty / balcony / rooftop setups where ``alt_m`` isn't
+    # simply ``DEM(lat, lon) + eye_height``. Phase-2 setup wizard will
+    # let users enter this; MVP keeps it at 0 with no UI surface but
+    # plumbs the field through so terrain-LoS can honour a user
+    # override if someone sets it.
+    platform_height_agl_m: float = 0.0
 
     @property
     def ecef_xyz(self) -> np.ndarray:
@@ -75,6 +83,8 @@ def build_site(
     lat_deg: float = OBSERVER_LAT_DEG,
     lon_deg: float = OBSERVER_LON_DEG,
     alt_m: float = OBSERVER_ALT_M,
+    *,
+    platform_height_agl_m: float = 0.0,
 ) -> ObserverSite:
     loc = EarthLocation.from_geodetic(
         lon=lon_deg * u.deg, lat=lat_deg * u.deg, height=alt_m * u.m,
@@ -87,6 +97,7 @@ def build_site(
         lat_deg=lat_deg, lon_deg=lon_deg, alt_m=alt_m,
         ecef_x=x, ecef_y=y, ecef_z=z,
         enu_rotation=_enu_rotation(lat_deg, lon_deg),
+        platform_height_agl_m=float(platform_height_agl_m),
     )
 
 

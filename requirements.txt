@@ -31,3 +31,8 @@ sdnotify==0.3.2
 pyhocon==0.3.61
 pydantic==2.11.7
 cryptography>=39.0.0
+# Terrain line-of-sight: DEM tile I/O + WGS-84 geodesic paths.
+# See scripts/trajectory/terrain_los.py and plans/terrain_los.md.
+rasterio==1.5.0
+pyproj==3.7.2
+geographiclib==2.1
