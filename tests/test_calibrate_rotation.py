@@ -476,21 +476,28 @@ def test_resolve_altitude_source_prompt(monkeypatch):
     assert val == pytest.approx(99.5)
 
 
-def test_altitude_menu_default_lookup_no_prior(monkeypatch):
-    """With no prior available, default should be [1] lookup."""
+def test_altitude_menu_default_dem_lookup(monkeypatch):
+    """With DEM available, default is [1] DEM lookup.
+
+    Menu layout: [1] DEM, [2] Open-Meteo, [3] manual (no prior here).
+    """
     monkeypatch.setattr("builtins.input", lambda _p: "")  # accept default
     with mock.patch(
-        "scripts.trajectory.calibrate_rotation.lookup_elevation",
-        return_value=2.0,
+        "scripts.trajectory.calibrate_rotation.dem_lookup_elevation",
+        return_value=0.5,
     ) as m:
         val = _altitude_menu(33.96, -118.46, prior=None, prior_available=False)
-    assert val == 2.0
+    # ground 0.5 + eye 1.6 = 2.1 m AMSL
+    assert val == pytest.approx(2.1, abs=1e-6)
     m.assert_called_once()
 
 
-def test_altitude_menu_prior_becomes_default(monkeypatch):
-    """When prior is local, the menu's default shifts to [2] prior."""
-    monkeypatch.setattr("builtins.input", lambda _p: "")  # accept default
+def test_altitude_menu_prior_available_still_defaults_to_dem(monkeypatch):
+    """DEM lookup is always the default (MVP §D.1). When a prior
+    exists, it appears at [3] but the user still has to pick it
+    explicitly."""
+    answers = iter(["3"])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
     prior = _prior(alt=11.0)
     val = _altitude_menu(
         33.96, -118.46, prior=prior, prior_available=True,
@@ -498,13 +505,33 @@ def test_altitude_menu_prior_becomes_default(monkeypatch):
     assert val == pytest.approx(11.0)
 
 
-def test_altitude_menu_lookup_failure_falls_back(monkeypatch):
-    """If lookup throws RuntimeError the menu redisplays; user picks
-    manual. Without a prior, the menu has only 2 options:
-      [1] lookup, [2] manual."""
-    answers = iter(["1", "2", "15.5"])  # try lookup → pick manual → value
+def test_altitude_menu_dem_failure_falls_back_to_open_meteo(monkeypatch):
+    """If DEM lookup throws RuntimeError the menu redisplays; user
+    can pick Open-Meteo at [2]."""
+    answers = iter(["1", "2"])  # try DEM → pick Open-Meteo
     monkeypatch.setattr("builtins.input", lambda _p: next(answers))
     with mock.patch(
+        "scripts.trajectory.calibrate_rotation.dem_lookup_elevation",
+        side_effect=RuntimeError("no net"),
+    ), mock.patch(
+        "scripts.trajectory.calibrate_rotation.lookup_elevation",
+        return_value=3.1,
+    ):
+        val = _altitude_menu(
+            33.96, -118.46, prior=None, prior_available=False,
+        )
+    assert val == pytest.approx(3.1)
+
+
+def test_altitude_menu_both_lookups_fail_user_picks_manual(monkeypatch):
+    """With both DEM and Open-Meteo failing, user falls through to
+    manual entry."""
+    answers = iter(["1", "2", "3", "15.5"])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
+    with mock.patch(
+        "scripts.trajectory.calibrate_rotation.dem_lookup_elevation",
+        side_effect=RuntimeError("no net"),
+    ), mock.patch(
         "scripts.trajectory.calibrate_rotation.lookup_elevation",
         side_effect=RuntimeError("no net"),
     ):
@@ -512,6 +539,22 @@ def test_altitude_menu_lookup_failure_falls_back(monkeypatch):
             33.96, -118.46, prior=None, prior_available=False,
         )
     assert val == pytest.approx(15.5)
+
+
+def test_resolve_altitude_source_dem_lookup(monkeypatch):
+    """--altitude-source dem_lookup calls the DEM, adds eye height,
+    and returns directly without touching the menu."""
+    with mock.patch(
+        "scripts.trajectory.calibrate_rotation.dem_lookup_elevation",
+        return_value=10.0,
+    ) as m:
+        val = _resolve_altitude(
+            _fake_args(altitude_source="dem_lookup"),
+            33.96, -118.46, None, False,
+        )
+    # 10.0 + 1.6 = 11.6
+    assert val == pytest.approx(11.6, abs=1e-6)
+    m.assert_called_once_with(33.96, -118.46)
 
 
 # ---------- pointing_uncertainty_deg ---------------------------------
