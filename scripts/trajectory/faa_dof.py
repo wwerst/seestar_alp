@@ -154,12 +154,22 @@ def filter_visible(
     min_el_deg: float = 0.3,
     max_slant_km: float = 20.0,
     top_n: int = 10,
+    check_terrain: bool = False,
+    k: float | None = None,
+    dem_source: str = "srtm1",
+    dem_provider=None,
 ) -> list[tuple[Landmark, float, float, float]]:
     """Return the top-N landmarks visible from ``site``.
 
     Visible = above ``min_el_deg`` and within ``max_slant_km`` of the
     observer. Ranked by ``(lit desc, height_amsl_m desc, slant asc)``
     so lit, tall, close obstructions bubble up first.
+
+    When ``check_terrain=True``, each remaining candidate is also run
+    through :func:`scripts.trajectory.terrain_los.check_los` and
+    dropped if the path is blocked by intervening DEM. ``k``,
+    ``dem_source``, and ``dem_provider`` are forwarded to
+    ``check_los``; leaving them ``None`` uses the module defaults.
 
     Each result tuple is ``(landmark, az_deg, el_deg, slant_m)``.
     """
@@ -173,6 +183,21 @@ def filter_visible(
         if slant > max_slant_km * 1000.0:
             continue
         out.append((lm, float(az), float(el), float(slant)))
+    if check_terrain and out:
+        # Imported here (not at module top) to keep the new rasterio /
+        # pyproj deps out of the import graph when the caller doesn't
+        # ask for terrain checks.
+        from scripts.trajectory.terrain_los import check_los
+
+        filtered: list[tuple[Landmark, float, float, float]] = []
+        for lm, az, el, slant in out:
+            los = check_los(
+                site, lm.lat_deg, lm.lon_deg, lm.height_amsl_m,
+                k=k, dem_source=dem_source, dem_provider=dem_provider,
+            )
+            if los.visible:
+                filtered.append((lm, az, el, slant))
+        out = filtered
     out.sort(key=lambda t: (not t[0].lit, -t[0].height_amsl_m, t[3]))
     return out[:top_n]
 
