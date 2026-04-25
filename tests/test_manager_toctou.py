@@ -127,31 +127,41 @@ def test_cross_manager_start_lock_serializes_concurrent_starts(monkeypatch):
             except RuntimeError as e:
                 results["track"] = e
 
-        ta = threading.Thread(target=start_cal)
-        tb = threading.Thread(target=start_track)
-        ta.start()
-        # Head start so cal's registry write happens before tracker's
-        # cross-check. With the 5 ms sleep inside _FakeCalSession.start()
-        # cal is reliably mid ``session.start()`` (registry written, but
-        # not yet alive) when tracker's cross-check fires. The shared
-        # lock turns this into "tracker waits, cal finishes, tracker's
-        # check sees alive=True and raises". Without it, tracker's check
-        # sees alive=False and both succeed.
-        time.sleep(0.001)
-        tb.start()
-        ta.join(timeout=5.0)
-        tb.join(timeout=5.0)
-        assert not ta.is_alive(), "cal thread hung"
-        assert not tb.is_alive(), "track thread hung"
+        # daemon=True so a regression that wedges these threads can't keep
+        # the pytest process alive past the test failure — CI would
+        # otherwise hang waiting for a non-daemon thread instead of
+        # surfacing the assertion failure.
+        ta = threading.Thread(target=start_cal, daemon=True)
+        tb = threading.Thread(target=start_track, daemon=True)
+        try:
+            ta.start()
+            # Head start so cal's registry write happens before tracker's
+            # cross-check. With the 5 ms sleep inside _FakeCalSession.start()
+            # cal is reliably mid ``session.start()`` (registry written, but
+            # not yet alive) when tracker's cross-check fires. The shared
+            # lock turns this into "tracker waits, cal finishes, tracker's
+            # check sees alive=True and raises". Without it, tracker's check
+            # sees alive=False and both succeed.
+            time.sleep(0.001)
+            tb.start()
+            ta.join(timeout=5.0)
+            tb.join(timeout=5.0)
+            assert not ta.is_alive(), "cal thread hung"
+            assert not tb.is_alive(), "track thread hung"
 
-        oks = [k for k, v in results.items() if v == "ok"]
-        errs = [k for k, v in results.items() if isinstance(v, RuntimeError)]
-        if not (len(oks) == 1 and len(errs) == 1):
-            bad_outcomes.append((i, dict(results)))
-
-        # Cleanup so the next iteration starts clean.
-        cal_mgr.stop(tid)
-        track_mgr.stop(tid)
+            oks = [k for k, v in results.items() if v == "ok"]
+            errs = [k for k, v in results.items() if isinstance(v, RuntimeError)]
+            if not (len(oks) == 1 and len(errs) == 1):
+                bad_outcomes.append((i, dict(results)))
+        finally:
+            # Cleanup so the next iteration starts clean, even if an
+            # assertion above fails. Best-effort: a deadlock regression
+            # may not be unblocked by stop(), but the daemon=True flag
+            # above ensures pytest can still exit.
+            cal_mgr.stop(tid)
+            track_mgr.stop(tid)
+            ta.join(timeout=1.0)
+            tb.join(timeout=1.0)
 
     assert not bad_outcomes, (
         f"cross-manager TOCTOU: {len(bad_outcomes)}/{iterations} "

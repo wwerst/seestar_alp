@@ -990,8 +990,16 @@ class CalibrationManager:
                     raise RuntimeError(
                         f"telescope {tid} already calibrating; stop first"
                     )
+                # Start the thread before publishing the session into the
+                # registry, and keep both inside ``self._lock``. Otherwise a
+                # concurrent ``stop(tid)`` can read the not-yet-started
+                # session out of the registry, call ``session.stop()`` (which
+                # only sets ``_stop_evt`` since no thread exists), and then
+                # ``session.start()`` runs here, clears the stop event, and
+                # spawns the thread anyway — the stop request is silently
+                # dropped. Mirrors LiveTrackManager.start above.
+                session.start()
                 self._sessions[tid] = session
-            session.start()
         return session
 
     def stop(self, telescope_id: int) -> CalibrationStatus | None:
