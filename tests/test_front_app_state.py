@@ -916,3 +916,311 @@ def test_sparse_template_contexts_render_without_error(template_name, context):
     html = template.render(**context)
     assert isinstance(html, str)
     assert len(html) > 0
+
+
+# ---------- Calibrate-motion routes -----------------------------------
+#
+# These tests exercise the resource handlers directly without spinning up
+# a real falcon server. The motion session is patched so the route logic
+# is exercised but no streaming-controller thread spawns. End-to-end
+# behaviour is verified by tests/test_calibrate_motion.py.
+
+
+class _DummyJSONReq:
+    """Minimal fake of a falcon request with JSON ``media`` and a few
+    convenience accessors the calibrate handlers don't use but that
+    other handlers in front_app might pick up."""
+
+    def __init__(self, body=None, params=None):
+        self.media = {} if body is None else dict(body)
+        self._params = params or {}
+
+    def get_param(self, key, default=None):
+        return self._params.get(key, default)
+
+    def get_header(self, key):
+        return None
+
+
+class _DummyJSONResp(DummyResp):
+    def __init__(self):
+        super().__init__()
+        self.status = None
+        self.text = ""
+        self.content_type = None
+
+
+class _StubMotion:
+    """Stand-in for CalibrateMotionSession that records calls without
+    spawning a streaming-controller thread."""
+
+    def __init__(self, alive=True):
+        self._alive = alive
+        self.calls = []
+        self.target = (0.0, 0.0)
+        self.jog = (0.0, 0.0)
+
+    def is_alive(self):
+        return self._alive
+
+    def stop(self, timeout=5.0):
+        self._alive = False
+
+    def set_target(self, az, el):
+        self.target = (az, el)
+        self.calls.append(("set_target", az, el))
+
+    def nudge_target(self, daz, del_):
+        self.target = (self.target[0] + daz, self.target[1] + del_)
+        self.calls.append(("nudge_target", daz, del_))
+
+    def set_jog(self, az_degs, el_degs):
+        self.jog = (az_degs, el_degs)
+        self.calls.append(("set_jog", az_degs, el_degs))
+
+    def freeze_jog(self):
+        self.jog = (0.0, 0.0)
+        self.calls.append(("freeze_jog",))
+
+    def status(self):
+        from device.calibrate_motion import MotionStatus
+
+        return MotionStatus(
+            active=self._alive,
+            phase="track",
+            elapsed_s=1.0,
+            exit_reason=None if self._alive else "stop_signal",
+            target_az_deg=self.target[0],
+            target_el_deg=self.target[1],
+            cur_cum_az_deg=self.target[0],
+            cur_el_deg=self.target[1],
+            err_az_deg=0.0,
+            err_el_deg=0.0,
+            jog_az_degs=self.jog[0],
+            jog_el_degs=self.jog[1],
+            is_settled=True,
+            tick=10,
+        )
+
+
+class _StubMgr:
+    """In-process registry that stores stubs by telescope id without
+    starting any threads — start() just registers the supplied session."""
+
+    def __init__(self):
+        self.sessions = {}
+        self.cross_check_should_refuse = False
+
+    def get(self, tid):
+        return self.sessions.get(int(tid))
+
+    def is_running(self, tid):
+        s = self.get(tid)
+        return s is not None and s.is_alive()
+
+    def start(self, session):
+        if self.cross_check_should_refuse:
+            raise RuntimeError("cross-manager refusal")
+        existing = self.sessions.get(int(session.telescope_id))
+        if existing is not None and existing.is_alive():
+            raise RuntimeError("already in calibrate-motion mode")
+        self.sessions[int(session.telescope_id)] = session
+        # Mark the session "alive" — for the stub we leave that to the
+        # stub's own state. The real session.start() spawns a thread.
+
+    def stop(self, tid):
+        s = self.sessions.get(int(tid))
+        if s is None:
+            return None
+        s.stop()
+        return s.status()
+
+    def status(self, tid):
+        s = self.get(tid)
+        return s.status() if s is not None else None
+
+
+def _patch_motion_manager(monkeypatch):
+    """Replace the singleton getter with a fresh stub registry. Returns
+    the stub so tests can inspect calls."""
+    import device.calibrate_motion as cm
+
+    mgr = _StubMgr()
+    monkeypatch.setattr(cm, "get_calibrate_motion_manager", lambda: mgr)
+    return mgr
+
+
+def test_calibrate_motion_start_returns_status(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    # Replace CalibrateMotionSession's start() so we don't spawn a thread.
+    import device.calibrate_motion as cm
+
+    original_session_cls = cm.CalibrateMotionSession
+
+    class _NoThreadSession(original_session_cls):
+        def start(self):
+            self._t_start = 1.0
+            self._phase = "track"
+
+        def is_alive(self):
+            return True
+
+        def stop(self, timeout=5.0):
+            pass
+
+    monkeypatch.setattr(cm, "CalibrateMotionSession", _NoThreadSession)
+    # Also patch the symbol where front_app imports it — it imports
+    # lazily inside on_post via ``from device.calibrate_motion import``,
+    # so the module-level patch is enough.
+
+    req = _DummyJSONReq(body={})
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionStartResource.on_post(req, resp, telescope_id=11)
+    assert resp.status is not None
+    assert "200" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert payload["active"] is True
+    # Manager registry should now hold the session.
+    assert mgr.get(11) is not None
+
+
+def test_calibrate_motion_start_idempotent_returns_existing(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    stub = _StubMotion()
+    stub.telescope_id = 12
+    mgr.sessions[12] = stub
+    req = _DummyJSONReq(body={})
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionStartResource.on_post(req, resp, telescope_id=12)
+    assert "200" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert payload["active"] is True
+
+
+def test_calibrate_motion_nudge_clamps_magnitude(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    stub = _StubMotion()
+    stub.telescope_id = 13
+    mgr.sessions[13] = stub
+    # 100° is far above the bound; the handler should clamp to 5°.
+    req = _DummyJSONReq(body={"daz": 100.0, "del": -100.0})
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionNudgeResource.on_post(req, resp, telescope_id=13)
+    assert "200" in str(resp.status)
+    kind, daz, del_ = stub.calls[-1]
+    assert kind == "nudge_target"
+    assert daz == 5.0  # _MOTION_NUDGE_BOUND_DEG
+    assert del_ == -5.0
+
+
+def test_calibrate_motion_nudge_rejects_nan(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    stub = _StubMotion()
+    stub.telescope_id = 14
+    mgr.sessions[14] = stub
+    req = _DummyJSONReq(body={"daz": float("nan"), "del": 0.0})
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionNudgeResource.on_post(req, resp, telescope_id=14)
+    assert "400" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert "invalid" in payload["error"].lower()
+    # Stub must not have received a nudge call.
+    assert stub.calls == []
+
+
+def test_calibrate_motion_nudge_404_when_no_session(monkeypatch):
+    _patch_motion_manager(monkeypatch)
+    req = _DummyJSONReq(body={"daz": 0.001, "del": 0.001})
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionNudgeResource.on_post(req, resp, telescope_id=15)
+    assert "404" in str(resp.status)
+
+
+def test_calibrate_motion_jog_clamps_rate(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    stub = _StubMotion()
+    stub.telescope_id = 16
+    mgr.sessions[16] = stub
+    req = _DummyJSONReq(body={"az_degs": 99.0, "el_degs": -99.0})
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionJogResource.on_post(req, resp, telescope_id=16)
+    assert "200" in str(resp.status)
+    kind, az, el = stub.calls[-1]
+    assert kind == "set_jog"
+    assert az == 5.0  # _MOTION_JOG_BOUND_DEGS
+    assert el == -5.0
+
+
+def test_calibrate_motion_freeze_calls_session(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    stub = _StubMotion()
+    stub.telescope_id = 17
+    mgr.sessions[17] = stub
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionFreezeResource.on_post(req, resp, telescope_id=17)
+    assert "200" in str(resp.status)
+    assert ("freeze_jog",) in stub.calls
+
+
+def test_calibrate_motion_set_target_validates_body(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    stub = _StubMotion()
+    stub.telescope_id = 18
+    mgr.sessions[18] = stub
+    # Missing fields → 400.
+    req = _DummyJSONReq(body={"az": 1.0})
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionSetTargetResource.on_post(req, resp, telescope_id=18)
+    assert "400" in str(resp.status)
+    # Valid body → 200.
+    req2 = _DummyJSONReq(body={"az": 5.5, "el": 35.0})
+    resp2 = _DummyJSONResp()
+    front_app.CalibrateMotionSetTargetResource.on_post(req2, resp2, telescope_id=18)
+    assert "200" in str(resp2.status)
+    assert stub.target == (5.5, 35.0)
+
+
+def test_calibrate_motion_state_returns_inactive_when_no_session(monkeypatch):
+    _patch_motion_manager(monkeypatch)
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionStateResource.on_get(req, resp, telescope_id=19)
+    assert "200" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert payload == {"active": False}
+
+
+def test_calibrate_motion_stop_when_no_session(monkeypatch):
+    _patch_motion_manager(monkeypatch)
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionStopResource.on_post(req, resp, telescope_id=20)
+    # The manager returns None when no session existed; the response
+    # body should encode an inactive payload (handler returns 200).
+    assert "200" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert payload == {"active": False}
+
+
+def test_calibrate_motion_start_409_on_cross_manager_refusal(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    mgr.cross_check_should_refuse = True
+    import device.calibrate_motion as cm
+
+    original_session_cls = cm.CalibrateMotionSession
+
+    class _NoThreadSession(original_session_cls):
+        def start(self):
+            self._phase = "track"
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(cm, "CalibrateMotionSession", _NoThreadSession)
+    req = _DummyJSONReq(body={})
+    resp = _DummyJSONResp()
+    front_app.CalibrateMotionStartResource.on_post(req, resp, telescope_id=21)
+    assert "409" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert "cross-manager" in payload["error"]

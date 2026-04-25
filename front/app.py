@@ -5104,6 +5104,308 @@ class CalibrationCancelResource:
         )
 
 
+# ---- Calibrate-motion (continuous-control session for the calibrate page) ----
+#
+# These endpoints back the new live-tracker-based motion primitive used by
+# the calibrate-rotation page. The page POSTs `/calibrate_motion/start` on
+# load and `/calibrate_motion/stop` on hide/unload. Arrow-key jog and
+# click-to-go drive `/jog`/`/freeze` and `/nudge` respectively. The
+# existing daytime FAA workflow (CalibrationSession) delegates its motion
+# to this session when one is alive on the same telescope, so all
+# operator-visible motion goes through the same continuous-control loop —
+# no arrive-tolerance truncation of sub-degree nudges.
+
+
+def _motion_status_dict(status):
+    """Serialise a ``MotionStatus`` (or ``None``) to a JSON-safe dict."""
+    if status is None:
+        return {"active": False}
+    return {
+        "active": status.active,
+        "phase": status.phase,
+        "elapsed_s": status.elapsed_s,
+        "exit_reason": status.exit_reason,
+        "target_az_deg": status.target_az_deg,
+        "target_el_deg": status.target_el_deg,
+        "cur_cum_az_deg": status.cur_cum_az_deg,
+        "cur_el_deg": status.cur_el_deg,
+        "err_az_deg": status.err_az_deg,
+        "err_el_deg": status.err_el_deg,
+        "jog_az_degs": status.jog_az_degs,
+        "jog_el_degs": status.jog_el_degs,
+        "is_settled": status.is_settled,
+        "tick": status.tick,
+        "errors": list(status.errors),
+    }
+
+
+def _motion_session_or_404(req, resp, telescope_id):
+    """Return the active CalibrateMotionSession for ``telescope_id`` or
+    None after writing a 404 response."""
+    from device.calibrate_motion import get_calibrate_motion_manager
+
+    session = get_calibrate_motion_manager().get(int(telescope_id))
+    if session is None or not session.is_alive():
+        resp.status = falcon.HTTP_404
+        resp.content_type = "application/json"
+        resp.text = json.dumps({"error": "no active calibrate-motion session"})
+        return None
+    return session
+
+
+class CalibrateMotionStartResource:
+    """POST: start a calibrate-motion session on this telescope.
+
+    Accepts an optional JSON body with ``initial_az_deg`` /
+    ``initial_el_deg`` to seed the static provider; defaults to (0, 0) so
+    the streaming controller's anchor offset is what carries the mount's
+    encoder origin. Returns 409 if a live-tracker session is already
+    running on this telescope, or another motion session is already alive.
+    """
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        from device.calibrate_motion import (
+            CalibrateMotionSession,
+            get_calibrate_motion_manager,
+        )
+
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "request body must be a JSON object"})
+            return
+        try:
+            initial_az_deg = float(body.get("initial_az_deg", 0.0))
+            initial_el_deg = float(body.get("initial_el_deg", 0.0))
+        except (TypeError, ValueError):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps(
+                {"error": "initial_az_deg / initial_el_deg must be numeric"}
+            )
+            return
+        # Idempotent start: if a session is already alive, return its
+        # status rather than 409 — a quick page reload should not require
+        # a stop step.
+        existing = get_calibrate_motion_manager().get(int(telescope_id))
+        if existing is not None and existing.is_alive():
+            resp.status = falcon.HTTP_200
+            resp.content_type = "application/json"
+            resp.text = json.dumps(_motion_status_dict(existing.status()))
+            return
+        session = CalibrateMotionSession(
+            telescope_id=int(telescope_id),
+            initial_az_deg=initial_az_deg,
+            initial_el_deg=initial_el_deg,
+            dry_run=bool(body.get("dry_run", False)),
+        )
+        try:
+            get_calibrate_motion_manager().start(session)
+        except RuntimeError as exc:
+            resp.status = falcon.HTTP_409
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": str(exc)})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            _motion_status_dict(
+                get_calibrate_motion_manager().status(int(telescope_id))
+            )
+        )
+
+
+class CalibrateMotionStopResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        from device.calibrate_motion import get_calibrate_motion_manager
+
+        status = get_calibrate_motion_manager().stop(int(telescope_id))
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_motion_status_dict(status))
+
+
+class CalibrateMotionStateResource:
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        from device.calibrate_motion import get_calibrate_motion_manager
+
+        status = get_calibrate_motion_manager().status(int(telescope_id))
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_motion_status_dict(status))
+
+
+class CalibrateMotionSetTargetResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "body must be a JSON object"})
+            return
+        try:
+            az = float(body["az"])
+            el = float(body["el"])
+        except (KeyError, TypeError, ValueError):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "az / el must be numeric"})
+            return
+        session = _motion_session_or_404(req, resp, telescope_id)
+        if session is None:
+            return
+        session.set_target(az, el)
+        from device.calibrate_motion import get_calibrate_motion_manager
+
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            _motion_status_dict(
+                get_calibrate_motion_manager().status(int(telescope_id))
+            )
+        )
+
+
+# Bound on a single nudge to keep a typo or stuck JS handler from driving
+# the mount tens of degrees in a single command. Matches MAX_NUDGE_PER_CMD_DEG
+# in rotation_calibration.py.
+_MOTION_NUDGE_BOUND_DEG = 5.0
+# Bound on the jog rate. The streaming controller's per-axis cap is the
+# plant's main rate (~6 °/s). Cap at 5 °/s here so the FF-only feedforward
+# leaves headroom for the FB correction without saturating.
+_MOTION_JOG_BOUND_DEGS = 5.0
+
+
+def _clamp_finite(x: float, lo: float, hi: float) -> float:
+    """Reject NaN, then clamp to ``[lo, hi]``."""
+    import math as _m
+
+    if not _m.isfinite(x):
+        raise ValueError("value must be finite")
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+class CalibrateMotionNudgeResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "body must be a JSON object"})
+            return
+        try:
+            d_az = _clamp_finite(
+                float(body.get("daz", 0.0)),
+                -_MOTION_NUDGE_BOUND_DEG,
+                _MOTION_NUDGE_BOUND_DEG,
+            )
+            d_el = _clamp_finite(
+                float(body.get("del", 0.0)),
+                -_MOTION_NUDGE_BOUND_DEG,
+                _MOTION_NUDGE_BOUND_DEG,
+            )
+        except (TypeError, ValueError) as exc:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": f"daz / del invalid: {exc}"})
+            return
+        session = _motion_session_or_404(req, resp, telescope_id)
+        if session is None:
+            return
+        session.nudge_target(d_az, d_el)
+        from device.calibrate_motion import get_calibrate_motion_manager
+
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            _motion_status_dict(
+                get_calibrate_motion_manager().status(int(telescope_id))
+            )
+        )
+
+
+class CalibrateMotionJogResource:
+    """Set a constant-velocity jog rate on the static target."""
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "body must be a JSON object"})
+            return
+        try:
+            az_degs = _clamp_finite(
+                float(body.get("az_degs", 0.0)),
+                -_MOTION_JOG_BOUND_DEGS,
+                _MOTION_JOG_BOUND_DEGS,
+            )
+            el_degs = _clamp_finite(
+                float(body.get("el_degs", 0.0)),
+                -_MOTION_JOG_BOUND_DEGS,
+                _MOTION_JOG_BOUND_DEGS,
+            )
+        except (TypeError, ValueError) as exc:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": f"az_degs / el_degs invalid: {exc}"})
+            return
+        session = _motion_session_or_404(req, resp, telescope_id)
+        if session is None:
+            return
+        session.set_jog(az_degs, el_degs)
+        from device.calibrate_motion import get_calibrate_motion_manager
+
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            _motion_status_dict(
+                get_calibrate_motion_manager().status(int(telescope_id))
+            )
+        )
+
+
+class CalibrateMotionFreezeResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        session = _motion_session_or_404(req, resp, telescope_id)
+        if session is None:
+            return
+        session.freeze_jog()
+        from device.calibrate_motion import get_calibrate_motion_manager
+
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            _motion_status_dict(
+                get_calibrate_motion_manager().status(int(telescope_id))
+            )
+        )
+
+
 class StatsContentResource:
     _last_render_by_key = {}
     _lock = threading.Lock()
@@ -6364,6 +6666,35 @@ class FrontMain:
         app.add_route(
             "/api/{telescope_id:int}/calibration/cancel",
             CalibrationCancelResource(),
+        )
+        # ---- Calibrate-motion (live-tracker primitive for jog/click-to-go) ----
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_motion/start",
+            CalibrateMotionStartResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_motion/stop",
+            CalibrateMotionStopResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_motion/state",
+            CalibrateMotionStateResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_motion/set_target",
+            CalibrateMotionSetTargetResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_motion/nudge",
+            CalibrateMotionNudgeResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_motion/jog",
+            CalibrateMotionJogResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_motion/freeze",
+            CalibrateMotionFreezeResource(),
         )
         app.add_route("/config", ConfigResource())
         app.add_route("/pa_refine", BlindPolarAlignResource())

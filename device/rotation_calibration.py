@@ -732,6 +732,8 @@ class CalibrationSession:
             target_el = self._target_el
         # Coalesce: drain pending nudges queued behind this one, sum
         # their deltas, and issue a single move to the final target.
+        coalesced_d_az = d_az
+        coalesced_d_el = d_el
         while True:
             try:
                 nxt = self._queue.get_nowait()
@@ -749,12 +751,42 @@ class CalibrationSession:
                 self._target_el += float(nxt.payload["d_el"])
                 target_az = self._target_az
                 target_el = self._target_el
+            coalesced_d_az += float(nxt.payload["d_az"])
+            coalesced_d_el += float(nxt.payload["d_el"])
         self._set_phase("nudging")
         if self.dry_run:
             with self._lock:
                 self._encoder_az = target_az
                 self._encoder_el = target_el
             return
+
+        # Delegate to the calibrate-motion session if one is running on
+        # this telescope. The continuous-control loop closes |err| below
+        # 0.005° rather than truncating at ``move_to_ff``'s 0.1° arrive
+        # tolerance, which is what makes the small-step UI buttons (down
+        # to 0.005°) actually meaningful at the mount. We pass the
+        # coalesced delta so the streaming target shifts by the same
+        # amount the legacy path would have moved to in absolute terms.
+        motion = self._motion_delegate()
+        if motion is not None:
+            try:
+                motion.nudge_target(coalesced_d_az, coalesced_d_el)
+            except Exception as exc:
+                with self._lock:
+                    self._errors.append(f"motion nudge_target failed: {exc}")
+                return
+            # Update self._encoder_* from the latest tick the motion
+            # session has seen so the UI's KPI strip stays in sync.
+            try:
+                st = motion.status()
+                if st.cur_cum_az_deg is not None and st.cur_el_deg is not None:
+                    with self._lock:
+                        self._encoder_az = float(st.cur_cum_az_deg)
+                        self._encoder_el = float(st.cur_el_deg)
+            except Exception:
+                pass
+            return
+
         try:
             from device.velocity_controller import move_to_ff
 
@@ -893,6 +925,40 @@ class CalibrationSession:
                 self._encoder_az = pred_az_wrapped
                 self._encoder_el = pred_el
             return
+
+        # If a calibrate-motion session is running, hand the slew to it
+        # so the same continuous-control primitive drives both pre-slew
+        # and the operator's subsequent nudges. Wait briefly for the
+        # mount to settle before transitioning to ``nudging``; the
+        # motion loop never "arrives" so we cap the wait at ~30 s and
+        # carry on regardless. The user can refine via nudges from
+        # whatever the mount actually reached.
+        motion = self._motion_delegate()
+        if motion is not None:
+            try:
+                motion.set_target(pred_az_wrapped, pred_el)
+            except Exception as exc:
+                with self._lock:
+                    self._errors.append(f"motion set_target failed: {exc}")
+                return
+            deadline = time.time() + 30.0
+            while time.time() < deadline and not self._stop_evt.is_set():
+                try:
+                    if motion.is_settled(threshold_deg=0.05, ticks=4):
+                        break
+                except Exception:
+                    break
+                time.sleep(0.25)
+            try:
+                st = motion.status()
+                if st.cur_cum_az_deg is not None and st.cur_el_deg is not None:
+                    with self._lock:
+                        self._encoder_az = float(st.cur_cum_az_deg)
+                        self._encoder_el = float(st.cur_el_deg)
+            except Exception:
+                pass
+            return
+
         try:
             from device.velocity_controller import move_to_ff
 
@@ -922,6 +988,36 @@ class CalibrationSession:
     def _set_phase(self, phase: str) -> None:
         with self._lock:
             self._phase = phase
+
+    def _motion_delegate(self):
+        """Return the active calibrate-motion session for this telescope,
+        or ``None`` if one is not running (or the module isn't importable
+        from this test context). Lazy import keeps this module independent
+        of ``device.calibrate_motion`` for unit tests that stub one but
+        not the other.
+
+        When non-None, motion is delegated through the live-tracker
+        primitive's continuous-control loop (no arrive-tolerance), so
+        sub-degree nudges actually reach the mount instead of being
+        truncated by ``move_to_ff``'s 0.1° / 0.3° tolerances.
+        """
+        if self.dry_run:
+            return None
+        try:
+            from device.calibrate_motion import get_calibrate_motion_manager
+        except ImportError:
+            return None
+        try:
+            mgr = get_calibrate_motion_manager()
+        except Exception:
+            return None
+        try:
+            session = mgr.get(self.telescope_id)
+        except Exception:
+            return None
+        if session is None or not session.is_alive():
+            return None
+        return session
 
     def _read_encoder_nonfatal(self, cli) -> tuple[float | None, float | None]:
         if self.dry_run:

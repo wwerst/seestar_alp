@@ -58,6 +58,22 @@
   .cal-prior-block { padding: 6px 8px; background: rgba(0,0,0,0.03); border-radius: 4px; font-size: 12px; margin-bottom: 8px; }
   .cal-err { color: #b91c1c; font-size: 11px; margin-top: 4px; white-space: pre-wrap; }
   .cal-toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); padding: 10px 20px; border-radius: 6px; background: rgba(34,197,94,0.9); color: white; font-family: monospace; z-index: 1000; }
+  /* Click-to-go dot — fades out over 800 ms while CSS-only animated. */
+  .cal-click-dot { position: absolute; width: 14px; height: 14px; border-radius: 50%;
+    border: 2px solid rgba(255,255,64,0.9); background: rgba(255,255,64,0.25);
+    transform: translate(-50%, -50%); pointer-events: none;
+    animation: cal-click-fade 800ms ease-out forwards; }
+  @keyframes cal-click-fade { from { opacity: 1; transform: translate(-50%, -50%) scale(0.7); }
+    to { opacity: 0; transform: translate(-50%, -50%) scale(2.2); } }
+  /* Cursor on the video → crosshair so the click-to-go affordance is visible. */
+  #cal-vid { cursor: crosshair; }
+  /* Motion-status pill (jog / err / settled). Compact, lives next to the KPIs. */
+  .cal-motion-pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-family: monospace; font-size: 11px; margin-left: 6px;
+    background: rgba(0,0,0,0.06); color: #333; }
+  .cal-motion-pill.jogging { background: rgba(59,130,246,0.18); color: #1e40af; }
+  .cal-motion-pill.settled { background: rgba(34,197,94,0.18); color: #166534; }
+  .cal-motion-pill.error   { background: rgba(239,68,68,0.18); color: #991b1b; }
 </style>
 
 <div class="cal-wrap" data-telescope-id="{{ telescope_id }}"
@@ -105,6 +121,10 @@
           <div class="cal-kpi"><div class="k">tgt az</div><div class="v" id="cal-kpi-tgtaz">—</div></div>
           <div class="cal-kpi"><div class="k">tgt el</div><div class="v" id="cal-kpi-tgtel">—</div></div>
           <div class="cal-kpi"><div class="k">fit RMS</div><div class="v" id="cal-kpi-rms">—</div></div>
+        </div>
+        <div style="margin-top:6px; font-size:11px;">
+          motion: <span id="cal-motion-pill" class="cal-motion-pill">starting…</span>
+          <span id="cal-motion-err" style="opacity:0.75; margin-left:8px;"></span>
         </div>
       </div>
     </div>
@@ -203,6 +223,29 @@
   const wrap = document.querySelector('.cal-wrap');
   const telescopeId = wrap.dataset.telescopeId || '1';
   const apiRoot = `/api/${telescopeId}/calibration`;
+  const motionRoot = `/api/${telescopeId}/calibrate_motion`;
+
+  // Seestar S50 imager FOV. Public spec ≈ 1.27° × 0.71°. The motion
+  // primitive treats this as the native angular extent of the live
+  // <img>, so a click at the rightmost pixel commands +0.635° in the
+  // image-frame x direction (which maps to az for an unrotated mount —
+  // see the rotation-aware mapping in `clickToOffset` below).
+  const S50_FOV_H_DEG = 1.27;
+  const S50_FOV_V_DEG = 0.71;
+
+  // Speed map for held arrow keys. Key = stepDeg, value = jog rate
+  // (deg/s). 0.005/0.02/0.1 are PR #14's smaller increments; 0.05/0.2/1.0
+  // are the legacy values main still ships, included so the speed map
+  // works pre- and post-PR-#14 without UI changes. Unknown stepDeg falls
+  // back to 1 °/s.
+  const JOG_SPEED_BY_STEP = {
+    0.005: 0.5,
+    0.02: 2.0,
+    0.1: 4.0,
+    0.05: 1.0,
+    0.2: 4.0,
+    1.0: 4.0,
+  };
 
   const els = {
     priorBlock: document.getElementById('cal-prior-block'),
@@ -230,6 +273,10 @@
     reviewBody: document.getElementById('cal-review-body'),
     reviewSummary: document.getElementById('cal-review-summary'),
     aimLabel: document.getElementById('cal-aim-label'),
+    motionPill: document.getElementById('cal-motion-pill'),
+    motionErr: document.getElementById('cal-motion-err'),
+    vid: document.getElementById('cal-vid'),
+    videoBox: document.querySelector('.cal-video-box'),
     kpiPhase: document.getElementById('cal-kpi-phase'),
     kpiIdx: document.getElementById('cal-kpi-idx'),
     kpiEncAz: document.getElementById('cal-kpi-encaz'),
@@ -246,6 +293,19 @@
     stepDeg: 0.2,
     sessionActive: false,
     phase: 'idle',
+  };
+
+  // Motion-primitive client state. Tracks whether the page-lifecycle
+  // CalibrateMotionSession is active and the most recent /state poll so
+  // the jog/click handlers can refuse to fire when the session has gone
+  // away (e.g. backend restart) and the pill can render rich status.
+  let motionState = {
+    active: false,
+    phase: 'init',
+    err_az_deg: null, err_el_deg: null,
+    jog_az_degs: 0, jog_el_degs: 0,
+    is_settled: false,
+    exit_reason: null,
   };
 
   function fmt(v, d=2, suffix='°') {
@@ -426,16 +486,88 @@
     });
   });
 
+  // ---- arrow-key continuous jog (item 4) ----
+  //
+  // Held arrow keys command a constant-velocity jog through the motion
+  // primitive's StaticReferenceProvider. The streaming controller closes
+  // residual error each tick, so on keyup the freeze command lets the
+  // mount converge below the smallest UI increment within a tick or two —
+  // no overshoot, no truncation by an arrival-tolerance threshold.
+  //
+  // We keep a held-keys set so two arrows can compose (left+up → diagonal),
+  // and we recompute the jog vector on every key transition.
+  const heldKeys = new Set();
+  const ARROW_KEYS = new Set(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown']);
+  let lastJog = {az: 0.0, el: 0.0};
+  function currentJogSpeed() {
+    const v = JOG_SPEED_BY_STEP[state.stepDeg];
+    return (typeof v === 'number' && isFinite(v)) ? v : 1.0;
+  }
+  function recomputeJog() {
+    if (!motionState.active) return;
+    let dx = 0, dy = 0;
+    if (heldKeys.has('ArrowLeft'))  dx -= 1;
+    if (heldKeys.has('ArrowRight')) dx += 1;
+    if (heldKeys.has('ArrowUp'))    dy += 1;
+    if (heldKeys.has('ArrowDown'))  dy -= 1;
+    if (dx === 0 && dy === 0) {
+      if (lastJog.az !== 0 || lastJog.el !== 0) {
+        lastJog = {az: 0.0, el: 0.0};
+        // Send a freeze rather than a jog with zeros so the server
+        // can log the transition explicitly (and so a transient
+        // race against another /jog write is resolved decisively).
+        fetch(`${motionRoot}/freeze`, {method:'POST'}).catch(() => {});
+      }
+      return;
+    }
+    const speed = currentJogSpeed();
+    // Diagonal rate equal to single-axis rate (each axis at `speed`).
+    const az = dx * speed;
+    const el = dy * speed;
+    if (az === lastJog.az && el === lastJog.el) return;
+    lastJog = {az, el};
+    fetch(`${motionRoot}/jog`, {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({az_degs: az, el_degs: el}),
+    }).catch(() => {});
+  }
+  function freezeJogIfActive() {
+    if (lastJog.az === 0 && lastJog.el === 0) return;
+    heldKeys.clear();
+    lastJog = {az: 0, el: 0};
+    fetch(`${motionRoot}/freeze`, {method:'POST'}).catch(() => {});
+  }
+
   document.addEventListener('keydown', (ev) => {
-    if (!state.sessionActive) return;
     if (ev.target && ['INPUT','SELECT','TEXTAREA'].includes(ev.target.tagName)) return;
-    let used = false;
-    if (ev.key === 'ArrowLeft')  { schedulePostNudge(-state.stepDeg, 0); used = true; }
-    if (ev.key === 'ArrowRight') { schedulePostNudge( state.stepDeg, 0); used = true; }
-    if (ev.key === 'ArrowUp')    { schedulePostNudge(0,  state.stepDeg); used = true; }
-    if (ev.key === 'ArrowDown')  { schedulePostNudge(0, -state.stepDeg); used = true; }
-    if (ev.key === 'Enter')      { postAction('sight'); used = true; }
-    if (used) ev.preventDefault();
+    if (ARROW_KEYS.has(ev.key)) {
+      if (!ev.repeat && !heldKeys.has(ev.key)) {
+        heldKeys.add(ev.key);
+        recomputeJog();
+      } else {
+        // ev.repeat fires while the key auto-repeats; we already issued
+        // the jog on first press, so just consume the event.
+      }
+      ev.preventDefault();
+      return;
+    }
+    if (!state.sessionActive) return;
+    if (ev.key === 'Enter')      { postAction('sight'); ev.preventDefault(); }
+  });
+  document.addEventListener('keyup', (ev) => {
+    if (ARROW_KEYS.has(ev.key)) {
+      heldKeys.delete(ev.key);
+      recomputeJog();
+      ev.preventDefault();
+    }
+  });
+  // Belt + suspenders: if focus leaves the page or the page hides,
+  // freeze the jog so the mount doesn't keep moving while the user
+  // can't see it.
+  window.addEventListener('blur', freezeJogIfActive);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') freezeJogIfActive();
   });
 
   async function postAction(action) {
@@ -580,9 +712,151 @@
     setTimeout(() => div.remove(), 2000);
   }
 
+  // ---- click-to-go on the live image (item 5) ----
+  //
+  // Map the click position relative to the <img>'s rendered bounding box
+  // to an angular offset using the S50's published FOV, then post that
+  // delta to /calibrate_motion/nudge. The motion primitive's static
+  // target shifts by that delta and the streaming controller continuously
+  // closes the residual error — no arrival pause, and a second click
+  // mid-slew updates the target atomically (the loop just redirects).
+  function clickToOffset(ev) {
+    const rect = els.vid.getBoundingClientRect();
+    const dxPx = ev.clientX - rect.left;
+    const dyPx = ev.clientY - rect.top;
+    // Normalised to [-0.5, 0.5] from the centre.
+    const u = (dxPx / rect.width) - 0.5;
+    const v = (dyPx / rect.height) - 0.5;
+    // Image x is right-positive in azimuth-frame; image y is down-positive
+    // (browser coordinates) but altitude is up-positive, so flip y. This
+    // ignores any rotation between mount and image — until the rotation
+    // calibration finishes, the click target is approximate. Once
+    // calibrated, ``mount_calibration.json``'s rotation is applied at the
+    // streaming layer by the MountFrame, so no JS rotation is needed.
+    const daz = u * S50_FOV_H_DEG;
+    const del = -v * S50_FOV_V_DEG;
+    return {dxPx, dyPx, daz, del};
+  }
+
+  function spawnClickDot(dxPx, dyPx) {
+    const dot = document.createElement('div');
+    dot.className = 'cal-click-dot';
+    dot.style.left = dxPx + 'px';
+    dot.style.top = dyPx + 'px';
+    els.videoBox.appendChild(dot);
+    setTimeout(() => dot.remove(), 900);
+  }
+
+  if (els.vid) {
+    els.vid.addEventListener('click', (ev) => {
+      if (!motionState.active) return;
+      const {dxPx, dyPx, daz, del} = clickToOffset(ev);
+      spawnClickDot(dxPx, dyPx);
+      fetch(`${motionRoot}/nudge`, {
+        method:'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({daz, del}),
+      }).catch(() => {});
+    });
+  }
+
+  // ---- motion-state polling + lifecycle ----
+
+  function applyMotionStatus(s) {
+    motionState = Object.assign(motionState, {
+      active: !!s.active,
+      phase: s.phase || 'init',
+      err_az_deg: s.err_az_deg,
+      err_el_deg: s.err_el_deg,
+      jog_az_degs: Number(s.jog_az_degs || 0),
+      jog_el_degs: Number(s.jog_el_degs || 0),
+      is_settled: !!s.is_settled,
+      exit_reason: s.exit_reason || null,
+    });
+    if (!els.motionPill) return;
+    let label, cls;
+    if (!s.active) {
+      label = s.exit_reason ? `stopped (${s.exit_reason})` : 'stopped';
+      cls = s.exit_reason && s.exit_reason !== 'stop_signal' ? 'error' : '';
+    } else if (Math.abs(motionState.jog_az_degs) > 1e-6 ||
+               Math.abs(motionState.jog_el_degs) > 1e-6) {
+      const az = motionState.jog_az_degs.toFixed(2);
+      const el = motionState.jog_el_degs.toFixed(2);
+      label = `JOG ${az},${el}°/s`;
+      cls = 'jogging';
+    } else if (motionState.is_settled) {
+      label = '✓ settled';
+      cls = 'settled';
+    } else if (s.err_az_deg != null && s.err_el_deg != null) {
+      label = `err ${fmt(s.err_az_deg, 3)}/${fmt(s.err_el_deg, 3)}`;
+      cls = '';
+    } else {
+      label = s.phase || 'tracking';
+      cls = '';
+    }
+    els.motionPill.textContent = label;
+    els.motionPill.className = 'cal-motion-pill' + (cls ? ' ' + cls : '');
+    if (els.motionErr) {
+      const errors = (s.errors || []).join(' | ');
+      els.motionErr.textContent = errors ? '⚠ ' + errors : '';
+    }
+  }
+
+  async function startMotion() {
+    try {
+      const r = await fetch(`${motionRoot}/start`, {
+        method:'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        if (els.motionPill) {
+          els.motionPill.textContent = 'unavailable';
+          els.motionPill.className = 'cal-motion-pill error';
+        }
+        if (els.motionErr) els.motionErr.textContent = err.error || '';
+        return;
+      }
+      const s = await r.json();
+      applyMotionStatus(s);
+    } catch (e) {
+      if (els.motionPill) {
+        els.motionPill.textContent = 'unavailable';
+        els.motionPill.className = 'cal-motion-pill error';
+      }
+    }
+  }
+
+  async function refreshMotionStatus() {
+    try {
+      const r = await fetch(`${motionRoot}/state`);
+      if (!r.ok) return;
+      applyMotionStatus(await r.json());
+    } catch (e) {}
+  }
+
+  function stopMotionBeacon() {
+    // sendBeacon: fires reliably on pagehide / beforeunload (regular
+    // fetch may be cancelled when the page tears down). Falls back to
+    // synchronous fetch if Beacon isn't available.
+    const url = `${motionRoot}/stop`;
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url);
+      } else {
+        fetch(url, {method:'POST', keepalive: true}).catch(() => {});
+      }
+    } catch (e) {}
+  }
+  window.addEventListener('pagehide', stopMotionBeacon);
+  window.addEventListener('beforeunload', stopMotionBeacon);
+
   // Kick things off.
   loadSetup();
+  startMotion();
   setInterval(refreshStatus, 1000);
+  setInterval(refreshMotionStatus, 1000);
   refreshStatus();
 })();
 </script>
