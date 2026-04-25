@@ -813,6 +813,7 @@
   // ---- motion-state polling + lifecycle ----
 
   function applyMotionStatus(s) {
+    const wasActive = motionState.active;
     motionState = Object.assign(motionState, {
       active: !!s.active,
       phase: s.phase || 'init',
@@ -823,6 +824,14 @@
       is_settled: !!s.is_settled,
       exit_reason: s.exit_reason || null,
     });
+    // If the user was already holding an arrow key before /start
+    // returned (motion not yet active), `recomputeJog` no-op'd at the
+    // keydown. On the false→true transition we re-apply the held keys
+    // so the jog actually begins instead of waiting for a fresh
+    // key transition.
+    if (!wasActive && motionState.active && heldKeys.size > 0) {
+      recomputeJog();
+    }
     if (!els.motionPill) return;
     let label, cls;
     if (!s.active) {

@@ -454,52 +454,74 @@ class CalibrateMotionSession:
                 self._errors.append(f"PositionLogger start failed: {exc}")
             self._position_logger = None
 
+        # Outer try/finally guarantees a direct ``cli.method_sync`` motor
+        # stop on session exit. ``streaming_controller.track`` already
+        # issues ``speed_move(cli, 0, 0, ...)`` from its own ``finally``,
+        # but ``speed_move`` is the lockout-aware wrapper that refuses
+        # commands while ``SunSafetyMonitor`` holds the emergency lockout.
+        # If lockout is active when we exit, that cleanup is silently
+        # swallowed and the previous tick's command keeps running until
+        # its firmware ``dur_sec`` TTL expires (bounded uncommanded motion
+        # of up to ``v_max × TICK_CMD_DUR_S``). Calling ``method_sync``
+        # directly bypasses the wrapper, mirroring the
+        # ``_motor_stop_on_exit`` pattern in ``velocity_controller``.
         try:
-            tracker: CumulativeAzTracker | None
             try:
-                tracker = CumulativeAzTracker.load_or_fresh()
-            except Exception:
-                tracker = CumulativeAzTracker()
-
-            with self._lock:
-                self._phase = "track"
-            try:
-                result = track(
-                    cli,
-                    self.provider,
-                    az_limits=self._az_limits,
-                    az_tracker=tracker,
-                    position_logger=self._position_logger,
-                    stop_signal=self._stop_evt,
-                    dry_run=self.dry_run,
-                    max_duration_s=self._max_duration_s,
-                    tick_callback=self._on_tick,
-                )
-            except Exception as exc:
-                with self._lock:
-                    self._exit_reason = "session_error"
-                    self._errors.append(f"track() raised: {exc}")
-                    self._phase = "error"
-            else:
-                with self._lock:
-                    self._exit_reason = result.exit_reason
-                    if result.errors:
-                        self._errors.extend(result.errors)
-                    self._phase = (
-                        "done"
-                        if result.exit_reason in ("end_of_track", "stop_signal")
-                        else "error"
-                    )
-        finally:
-            if self._position_logger is not None:
+                tracker: CumulativeAzTracker | None
                 try:
-                    self._position_logger.mark_event(
-                        "calibrate_motion_end",
-                        exit_reason=self._exit_reason,
-                    )
-                    self._position_logger.stop()
+                    tracker = CumulativeAzTracker.load_or_fresh()
                 except Exception:
-                    pass
+                    tracker = CumulativeAzTracker()
+
+                with self._lock:
+                    self._phase = "track"
+                try:
+                    result = track(
+                        cli,
+                        self.provider,
+                        az_limits=self._az_limits,
+                        az_tracker=tracker,
+                        position_logger=self._position_logger,
+                        stop_signal=self._stop_evt,
+                        dry_run=self.dry_run,
+                        max_duration_s=self._max_duration_s,
+                        tick_callback=self._on_tick,
+                    )
+                except Exception as exc:
+                    with self._lock:
+                        self._exit_reason = "session_error"
+                        self._errors.append(f"track() raised: {exc}")
+                        self._phase = "error"
+                else:
+                    with self._lock:
+                        self._exit_reason = result.exit_reason
+                        if result.errors:
+                            self._errors.extend(result.errors)
+                        self._phase = (
+                            "done"
+                            if result.exit_reason in ("end_of_track", "stop_signal")
+                            else "error"
+                        )
+            finally:
+                if self._position_logger is not None:
+                    try:
+                        self._position_logger.mark_event(
+                            "calibrate_motion_end",
+                            exit_reason=self._exit_reason,
+                        )
+                        self._position_logger.stop()
+                    except Exception:
+                        pass
+        finally:
+            if not self.dry_run:
+                try:
+                    cli.method_sync(
+                        "scope_speed_move",
+                        {"speed": 0, "angle": 0, "dur_sec": 1},
+                    )
+                except Exception:
+                    with self._lock:
+                        self._errors.append("outer motor-stop on session exit failed")
 
 
 # ---------- CalibrateMotionManager ------------------------------------

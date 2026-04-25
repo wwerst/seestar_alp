@@ -1184,6 +1184,41 @@ def test_calibrate_motion_set_target_validates_body(monkeypatch):
     assert stub.target == (5.5, 35.0)
 
 
+def test_calibrate_motion_set_target_rejects_nonfinite(monkeypatch):
+    mgr = _patch_motion_manager(monkeypatch)
+    stub = _StubMotion()
+    stub.telescope_id = 28
+    mgr.sessions[28] = stub
+    initial_target = stub.target
+    for body in (
+        {"az": float("nan"), "el": 0.0},
+        {"az": 0.0, "el": float("inf")},
+    ):
+        req = _DummyJSONReq(body=body)
+        resp = _DummyJSONResp()
+        front_app.CalibrateMotionSetTargetResource.on_post(req, resp, telescope_id=28)
+        assert "400" in str(resp.status)
+        payload = json.loads(resp.text)
+        assert "finite" in payload["error"].lower()
+    # Non-finite inputs must not have reached the session.
+    assert stub.target == initial_target
+    assert all(c[0] != "set_target" for c in stub.calls)
+
+
+def test_calibrate_motion_start_rejects_nonfinite_initial(monkeypatch):
+    _patch_motion_manager(monkeypatch)
+    for body in (
+        {"initial_az_deg": float("nan"), "initial_el_deg": 0.0},
+        {"initial_az_deg": 0.0, "initial_el_deg": float("inf")},
+    ):
+        req = _DummyJSONReq(body=body)
+        resp = _DummyJSONResp()
+        front_app.CalibrateMotionStartResource.on_post(req, resp, telescope_id=29)
+        assert "400" in str(resp.status)
+        payload = json.loads(resp.text)
+        assert "finite" in payload["error"].lower()
+
+
 def test_calibrate_motion_state_returns_inactive_when_no_session(monkeypatch):
     _patch_motion_manager(monkeypatch)
     req = _DummyJSONReq()

@@ -5229,6 +5229,13 @@ class CalibrateMotionStartResource:
                 {"error": "initial_az_deg / initial_el_deg must be numeric"}
             )
             return
+        if not (math.isfinite(initial_az_deg) and math.isfinite(initial_el_deg)):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps(
+                {"error": "initial_az_deg / initial_el_deg must be finite"}
+            )
+            return
         # Idempotent start: if a session is already alive, return its
         # status rather than 409 — a quick page reload should not require
         # a stop step.
@@ -5301,6 +5308,11 @@ class CalibrateMotionSetTargetResource:
             resp.status = falcon.HTTP_400
             resp.content_type = "application/json"
             resp.text = json.dumps({"error": "az / el must be numeric"})
+            return
+        if not (math.isfinite(az) and math.isfinite(el)):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "az / el must be finite"})
             return
         session = _motion_session_or_404(req, resp, telescope_id)
         if session is None:
