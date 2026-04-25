@@ -1,4 +1,6 @@
 import json
+import threading
+
 import pytest
 import front.app as front_app
 from device.config import Config
@@ -929,10 +931,14 @@ def test_calibrate_rotation_page_kicks_off_scenery_view_for_streaming(monkeypatc
     Without this, the live-camera <img id="cal-vid"> sits on a Loading
     frame until the calibration session itself starts (which is when
     `ensure_scenery_mode` is called inside `_connect_mount`)."""
+    import time as _time
+
     calls = []
+    call_event = threading.Event()
 
     def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
         calls.append((action, dev_num, parameters))
+        call_event.set()
         return {"Value": "ok"}
 
     monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
@@ -946,6 +952,14 @@ def test_calibrate_rotation_page_kicks_off_scenery_view_for_streaming(monkeypatc
 
     front_app.CalibrateRotationResource.on_get(req, resp, telescope_id=1)
 
+    # The kick is dispatched in a daemon thread; wait briefly for it.
+    assert call_event.wait(timeout=2.0), (
+        f"scenery iscope_start_view kick never landed within 2s; calls={calls}"
+    )
+    # Allow a tick for any duplicate kicks that might land after the
+    # first — we want to assert exactly one.
+    _time.sleep(0.05)
+
     # The scenery-view kick must have been issued exactly once.
     matching = [
         c
@@ -954,7 +968,9 @@ def test_calibrate_rotation_page_kicks_off_scenery_view_for_streaming(monkeypatc
         and c[2].get("method") == "iscope_start_view"
         and c[2].get("params", {}).get("mode") == "scenery"
     ]
-    assert matching, f"expected a scenery iscope_start_view kick, got: {calls}"
+    assert len(matching) == 1, (
+        f"expected exactly one scenery iscope_start_view kick, got: {calls}"
+    )
     assert matching[0][1] == 1
 
     # Page should still render the calibration UI.

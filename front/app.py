@@ -4670,21 +4670,46 @@ class CalibrateRotationResource:
     """Serve the browser calibration page."""
 
     @staticmethod
+    def _start_scenery_view_kick(telescope_id):
+        """Fire-and-forget background thread that puts the firmware in
+        scenery view so the MJPEG stream produces frames before the
+        user clicks Start calibration.
+
+        Runs in a daemon thread because ``do_action_device`` ultimately
+        issues a synchronous ``requests.put`` with ``Config.timeout``,
+        which can block page render for the full timeout if the device
+        is slow or just became unreachable. Failures are logged at
+        debug — the page still renders, and the prior/targets REST
+        endpoints surface offline state separately.
+        """
+
+        def _run():
+            try:
+                do_action_device(
+                    "method_async",
+                    telescope_id,
+                    {"method": "iscope_start_view", "params": {"mode": "scenery"}},
+                )
+            except Exception as exc:
+                logger.debug(
+                    f"calibrate-rotation: scenery view kick failed for telescope {telescope_id}: {exc}"
+                )
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return t
+
+    @staticmethod
     def on_get(req, resp, telescope_id=1):
         # Kick the firmware into scenery view mode so the MJPEG stream
         # produces frames before "Start calibration" is clicked.
         # Daytime calibration runs in scenery anyway, so already-active
-        # scenery is a no-op. Errors are swallowed so the calibration
-        # UI still renders when the device is unreachable.
-        try:
-            do_action_device(
-                "method_async",
-                telescope_id,
-                {"method": "iscope_start_view", "params": {"mode": "scenery"}},
-            )
-        except Exception:
-            pass
+        # scenery is a no-op. The kick runs in a background thread and
+        # is gated on the cached online state so we don't pay the
+        # request timeout cost when the device is offline.
         context = get_context(telescope_id, req)
+        if context.get("online"):
+            CalibrateRotationResource._start_scenery_view_kick(telescope_id)
         render_template(
             req,
             resp,

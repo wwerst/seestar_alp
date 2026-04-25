@@ -170,12 +170,12 @@ def filter_visible(
     observer. Ranked by ``(lit desc, height_amsl_m desc, slant asc)``
     so lit, tall, close obstructions bubble up first.
 
-    When ``preserve_order=True``, the height/slant tiebreaker is
-    skipped and results are returned in the input order. Used when
-    the caller passes a hand-curated list (e.g. ``DEFAULT_LANDMARKS``)
-    where source order encodes intent — Hyperion is the closer, lit
-    primary calibration target and should remain first even though
-    LA Broadcast is taller.
+    When ``preserve_order=True``, no ranking sort is applied (including
+    the lit-first ordering) and results are returned in the filtered
+    input order. Used when the caller passes a hand-curated list
+    (e.g. ``DEFAULT_LANDMARKS``) where source order encodes intent —
+    Hyperion is the closer, lit primary calibration target and should
+    remain first even though LA Broadcast is taller.
 
     When ``check_terrain=True``, each remaining candidate is also run
     through :func:`scripts.trajectory.terrain_los.check_los` and
