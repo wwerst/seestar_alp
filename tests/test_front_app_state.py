@@ -916,3 +916,112 @@ def test_sparse_template_contexts_render_without_error(template_name, context):
     html = template.render(**context)
     assert isinstance(html, str)
     assert len(html) > 0
+
+
+# ---------- CalibrateRotationResource ---------------------------------
+
+
+def test_calibrate_rotation_page_kicks_off_scenery_view_for_streaming(monkeypatch):
+    """Visiting /{id}/calibrate_rotation must idempotently kick the
+    firmware into scenery view mode so the MJPEG stream produces frames
+    before the user clicks 'Start calibration'.
+
+    Without this, the live-camera <img id="cal-vid"> sits on a Loading
+    frame until the calibration session itself starts (which is when
+    `ensure_scenery_mode` is called inside `_connect_mount`)."""
+    calls = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(
+        front_app,
+        "get_context",
+        lambda _tid, _req: _minimal_context("calibrate_rotation", online=True),
+    )
+    req = DummyHTMXReq(relative_uri="/1/calibrate_rotation")
+    resp = DummyResp()
+
+    front_app.CalibrateRotationResource.on_get(req, resp, telescope_id=1)
+
+    # The scenery-view kick must have been issued exactly once.
+    matching = [
+        c
+        for c in calls
+        if c[0] == "method_async"
+        and c[2].get("method") == "iscope_start_view"
+        and c[2].get("params", {}).get("mode") == "scenery"
+    ]
+    assert matching, f"expected a scenery iscope_start_view kick, got: {calls}"
+    assert matching[0][1] == 1
+
+    # Page should still render the calibration UI.
+    assert "Calibrate rotation" in resp.text
+    assert 'id="cal-vid"' in resp.text
+
+
+def test_calibrate_rotation_page_renders_when_streaming_kick_fails(monkeypatch):
+    """If the firmware is unreachable, the streaming-kick must not
+    block the page render — the user can still drive the calibration
+    UI's REST endpoints and the prior/targets calls surface the
+    backend-offline state separately."""
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("firmware offline")
+
+    monkeypatch.setattr(front_app, "do_action_device", boom)
+    monkeypatch.setattr(
+        front_app,
+        "get_context",
+        lambda _tid, _req: _minimal_context("calibrate_rotation", online=True),
+    )
+    req = DummyHTMXReq(relative_uri="/1/calibrate_rotation")
+    resp = DummyResp()
+
+    front_app.CalibrateRotationResource.on_get(req, resp, telescope_id=1)
+    assert "Calibrate rotation" in resp.text
+
+
+def test_calibrate_rotation_targets_default_first_is_hyperion(monkeypatch):
+    """CalibrationTargetsResource must return Hyperion as the first
+    default landmark so the page UI's pre-selection (state.targets[0])
+    lands on Hyperion. Regression for the previous behavior, where
+    `filter_visible`'s height-based ranking pushed the taller LA
+    broadcast tower ahead of Hyperion."""
+    from device.config import Config
+    from scripts.trajectory.faa_dof import HYPERION_06_000301
+
+    monkeypatch.setattr(Config, "port", 5555)
+
+    class FakeAlpaca:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        "device.alpaca_client.AlpacaClient",
+        FakeAlpaca,
+    )
+    # Dockweiler Beach — both default landmarks visible from here.
+    monkeypatch.setattr(
+        "scripts.trajectory.observer.fetch_telescope_lonlat",
+        lambda _cli: (33.9615051, -118.4581361),
+    )
+
+    class _Req:
+        params = {"altitude_m": "2.0"}
+
+    class _Resp:
+        status = None
+        content_type = None
+        text = None
+
+    req = _Req()
+    resp = _Resp()
+    front_app.CalibrationTargetsResource.on_get(req, resp, telescope_id=1)
+    payload = json.loads(resp.text)
+    defaults = payload["defaults"]
+    assert len(defaults) >= 1
+    assert defaults[0]["oas"] == HYPERION_06_000301.oas
+    assert "Hyperion" in defaults[0]["name"]

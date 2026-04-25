@@ -4671,6 +4671,19 @@ class CalibrateRotationResource:
 
     @staticmethod
     def on_get(req, resp, telescope_id=1):
+        # Kick the firmware into scenery view mode so the MJPEG stream
+        # produces frames before "Start calibration" is clicked.
+        # Daytime calibration runs in scenery anyway, so already-active
+        # scenery is a no-op. Errors are swallowed so the calibration
+        # UI still renders when the device is unreachable.
+        try:
+            do_action_device(
+                "method_async",
+                telescope_id,
+                {"method": "iscope_start_view", "params": {"mode": "scenery"}},
+            )
+        except Exception:
+            pass
         context = get_context(telescope_id, req)
         render_template(
             req,
@@ -4772,6 +4785,7 @@ class CalibrationTargetsResource:
             list(DEFAULT_LANDMARKS),
             site,
             min_el_deg=0.3,
+            preserve_order=True,
         )
         dof = []
         if len(defaults) < 2:
@@ -4919,6 +4933,7 @@ class CalibrationStartResource:
             list(DEFAULT_LANDMARKS),
             site,
             min_el_deg=0.3,
+            preserve_order=True,
         )
         pool = list(default_hits)
         if len(pool) < 2 or target_oas:

@@ -70,6 +70,7 @@ class Landmark:
     white strobe). Unlit landmarks (``lit=False``) work for daytime
     calibration only.
     """
+
     oas: str
     name: str
     lat_deg: float
@@ -92,7 +93,7 @@ HYPERION_06_000301 = Landmark(
     lat_deg=33.918889,
     lon_deg=-118.427223,
     height_amsl_m=339.0 * 0.3048,  # 339 ft AMSL → 103.33 m
-    lit=True,                       # L-864 red obstruction + L-810 sides
+    lit=True,  # L-864 red obstruction + L-810 sides
     accuracy_class="1A",
     obstacle_type="STACK",
     city="El Segundo / Playa del Rey",
@@ -101,11 +102,11 @@ HYPERION_06_000301 = Landmark(
 LA_BROADCAST_06_000177 = Landmark(
     oas="06-000177",
     name="LA broadcast tower (Baldwin Hills cluster)",
-    lat_deg=34.027767,            # 34° 01' 39.96" N
-    lon_deg=-118.373250,           # 118° 22' 23.70" W
+    lat_deg=34.027767,  # 34° 01' 39.96" N
+    lon_deg=-118.373250,  # 118° 22' 23.70" W
     height_amsl_m=568.0 * 0.3048,  # 568 ft AMSL → 173.13 m (473 ft AGL)
-    lit=True,                      # L-864 red beacon per DOF record
-    accuracy_class="1B",           # 1 = ±50 ft horiz, B = ±10 ft vert
+    lit=True,  # L-864 red beacon per DOF record
+    accuracy_class="1B",  # 1 = ±50 ft horiz, B = ±10 ft vert
     obstacle_type="TOWER",
     city="Los Angeles",
 )
@@ -127,7 +128,8 @@ CULVER_CITY_06_001087 = Landmark(
 )
 
 DEFAULT_LANDMARKS: tuple[Landmark, ...] = (
-    HYPERION_06_000301, LA_BROADCAST_06_000177,
+    HYPERION_06_000301,
+    LA_BROADCAST_06_000177,
 )
 
 
@@ -139,8 +141,10 @@ def _compute_topo(site: ObserverSite, landmarks: list[Landmark]) -> np.ndarray:
     if not landmarks:
         return np.zeros((0, 3))
     ecef = np.asarray(
-        [list(lla_to_ecef(lm.lat_deg, lm.lon_deg, lm.height_amsl_m))
-         for lm in landmarks],
+        [
+            list(lla_to_ecef(lm.lat_deg, lm.lon_deg, lm.height_amsl_m))
+            for lm in landmarks
+        ],
         dtype=float,
     )
     az, el, slant = ecef_array_to_topo(ecef, site)
@@ -158,12 +162,20 @@ def filter_visible(
     k: float | None = None,
     dem_source: str = "srtm1",
     dem_provider=None,
+    preserve_order: bool = False,
 ) -> list[tuple[Landmark, float, float, float]]:
     """Return the top-N landmarks visible from ``site``.
 
     Visible = above ``min_el_deg`` and within ``max_slant_km`` of the
     observer. Ranked by ``(lit desc, height_amsl_m desc, slant asc)``
     so lit, tall, close obstructions bubble up first.
+
+    When ``preserve_order=True``, the height/slant tiebreaker is
+    skipped and results are returned in the input order. Used when
+    the caller passes a hand-curated list (e.g. ``DEFAULT_LANDMARKS``)
+    where source order encodes intent — Hyperion is the closer, lit
+    primary calibration target and should remain first even though
+    LA Broadcast is taller.
 
     When ``check_terrain=True``, each remaining candidate is also run
     through :func:`scripts.trajectory.terrain_los.check_los` and
@@ -192,13 +204,19 @@ def filter_visible(
         filtered: list[tuple[Landmark, float, float, float]] = []
         for lm, az, el, slant in out:
             los = check_los(
-                site, lm.lat_deg, lm.lon_deg, lm.height_amsl_m,
-                k=k, dem_source=dem_source, dem_provider=dem_provider,
+                site,
+                lm.lat_deg,
+                lm.lon_deg,
+                lm.height_amsl_m,
+                k=k,
+                dem_source=dem_source,
+                dem_provider=dem_provider,
             )
             if los.visible:
                 filtered.append((lm, az, el, slant))
         out = filtered
-    out.sort(key=lambda t: (not t[0].lit, -t[0].height_amsl_m, t[3]))
+    if not preserve_order:
+        out.sort(key=lambda t: (not t[0].lit, -t[0].height_amsl_m, t[3]))
     return out[:top_n]
 
 
@@ -319,8 +337,7 @@ def iter_dof_records(zip_path: Path, *, state: str = "06"):
     with zipfile.ZipFile(zip_path) as zf:
         # DAT archives typically contain a single DOF.DAT file; scan
         # members rather than assume a name.
-        members = [n for n in zf.namelist()
-                   if n.upper().endswith(".DAT")]
+        members = [n for n in zf.namelist() if n.upper().endswith(".DAT")]
         if not members:
             return
         with zf.open(members[0]) as raw:
@@ -366,9 +383,9 @@ def fetch_nearby_landmarks(
 # Source: FAA DOF User Guide rev. 2023. "5" horizontal and "H"/"I"
 # vertical are explicitly "unknown / unverified" so we surface NaN.
 _FAA_H_FT: dict[str, float] = {
-    "1":   50.0,
-    "2":  250.0,
-    "3":  500.0,
+    "1": 50.0,
+    "2": 250.0,
+    "3": 500.0,
     "4": 1000.0,
     "5": float("nan"),
     "6": float("nan"),
@@ -377,10 +394,10 @@ _FAA_H_FT: dict[str, float] = {
     "9": float("nan"),
 }
 _FAA_V_FT: dict[str, float] = {
-    "A":   3.0,
-    "B":  10.0,
-    "C":  20.0,
-    "D":  50.0,
+    "A": 3.0,
+    "B": 10.0,
+    "C": 20.0,
+    "D": 50.0,
     "E": 125.0,
     "F": 250.0,
     "G": 500.0,
@@ -434,10 +451,7 @@ def aiming_hint(landmark: "Landmark") -> str:
     # the distinction between L-864, L-810, and strobes is captured
     # well enough by type + lit for the phrasing here to be useful.
     if not landmark.lit:
-        return (
-            "Unlit — daytime only. Aim at the top-centre silhouette "
-            "against the sky."
-        )
+        return "Unlit — daytime only. Aim at the top-centre silhouette against the sky."
     if "STACK" in t:
         return (
             "Red L-864 beacon at the top of the taller stack "
@@ -448,8 +462,5 @@ def aiming_hint(landmark: "Landmark") -> str:
     if "TOWER" in t:
         return "Red L-864 flashing beacon at the very top of the tower."
     if "BLDG" in t:
-        return (
-            "Top-edge marker light; aim at the highest lit point on "
-            "the roofline."
-        )
+        return "Top-edge marker light; aim at the highest lit point on the roofline."
     return "Top of the structure."
