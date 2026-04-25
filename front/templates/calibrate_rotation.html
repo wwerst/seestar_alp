@@ -201,9 +201,9 @@
 
         <h4 style="margin-top:10px;">Step size</h4>
         <div class="cal-step-row" id="cal-step-row">
-          <button class="cal-btn" data-step="0.05">±0.05°</button>
-          <button class="cal-btn active" data-step="0.2">±0.2°</button>
-          <button class="cal-btn" data-step="1.0">±1°</button>
+          <button class="cal-btn" data-step="0.005">±0.005°</button>
+          <button class="cal-btn active" data-step="0.02">±0.02°</button>
+          <button class="cal-btn" data-step="0.1">±0.1°</button>
         </div>
 
         <h4 style="margin-top:10px;">Nudge</h4>
@@ -324,11 +324,23 @@
     kpiRMS: document.getElementById('cal-kpi-rms'),
   };
 
+  // Source of truth for the default step is the button marked
+  // `active` in the markup; fall back to the first button if no
+  // explicit default is set. Avoids drift if the markup default
+  // changes without a matching JS update.
+  function _initialStepDeg() {
+    const btn =
+      els.stepRow.querySelector('button.active') ||
+      els.stepRow.querySelector('button[data-step]');
+    const v = btn ? parseFloat(btn.dataset.step) : NaN;
+    return isFinite(v) ? v : 0.02;
+  }
+
   let state = {
     priorInfo: null,
     targets: [],           // [{oas, ..., aiming_hint, sigma_az_deg, sigma_el_deg}]
     selectedOas: new Set(),
-    stepDeg: 0.2,
+    stepDeg: _initialStepDeg(),
     sessionActive: false,
     phase: 'idle',
   };
