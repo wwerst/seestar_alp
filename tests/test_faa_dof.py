@@ -96,6 +96,26 @@ def test_filter_visible_excludes_beyond_radius():
     assert len(filter_visible([far], site, max_slant_km=500.0)) == 1
 
 
+def test_filter_visible_preserve_order_keeps_default_landmarks_in_input_order():
+    """DEFAULT_LANDMARKS is hand-curated with Hyperion first because it
+    is the closer, lit primary calibration target. The default
+    height-based sort would push the taller LA broadcast tower ahead of
+    Hyperion. ``preserve_order=True`` opts out of the sort so the page
+    UI's "select first two" pre-selection lands on Hyperion."""
+    site = build_site(lat_deg=33.9615051, lon_deg=-118.4581361, alt_m=2.0)
+    hits = filter_visible(
+        list(DEFAULT_LANDMARKS), site, min_el_deg=0.0, preserve_order=True
+    )
+    assert len(hits) == 2
+    assert hits[0][0].oas == HYPERION_06_000301.oas
+    assert "Hyperion" in hits[0][0].name
+    assert hits[1][0].oas == LA_BROADCAST_06_000177.oas
+    # Without preserve_order, the height-based tiebreaker would invert
+    # the order — confirm the tested behaviour actually opts out of it.
+    sorted_hits = filter_visible(list(DEFAULT_LANDMARKS), site, min_el_deg=0.0)
+    assert sorted_hits[0][0].oas == LA_BROADCAST_06_000177.oas
+
+
 def test_filter_visible_ranks_lit_then_height_then_slant():
     site = build_site(lat_deg=0.0, lon_deg=0.0, alt_m=0.0)
     # Three candidates at various positions, all visible.

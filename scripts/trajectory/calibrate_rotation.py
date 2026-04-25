@@ -138,6 +138,7 @@ def _filter_with_optional_terrain(
     *,
     top_n: int = 10,
     min_el_deg: float = 0.3,
+    preserve_order: bool = False,
 ) -> tuple[list[tuple[Landmark, float, float, float]], list[Landmark]]:
     """Run ``filter_visible`` first with terrain LoS checking, falling
     back to the plain horizon+slant filter if the DEM isn't available.
@@ -146,17 +147,30 @@ def _filter_with_optional_terrain(
     the set of landmarks that the horizon+slant filter kept but the
     terrain filter rejected, so the REPL can show them in a "dropped
     because behind terrain" list.
+
+    ``preserve_order=True`` keeps the input order (used for hand-curated
+    ``DEFAULT_LANDMARKS``).
     """
-    plain = filter_visible(landmarks, site, min_el_deg=min_el_deg,
-                           top_n=top_n)
+    plain = filter_visible(
+        landmarks,
+        site,
+        min_el_deg=min_el_deg,
+        top_n=top_n,
+        preserve_order=preserve_order,
+    )
     try:
         terrain_hits = filter_visible(
-            landmarks, site, min_el_deg=min_el_deg, top_n=top_n,
+            landmarks,
+            site,
+            min_el_deg=min_el_deg,
+            top_n=top_n,
             check_terrain=True,
+            preserve_order=preserve_order,
         )
     except Exception as exc:
-        _print(f"[calibrate] [warn] terrain LoS unavailable ({exc}); "
-               "continuing without it")
+        _print(
+            f"[calibrate] [warn] terrain LoS unavailable ({exc}); continuing without it"
+        )
         return plain, []
     terrain_oas = {h[0].oas for h in terrain_hits}
     dropped = [h[0] for h in plain if h[0].oas not in terrain_oas]
@@ -173,11 +187,16 @@ def _choose_targets(
     offer up to 10 visible candidates. When a DEM is available,
     terrain LoS rejects candidates behind intervening ridges."""
     default_hits, _default_dropped = _filter_with_optional_terrain(
-        list(DEFAULT_LANDMARKS), site, min_el_deg=0.3,
+        list(DEFAULT_LANDMARKS),
+        site,
+        min_el_deg=0.3,
+        preserve_order=True,
     )
     if len(default_hits) >= 2:
-        _print("[calibrate] using default landmarks: "
-               + ", ".join(h[0].oas for h in default_hits[:2]))
+        _print(
+            "[calibrate] using default landmarks: "
+            + ", ".join(h[0].oas for h in default_hits[:2])
+        )
         return default_hits[:2]
 
     _print("[calibrate] default landmarks below horizon; fetching FAA DOF…")
@@ -190,7 +209,10 @@ def _choose_targets(
             f"  {_repo_cache_hint()}"
         ) from exc
     hits, dropped_terrain = _filter_with_optional_terrain(
-        candidates, site, top_n=10, min_el_deg=0.3,
+        candidates,
+        site,
+        top_n=10,
+        min_el_deg=0.3,
     )
     if not hits:
         raise SystemExit("no visible DOF landmarks within 20 km — move the site?")
@@ -198,12 +220,16 @@ def _choose_targets(
     _print("[calibrate] visible landmarks (pick two):")
     for i, (lm, az, el, slant) in enumerate(hits, start=1):
         lit_flag = "lit" if lm.lit else "unlit"
-        _print(f"  [{i:2d}] {lm.oas}  {lm.name[:35]:<35}  "
-               f"az={az:6.2f}°  el={el:5.2f}°  slant={slant/1000:4.1f}km  "
-               f"{lit_flag}")
+        _print(
+            f"  [{i:2d}] {lm.oas}  {lm.name[:35]:<35}  "
+            f"az={az:6.2f}°  el={el:5.2f}°  slant={slant / 1000:4.1f}km  "
+            f"{lit_flag}"
+        )
     if dropped_terrain:
-        _print("[calibrate] dropped because terrain blocks the path: "
-               + ", ".join(lm.oas for lm in dropped_terrain))
+        _print(
+            "[calibrate] dropped because terrain blocks the path: "
+            + ", ".join(lm.oas for lm in dropped_terrain)
+        )
     if not interactive:
         return hits[:2]
     picks: list[int] = []
@@ -228,6 +254,7 @@ def _choose_targets(
 
 def _repo_cache_hint() -> str:
     from scripts.trajectory.faa_dof import default_cache_path
+
     return str(default_cache_path())
 
 
@@ -258,8 +285,10 @@ def _nudge_loop(
             continue
         if raw in ("ok", "y", "accept"):
             if no_move or dry_run:
-                _print(f"  [recorded synthetic encoder={target_az_deg:+.3f}, "
-                       f"{target_el_deg:+.3f}]")
+                _print(
+                    f"  [recorded synthetic encoder={target_az_deg:+.3f}, "
+                    f"{target_el_deg:+.3f}]"
+                )
                 return target_az_deg, target_el_deg
             enc_el, enc_az = _read_encoder(cli)
             _print(f"  [recorded encoder az={enc_az:+.3f}° el={enc_el:+.3f}°]")
@@ -270,8 +299,10 @@ def _nudge_loop(
             raise SystemExit("aborted by user")
         if raw == "show":
             if no_move or dry_run:
-                _print(f"  synthetic target = az {target_az_deg:+.3f}° "
-                       f"el {target_el_deg:+.3f}°")
+                _print(
+                    f"  synthetic target = az {target_az_deg:+.3f}° "
+                    f"el {target_el_deg:+.3f}°"
+                )
                 continue
             try:
                 enc_el, enc_az = _read_encoder(cli)
@@ -299,9 +330,13 @@ def _nudge_loop(
         try:
             enc_el, enc_az, _stats = move_to_ff(
                 cli,
-                target_az_deg=target_az_deg, target_el_deg=target_el_deg,
-                cur_az_deg=cur_az, cur_el_deg=cur_el, loc=loc,
-                tag="[calibrate]", arrive_tolerance_deg=0.1,
+                target_az_deg=target_az_deg,
+                target_el_deg=target_el_deg,
+                cur_az_deg=cur_az,
+                cur_el_deg=cur_el,
+                loc=loc,
+                tag="[calibrate]",
+                arrive_tolerance_deg=0.1,
             )
             cur_el, cur_az = enc_el, enc_az
             _print(f"  arrived: az={enc_az:+.3f}° el={enc_el:+.3f}°")
@@ -327,20 +362,29 @@ def _initial_slew(
     # Wrap az to [-180, 180) — encoder convention matches measure_altaz_timed.
     pred_az_wrapped = _wrap_pm180(pred_az)
     if no_move or dry_run:
-        _print(f"  [no-move] would slew to encoder az={pred_az_wrapped:+.2f}° "
-               f"el={pred_el:+.2f}°")
+        _print(
+            f"  [no-move] would slew to encoder az={pred_az_wrapped:+.2f}° "
+            f"el={pred_el:+.2f}°"
+        )
         return pred_az_wrapped, pred_el
     try:
         cur_el, cur_az = _read_encoder(cli)
     except Exception:
         cur_el, cur_az = pred_el, pred_az_wrapped
-    _print(f"  slewing to encoder az={pred_az_wrapped:+.2f}° el={pred_el:+.2f}° "
-           f"from az={cur_az:+.2f}° el={cur_el:+.2f}°")
+    _print(
+        f"  slewing to encoder az={pred_az_wrapped:+.2f}° el={pred_el:+.2f}° "
+        f"from az={cur_az:+.2f}° el={cur_el:+.2f}°"
+    )
     loc = EarthLocation.from_geodetic(0, 0, 0)
     new_el, new_az, _ = move_to_ff(
-        cli, target_az_deg=pred_az_wrapped, target_el_deg=pred_el,
-        cur_az_deg=cur_az, cur_el_deg=cur_el, loc=loc,
-        tag="[calibrate_rotation]", arrive_tolerance_deg=0.3,
+        cli,
+        target_az_deg=pred_az_wrapped,
+        target_el_deg=pred_el,
+        cur_az_deg=cur_az,
+        cur_el_deg=cur_el,
+        loc=loc,
+        tag="[calibrate_rotation]",
+        arrive_tolerance_deg=0.3,
     )
     _print(f"  arrived: az={new_az:+.3f}° el={new_el:+.3f}°")
     return new_az, new_el
@@ -381,42 +425,76 @@ def _sightings_from_json(path: Path) -> list[Sighting]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--device", type=int, default=1)
-    parser.add_argument("--out", type=Path, default=_CAL_PATH,
-                        help="calibration output path (default device/mount_calibration.json)")
-    parser.add_argument("--altitude-m", type=float, default=None,
-                        help="Observer altitude in metres AMSL. Overrides --altitude-source.")
-    parser.add_argument("--altitude-source",
-                        choices=("menu", "dem_lookup", "lookup", "prior", "prompt"),
-                        default="menu",
-                        help="Where to get the altitude from when --altitude-m is absent. "
-                             "'menu' (default) shows an interactive chooser with a smart "
-                             "default; 'dem_lookup' reads the SRTM DEM tile covering the "
-                             "observer and adds a 1.6 m eye-height; 'lookup' hits "
-                             "Open-Meteo; 'prior' reuses the last calibration's altitude; "
-                             "'prompt' asks the user.")
-    parser.add_argument("--yes-clear", action="store_true",
-                        help="Non-interactive: clear prior calibration (backup to .bak) "
-                             "before starting.")
-    parser.add_argument("--keep-prior", action="store_true",
-                        help="Non-interactive: keep prior calibration for seeding. "
-                             "Conflicts with --yes-clear.")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Skip mount motion and skip writing the JSON.")
-    parser.add_argument("--no-move", action="store_true",
-                        help="Skip mount motion; still reads encoder on 'ok' "
-                             "unless combined with --sightings.")
-    parser.add_argument("--sightings", type=Path, default=None,
-                        help="Solve from a previously-saved sightings JSON "
-                             "instead of running the REPL.")
-    parser.add_argument("--save-sightings", type=Path, default=None,
-                        help="Write captured sightings to JSON (for replay).")
-    parser.add_argument("--force", action="store_true",
-                        help="Write calibration even if residual RMS > 0.5°.")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=_CAL_PATH,
+        help="calibration output path (default device/mount_calibration.json)",
+    )
+    parser.add_argument(
+        "--altitude-m",
+        type=float,
+        default=None,
+        help="Observer altitude in metres AMSL. Overrides --altitude-source.",
+    )
+    parser.add_argument(
+        "--altitude-source",
+        choices=("menu", "dem_lookup", "lookup", "prior", "prompt"),
+        default="menu",
+        help="Where to get the altitude from when --altitude-m is absent. "
+        "'menu' (default) shows an interactive chooser with a smart "
+        "default; 'dem_lookup' reads the SRTM DEM tile covering the "
+        "observer and adds a 1.6 m eye-height; 'lookup' hits "
+        "Open-Meteo; 'prior' reuses the last calibration's altitude; "
+        "'prompt' asks the user.",
+    )
+    parser.add_argument(
+        "--yes-clear",
+        action="store_true",
+        help="Non-interactive: clear prior calibration (backup to .bak) "
+        "before starting.",
+    )
+    parser.add_argument(
+        "--keep-prior",
+        action="store_true",
+        help="Non-interactive: keep prior calibration for seeding. "
+        "Conflicts with --yes-clear.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Skip mount motion and skip writing the JSON.",
+    )
+    parser.add_argument(
+        "--no-move",
+        action="store_true",
+        help="Skip mount motion; still reads encoder on 'ok' "
+        "unless combined with --sightings.",
+    )
+    parser.add_argument(
+        "--sightings",
+        type=Path,
+        default=None,
+        help="Solve from a previously-saved sightings JSON "
+        "instead of running the REPL.",
+    )
+    parser.add_argument(
+        "--save-sightings",
+        type=Path,
+        default=None,
+        help="Write captured sightings to JSON (for replay).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Write calibration even if residual RMS > 0.5°.",
+    )
     args = parser.parse_args(argv)
 
     if args.yes_clear and args.keep_prior:
@@ -434,7 +512,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _handle_clear_or_keep(
-    args: argparse.Namespace, prior: PriorInfo | None,
+    args: argparse.Namespace,
+    prior: PriorInfo | None,
 ) -> bool:
     """Return True if the caller should use the prior for seeding,
     False if it was (or never was) cleared.
@@ -450,15 +529,19 @@ def _handle_clear_or_keep(
     dist_str = f"{dist_m:.1f} m" if dist_m is not None else "no observer on file"
     default_keep = decide_clear_or_keep(prior)
     _print(f"[calibrate] prior calibration at {prior.path}:")
-    _print(f"             age {age_str}, {dist_str} from current GPS → "
-           f"default: {'keep' if default_keep else 'clear'}")
+    _print(
+        f"             age {age_str}, {dist_str} from current GPS → "
+        f"default: {'keep' if default_keep else 'clear'}"
+    )
 
     if args.yes_clear:
         decision_keep = False
     elif args.keep_prior:
         decision_keep = True
     else:
-        prompt = "Clear prior calibration? " + ("[y/N]: " if default_keep else "[Y/n]: ")
+        prompt = "Clear prior calibration? " + (
+            "[y/N]: " if default_keep else "[Y/n]: "
+        )
         try:
             raw = input(prompt).strip().lower()
         except EOFError:
@@ -503,8 +586,10 @@ def _prompt_altitude() -> float:
 
 def _resolve_altitude(
     args: argparse.Namespace,
-    lat_deg: float, lon_deg: float,
-    prior: PriorInfo | None, prior_kept: bool,
+    lat_deg: float,
+    lon_deg: float,
+    prior: PriorInfo | None,
+    prior_kept: bool,
 ) -> float:
     """Decide observer altitude (metres AMSL).
 
@@ -530,16 +615,20 @@ def _resolve_altitude(
                 "--altitude-source prior requested but no nearby prior "
                 "calibration has a recorded altitude"
             )
-        _print(f"[calibrate] altitude from prior calibration: "
-               f"{prior.observer_alt_m:.2f} m AMSL")
+        _print(
+            f"[calibrate] altitude from prior calibration: "
+            f"{prior.observer_alt_m:.2f} m AMSL"
+        )
         return float(prior.observer_alt_m)
 
     if source == "dem_lookup":
         ground = dem_lookup_elevation(lat_deg, lon_deg)
         eye = float(ground) + DEFAULT_EYE_HEIGHT_AGL_M
-        _print(f"[calibrate] altitude from DEM (SRTM): ground "
-               f"{ground:.2f} m + eye {DEFAULT_EYE_HEIGHT_AGL_M:.1f} m "
-               f"= {eye:.2f} m AMSL")
+        _print(
+            f"[calibrate] altitude from DEM (SRTM): ground "
+            f"{ground:.2f} m + eye {DEFAULT_EYE_HEIGHT_AGL_M:.1f} m "
+            f"= {eye:.2f} m AMSL"
+        )
         return eye
 
     if source == "lookup":
@@ -555,8 +644,10 @@ def _resolve_altitude(
 
 
 def _altitude_menu(
-    lat_deg: float, lon_deg: float,
-    prior: PriorInfo | None, prior_available: bool,
+    lat_deg: float,
+    lon_deg: float,
+    prior: PriorInfo | None,
+    prior_available: bool,
 ) -> float:
     """Interactive altitude source chooser.
 
@@ -576,10 +667,12 @@ def _altitude_menu(
         ("lookup", "elevation lookup (Open-Meteo)"),
     ]
     if prior_available:
-        options.append((
-            "prior",
-            f"use prior calibration ({prior.observer_alt_m:.2f} m)",
-        ))
+        options.append(
+            (
+                "prior",
+                f"use prior calibration ({prior.observer_alt_m:.2f} m)",
+            )
+        )
     options.append(("manual", "enter manually"))
     default_idx = 1  # DEM lookup
     while True:
@@ -606,8 +699,10 @@ def _altitude_menu(
                 _print(f"  [DEM lookup failed] {exc}")
                 continue  # re-show menu
             eye = float(ground) + DEFAULT_EYE_HEIGHT_AGL_M
-            _print(f"  → DEM {ground:.2f} m + eye "
-                   f"{DEFAULT_EYE_HEIGHT_AGL_M:.1f} m = {eye:.2f} m AMSL")
+            _print(
+                f"  → DEM {ground:.2f} m + eye "
+                f"{DEFAULT_EYE_HEIGHT_AGL_M:.1f} m = {eye:.2f} m AMSL"
+            )
             return eye
         if key == "lookup":
             try:
@@ -626,7 +721,8 @@ def _altitude_menu(
 
 
 def _load_prior_frame(
-    out_path: Path, site: ObserverSite,
+    out_path: Path,
+    site: ObserverSite,
 ) -> MountFrame | None:
     if not out_path.exists():
         return None
@@ -653,8 +749,10 @@ def _main_live(args: argparse.Namespace) -> int:
     # or prompt. Menu picks a sensible default based on what's available.
     alt_m = _resolve_altitude(args, lat_deg, lon_deg, prior, prior_kept)
     site = build_site(lat_deg=lat_deg, lon_deg=lon_deg, alt_m=alt_m)
-    _print(f"[calibrate] observer @ lat={site.lat_deg:+.6f}° "
-           f"lon={site.lon_deg:+.6f}° alt={site.alt_m:.1f} m")
+    _print(
+        f"[calibrate] observer @ lat={site.lat_deg:+.6f}° "
+        f"lon={site.lon_deg:+.6f}° alt={site.alt_m:.1f} m"
+    )
 
     if not args.dry_run and not args.no_move:
         try:
@@ -677,47 +775,66 @@ def _main_live(args: argparse.Namespace) -> int:
 
     sightings: list[Sighting] = []
     for i, (lm, true_az, true_el, slant) in enumerate(chosen, start=1):
-        _print(f"\n[calibrate] landmark {i}/{len(chosen)}: "
-               f"{lm.oas} {lm.name}")
-        _print(f"  true (az, el) = ({true_az:.2f}°, {true_el:.2f}°)  "
-               f"slant = {slant/1000:.2f} km")
-        _print(f"  lighting: {'LIT (L-864/L-810/etc.)' if lm.lit else 'UNLIT — daylight only'}")
+        _print(f"\n[calibrate] landmark {i}/{len(chosen)}: {lm.oas} {lm.name}")
+        _print(
+            f"  true (az, el) = ({true_az:.2f}°, {true_el:.2f}°)  "
+            f"slant = {slant / 1000:.2f} km"
+        )
+        _print(
+            f"  lighting: {'LIT (L-864/L-810/etc.)' if lm.lit else 'UNLIT — daylight only'}"
+        )
         target_az, target_el = _initial_slew(
-            cli, site, lm, working_frame,
-            dry_run=args.dry_run, no_move=args.no_move,
+            cli,
+            site,
+            lm,
+            working_frame,
+            dry_run=args.dry_run,
+            no_move=args.no_move,
         )
         _print("  nudge the mount until the beacon is centered on the imager.")
         _print("  commands: 'h +0.2' (az), 'v -0.1' (el), 'show', 'ok', 'skip', 'quit'")
         rec = _nudge_loop(
-            cli, target_az, target_el,
-            dry_run=args.dry_run, no_move=args.no_move,
+            cli,
+            target_az,
+            target_el,
+            dry_run=args.dry_run,
+            no_move=args.no_move,
         )
         if rec is None:
             _print("  skipped.")
             continue
         enc_az, enc_el = rec
-        sightings.append(Sighting(
-            landmark=lm, encoder_az_deg=float(enc_az),
-            encoder_el_deg=float(enc_el),
-            true_az_deg=float(true_az), true_el_deg=float(true_el),
-            slant_m=float(slant), t_unix=time.time(),
-        ))
+        sightings.append(
+            Sighting(
+                landmark=lm,
+                encoder_az_deg=float(enc_az),
+                encoder_el_deg=float(enc_el),
+                true_az_deg=float(true_az),
+                true_el_deg=float(true_el),
+                slant_m=float(slant),
+                t_unix=time.time(),
+            )
+        )
 
         # Progressive fit: yaw-only after the first sighting, full
         # 3-DOF once we have ≥2. Print residuals so the user can judge
         # whether the sighting landed on the beacon or on a nearby
         # bright object (outliers show up as >1° el residual).
         interim = solve_rotation(sightings, site)
-        _print(f"  [progressive fit n={len(sightings)}, "
-               f"dof={'yaw' if len(sightings) == 1 else '3'}] "
-               f"yaw={interim.yaw_deg:+.3f}° "
-               f"pitch={interim.pitch_deg:+.3f}° "
-               f"roll={interim.roll_deg:+.3f}°  "
-               f"residual RMS={interim.residual_rms_deg:.3f}°")
+        _print(
+            f"  [progressive fit n={len(sightings)}, "
+            f"dof={'yaw' if len(sightings) == 1 else '3'}] "
+            f"yaw={interim.yaw_deg:+.3f}° "
+            f"pitch={interim.pitch_deg:+.3f}° "
+            f"roll={interim.roll_deg:+.3f}°  "
+            f"residual RMS={interim.residual_rms_deg:.3f}°"
+        )
         for lm_rec in interim.per_landmark:
-            _print(f"    {lm_rec['oas']}: "
-                   f"d_az={lm_rec['residual_az_deg']:+.3f}° "
-                   f"d_el={lm_rec['residual_el_deg']:+.3f}°")
+            _print(
+                f"    {lm_rec['oas']}: "
+                f"d_az={lm_rec['residual_az_deg']:+.3f}° "
+                f"d_el={lm_rec['residual_el_deg']:+.3f}°"
+            )
         # Refresh the frame used for the next landmark's predictive slew.
         working_frame = MountFrame.from_euler_deg(
             yaw_deg=interim.yaw_deg,
@@ -732,7 +849,8 @@ def _main_live(args: argparse.Namespace) -> int:
 
     if args.save_sightings is not None:
         args.save_sightings.write_text(
-            _sightings_to_json(sightings), encoding="utf-8",
+            _sightings_to_json(sightings),
+            encoding="utf-8",
         )
         _print(f"[calibrate] sightings saved to {args.save_sightings}")
 
@@ -751,17 +869,22 @@ def _main_replay(args: argparse.Namespace) -> int:
     # When replaying without a telescope, fall back to build_site() with
     # env vars; the caller can override via OBSERVER_LAT_DEG et al.
     from scripts.trajectory.observer import build_site
+
     site = build_site(alt_m=alt_m)
-    _print(f"[replay] observer @ lat={site.lat_deg:+.6f}° "
-           f"lon={site.lon_deg:+.6f}° alt={site.alt_m:.1f} m "
-           f"(from env vars / defaults)")
+    _print(
+        f"[replay] observer @ lat={site.lat_deg:+.6f}° "
+        f"lon={site.lon_deg:+.6f}° alt={site.alt_m:.1f} m "
+        f"(from env vars / defaults)"
+    )
     sol = solve_rotation(sightings, site)
     _report_and_write(sol, site, args)
     return 0
 
 
 def _report_and_write(
-    sol: RotationSolution, site: ObserverSite, args: argparse.Namespace,
+    sol: RotationSolution,
+    site: ObserverSite,
+    args: argparse.Namespace,
 ) -> None:
     _print("\n[calibrate] 3-DOF rotation fit:")
     _print(f"  yaw   = {sol.yaw_deg:+8.3f}°")
@@ -769,11 +892,15 @@ def _report_and_write(
     _print(f"  roll  = {sol.roll_deg:+8.3f}°")
     _print(f"  residual RMS = {sol.residual_rms_deg:.3f}°")
     for lm_rec in sol.per_landmark:
-        _print(f"    {lm_rec['oas']}: d_az={lm_rec['residual_az_deg']:+.3f}° "
-               f"d_el={lm_rec['residual_el_deg']:+.3f}°")
+        _print(
+            f"    {lm_rec['oas']}: d_az={lm_rec['residual_az_deg']:+.3f}° "
+            f"d_el={lm_rec['residual_el_deg']:+.3f}°"
+        )
     if sol.residual_rms_deg > 0.5 and not args.force:
-        _print("\n[calibrate] residual RMS > 0.5° — refusing to write "
-               "(pass --force to override).")
+        _print(
+            "\n[calibrate] residual RMS > 0.5° — refusing to write "
+            "(pass --force to override)."
+        )
         return
     if args.dry_run:
         _print("\n[calibrate] --dry-run: skipping JSON write.")
