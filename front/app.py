@@ -4861,6 +4861,168 @@ class CalibrationTargetsResource:
         )
 
 
+class CalibrationCelestialTargetsResource:
+    """Return the curated bright-star catalog + visible planets, filtered
+    by horizon visibility / magnitude / sun-cone / moon-cone, and either
+    ranked by proximity (when ``current_az`` and ``current_el`` are
+    provided) or by ascending magnitude (otherwise).
+
+    Parallel to :class:`CalibrationTargetsResource` but for the
+    nighttime calibration picker. Uses
+    :mod:`scripts.trajectory.celestial_targets` for the math and the
+    static catalog. Daytime callers will get an empty ``visible`` list
+    once every catalog target is within the sun cone (30° default) — by
+    design.
+
+    Query params:
+      altitude_m  default 2.0    — observer altitude AMSL.
+      min_el      default 20.0   — minimum apparent elevation (deg).
+      max_mag     default 4.0    — magnitude cap (lower vmag = brighter).
+      current_az  optional       — current pointing az (deg) for proximity sort.
+      current_el  optional       — current pointing el (deg); required if
+                                   ``current_az`` is given.
+      top_n       default 20     — number of results to return.
+    """
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        from datetime import datetime, timezone
+
+        from device.alpaca_client import AlpacaClient
+        from scripts.trajectory.celestial_targets import (
+            all_targets,
+            filter_visible,
+            moon_separation_deg,
+            sort_by_magnitude,
+            sort_by_proximity,
+            sun_separation_deg,
+        )
+        from scripts.trajectory.observer import (
+            build_site,
+            fetch_telescope_lonlat,
+        )
+
+        def _err400(msg):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": msg})
+
+        def _parse_float(name, default=None, *, allow_missing=True):
+            raw = req.params.get(name)
+            if raw is None or raw == "":
+                if allow_missing:
+                    return default
+                raise ValueError(f"{name} is required")
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be numeric")
+
+        try:
+            alt_m = _parse_float("altitude_m", default=2.0)
+            min_el = _parse_float("min_el", default=20.0)
+            max_mag = _parse_float("max_mag", default=4.0)
+            current_az = _parse_float("current_az", default=None)
+            current_el = _parse_float("current_el", default=None)
+            top_n_raw = req.params.get("top_n", "20")
+            try:
+                top_n = int(top_n_raw)
+            except (TypeError, ValueError):
+                _err400("top_n must be an integer")
+                return
+        except ValueError as exc:
+            _err400(str(exc))
+            return
+        # If exactly one of (current_az, current_el) is supplied the
+        # caller probably forgot the other. Reject loudly so the picker
+        # doesn't silently fall back to magnitude sort.
+        if (current_az is None) != (current_el is None):
+            _err400(
+                "current_az and current_el must be supplied together",
+            )
+            return
+
+        try:
+            cli = AlpacaClient(
+                "127.0.0.1",
+                int(Config.port),
+                int(telescope_id),
+            )
+            lat, lon = fetch_telescope_lonlat(cli)
+        except Exception as exc:
+            resp.status = falcon.HTTP_503
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": f"GPS unavailable: {exc}"})
+            return
+
+        when_utc = datetime.now(tz=timezone.utc)
+        site = build_site(lat_deg=lat, lon_deg=lon, alt_m=alt_m)
+
+        # Build the candidate pool (curated stars + freshly-computed
+        # planets), then apply the visibility filter at the requested
+        # thresholds. sun-sep / moon-sep are baked into ``filter_visible``.
+        pool = all_targets(when_utc, site)
+        visible = filter_visible(
+            pool,
+            site,
+            when_utc,
+            min_el_deg=min_el,
+            max_mag=max_mag,
+        )
+        if current_az is not None and current_el is not None:
+            ranked = sort_by_proximity(visible, current_az, current_el)
+        else:
+            ranked = [(t, az, el, None) for (t, az, el) in sort_by_magnitude(visible)]
+        ranked = ranked[: max(0, top_n)]
+
+        out_visible = []
+        for entry in ranked:
+            target, az, el, dist = entry
+            out_visible.append(
+                {
+                    "name": target.name,
+                    "kind": target.kind,
+                    "bayer": target.bayer,
+                    "vmag": float(target.vmag),
+                    "ra_hours": (
+                        None if target.ra_hours is None else float(target.ra_hours)
+                    ),
+                    "dec_deg": (
+                        None if target.dec_deg is None else float(target.dec_deg)
+                    ),
+                    "az_deg": float(az),
+                    "el_deg": float(el),
+                    "sun_sep_deg": float(
+                        sun_separation_deg(az, el, site, when_utc),
+                    ),
+                    "moon_sep_deg": float(
+                        moon_separation_deg(az, el, site, when_utc),
+                    ),
+                    "distance_deg": (None if dist is None else float(dist)),
+                    "notes": target.notes,
+                }
+            )
+
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            {
+                "visible": out_visible,
+                "observer": {
+                    "lat_deg": lat,
+                    "lon_deg": lon,
+                    "alt_m": alt_m,
+                    "when_utc": when_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                "filters": {
+                    "min_el_deg": min_el,
+                    "max_mag": max_mag,
+                    "top_n": top_n,
+                },
+            }
+        )
+
+
 def _nan_to_none(x):
     """JSON doesn't encode NaN; map to null for clean UI handling."""
     import math as _m
@@ -6967,6 +7129,10 @@ class FrontMain:
         app.add_route(
             "/api/{telescope_id:int}/calibration/targets",
             CalibrationTargetsResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibration/celestial-targets",
+            CalibrationCelestialTargetsResource(),
         )
         app.add_route(
             "/api/{telescope_id:int}/calibration/start",
