@@ -532,30 +532,39 @@ class CalibrateMotionManager:
 
     def start(self, session: CalibrateMotionSession) -> CalibrateMotionSession:
         tid = int(session.telescope_id)
-        # Cross-manager mutex against LiveTrackManager. Lazy import keeps
-        # this module from pulling in live_tracker at import time.
-        try:
-            from device.live_tracker import get_manager as _get_tracker_mgr
+        # Hold the shared per-telescope start-lock across the entire
+        # sequence (cross-checks + registry write + session.start()) so
+        # that concurrent CalibrationManager / LiveTrackManager /
+        # CalibrateMotionManager starts on the same scope cannot all pass
+        # their respective cross-checks. Mirrors the pattern in
+        # ``device.live_tracker.LiveTrackManager.start``.
+        from device._scope_start_lock import get_scope_start_lock
 
-            tracker = _get_tracker_mgr().get(tid)
-            if tracker is not None and tracker.is_alive():
-                raise RuntimeError(
-                    f"telescope {tid} is live-tracking; stop the live tracker first"
-                )
-        except ImportError:
-            pass
-        with self._lock:
-            existing = self._sessions.get(tid)
-            if existing is not None and existing.is_alive():
-                raise RuntimeError(
-                    f"telescope {tid} already in calibrate-motion mode; "
-                    "stop the existing session first"
-                )
-            # Start under the lock so the cross-check + registry write +
-            # thread spawn are atomic against another concurrent start
-            # call. Same pattern as LiveTrackManager.start.
-            session.start()
-            self._sessions[tid] = session
+        with get_scope_start_lock(tid):
+            # Cross-manager mutex against LiveTrackManager. Lazy import keeps
+            # this module from pulling in live_tracker at import time.
+            try:
+                from device.live_tracker import get_manager as _get_tracker_mgr
+
+                tracker = _get_tracker_mgr().get(tid)
+                if tracker is not None and tracker.is_alive():
+                    raise RuntimeError(
+                        f"telescope {tid} is live-tracking; stop the live tracker first"
+                    )
+            except ImportError:
+                pass
+            with self._lock:
+                existing = self._sessions.get(tid)
+                if existing is not None and existing.is_alive():
+                    raise RuntimeError(
+                        f"telescope {tid} already in calibrate-motion mode; "
+                        "stop the existing session first"
+                    )
+                # Start under the lock so the cross-check + registry write +
+                # thread spawn are atomic against another concurrent start
+                # call. Same pattern as LiveTrackManager.start.
+                session.start()
+                self._sessions[tid] = session
         return session
 
     def stop(self, telescope_id: int) -> MotionStatus | None:
