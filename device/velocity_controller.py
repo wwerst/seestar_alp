@@ -154,9 +154,7 @@ def unwrap_az_series(wrapped_samples: list[float]) -> list[float]:
     out: list[float] = []
     for i, v in enumerate(wrapped_samples):
         if not math.isfinite(v):
-            raise ValueError(
-                f"unwrap_az_series: non-finite sample at index {i}: {v!r}"
-            )
+            raise ValueError(f"unwrap_az_series: non-finite sample at index {i}: {v!r}")
     out.append(wrapped_samples[0])
     for i in range(1, len(wrapped_samples)):
         d = wrap_pm180(wrapped_samples[i] - wrapped_samples[i - 1])
@@ -1636,8 +1634,7 @@ def move_to_ff(
 
             # Convergence: both axes past trajectory AND within tolerance.
             both_past = (
-                t_plant >= traj_az.total_duration
-                and t_plant >= traj_el.total_duration
+                t_plant >= traj_az.total_duration and t_plant >= traj_el.total_duration
             )
             if both_past:
                 if t_settle_enter is None:
