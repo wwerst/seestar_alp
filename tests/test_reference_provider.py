@@ -108,11 +108,21 @@ def test_rejects_too_few_samples(tmp_path):
     with path.open("w", encoding="utf-8") as f:
         f.write(json.dumps({"kind": "header", "source": "adsb"}) + "\n")
         for i in range(3):
-            f.write(json.dumps({
-                "kind": "sample", "t_unix": float(i),
-                "ecef_x": 0.0, "ecef_y": 0.0, "ecef_z": 0.0,
-                "az_deg": 0.0, "el_deg": 0.0, "slant_m": 0.0,
-            }) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "kind": "sample",
+                        "t_unix": float(i),
+                        "ecef_x": 0.0,
+                        "ecef_y": 0.0,
+                        "ecef_z": 0.0,
+                        "az_deg": 0.0,
+                        "el_deg": 0.0,
+                        "slant_m": 0.0,
+                    }
+                )
+                + "\n"
+            )
     mf = MountFrame.from_identity_enu()
     with pytest.raises(ValueError):
         JsonlECEFProvider(path, mf)

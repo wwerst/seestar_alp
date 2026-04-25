@@ -163,8 +163,7 @@ class CumulativeAzTracker:
             saved_wrapped = float(data["wrapped_az_deg"])
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             sys.stderr.write(
-                f"CumulativeAzTracker: failed to load {path}: {exc}; "
-                "starting fresh.\n"
+                f"CumulativeAzTracker: failed to load {path}: {exc}; starting fresh.\n"
             )
             return tracker
         # Import here to avoid a cycle on module import.

@@ -50,24 +50,44 @@ def _write_fixture(
     east = speed_mps * (t_grid - t_grid[0]) - speed_mps * duration_s / 2.0
     with path.open("w", encoding="utf-8") as f:
         header = {
-            "kind": "header", "source": "adsb", "id": "test",
-            "observer_lat": site.lat_deg, "observer_lon": site.lon_deg,
-            "observer_alt_m": site.alt_m, "duration_s": duration_s,
-            "sample_rate_hz": 1.0 / dt, "n_samples": n,
+            "kind": "header",
+            "source": "adsb",
+            "id": "test",
+            "observer_lat": site.lat_deg,
+            "observer_lon": site.lon_deg,
+            "observer_alt_m": site.alt_m,
+            "duration_s": duration_s,
+            "sample_rate_hz": 1.0 / dt,
+            "n_samples": n,
         }
         f.write(json.dumps(header) + "\n")
         for i in range(n):
             lat, lon = _offset_latlon(
-                site.lat_deg, site.lon_deg, lateral_north_m, float(east[i]),
+                site.lat_deg,
+                site.lon_deg,
+                lateral_north_m,
+                float(east[i]),
             )
             alt = altitude_m + site.alt_m
             ex, ey, ez = lla_to_ecef(lat, lon, alt)
-            f.write(json.dumps({
-                "kind": "sample", "t_unix": float(t_grid[i]),
-                "ecef_x": ex, "ecef_y": ey, "ecef_z": ez,
-                "lat": lat, "lon": lon, "alt_m": alt,
-                "az_deg": 0.0, "el_deg": 0.0, "slant_m": 0.0,
-            }) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "kind": "sample",
+                        "t_unix": float(t_grid[i]),
+                        "ecef_x": ex,
+                        "ecef_y": ey,
+                        "ecef_z": ez,
+                        "lat": lat,
+                        "lon": lon,
+                        "alt_m": alt,
+                        "az_deg": 0.0,
+                        "el_deg": 0.0,
+                        "slant_m": 0.0,
+                    }
+                )
+                + "\n"
+            )
 
 
 # --------- pre-check tests -------------------------------------------
@@ -89,8 +109,12 @@ def test_pre_check_rejects_el_over_limit(tmp_path):
     """Close overhead pass peaks too high for the mount's usable el band."""
     path = tmp_path / "overhead.jsonl"
     _write_fixture(
-        path, t0_unix=time.time() + 1.0, duration_s=10.0, dt=1.0,
-        lateral_north_m=300.0, altitude_m=3000.0,
+        path,
+        t0_unix=time.time() + 1.0,
+        duration_s=10.0,
+        dt=1.0,
+        lateral_north_m=300.0,
+        altitude_m=3000.0,
     )
     mf = MountFrame.from_identity_enu()
     provider = JsonlECEFProvider(path, mf)
@@ -125,15 +149,23 @@ def test_track_synthetic_flight_rms_bounded(tmp_path):
     stop = threading.Event()
 
     result = track(
-        cli, provider,
-        tick_dt=0.5, latency_s=0.4, tau_s=0.348,
-        kp_pos=0.5, v_corr_max=2.0, v_max=6.0,
-        az_limits=None, az_tracker=tracker,
-        stop_signal=stop, max_duration_s=10.0,
+        cli,
+        provider,
+        tick_dt=0.5,
+        latency_s=0.4,
+        tau_s=0.348,
+        kp_pos=0.5,
+        v_corr_max=2.0,
+        v_max=6.0,
+        az_limits=None,
+        az_tracker=tracker,
+        stop_signal=stop,
+        max_duration_s=10.0,
     )
 
-    assert result.exit_reason in ("end_of_track", "stop_signal"), \
+    assert result.exit_reason in ("end_of_track", "stop_signal"), (
         f"unexpected exit {result.exit_reason}: {result.errors}"
+    )
     assert result.ticks >= 4
     # Tracking error: startup transient + k_dc=0.996 bias. Same thresholds
     # the offline replay achieves on the same geometry.
@@ -186,8 +218,10 @@ def test_track_exits_when_per_tick_sun_guard_trips(tmp_path, monkeypatch):
 
     # Force the guard to always refuse.
     import device.streaming_controller as sc
+
     monkeypatch.setattr(
-        sc, "_is_sun_safe",
+        sc,
+        "_is_sun_safe",
         lambda az, el: (False, "sun_avoidance: forced by test"),
     )
 
@@ -221,8 +255,10 @@ def test_track_exits_sun_avoidance_when_speed_move_locked_out(tmp_path):
 
     prev = get_sun_monitor()
     m = SunSafetyMonitor(
-        altaz_reader=lambda: None, jog_command=_FakeJog(),
-        lat_deg=0.0, lon_deg=0.0,
+        altaz_reader=lambda: None,
+        jog_command=_FakeJog(),
+        lat_deg=0.0,
+        lon_deg=0.0,
     )
     m._emergency_lockout.set()  # pretend monitor is mid-jog
     set_sun_monitor(m)
@@ -272,8 +308,10 @@ def _run_dry_with_offsets(
 
     captured: list[TickInfo] = []
     track(
-        cli, provider,
-        dry_run=True, max_duration_s=10.0,
+        cli,
+        provider,
+        dry_run=True,
+        max_duration_s=10.0,
         offset_provider=lambda: offsets,
         tick_callback=captured.append,
     )
@@ -318,15 +356,21 @@ def test_heading_locks_at_low_velocity():
     import types
 
     from device.reference_provider import ReferenceSample
+
     t0 = time.time() + 0.2
     t1 = t0 + 3.0
 
     def sample(t):
         return ReferenceSample(
-            t_unix=float(t), az_cum_deg=10.0, el_deg=45.0,
-            v_az_degs=0.0, v_el_degs=0.0,
-            a_az_degs2=0.0, a_el_degs2=0.0,
-            stale=False, extrapolated=False,
+            t_unix=float(t),
+            az_cum_deg=10.0,
+            el_deg=45.0,
+            v_az_degs=0.0,
+            v_el_degs=0.0,
+            a_az_degs2=0.0,
+            a_el_degs2=0.0,
+            stale=False,
+            extrapolated=False,
         )
 
     provider = types.SimpleNamespace(
@@ -339,8 +383,10 @@ def test_heading_locks_at_low_velocity():
 
     captured: list[TickInfo] = []
     track(
-        cli, provider,
-        dry_run=True, max_duration_s=5.0,
+        cli,
+        provider,
+        dry_run=True,
+        max_duration_s=5.0,
         offset_provider=lambda: OffsetSnapshot(along_deg=0.3),
         tick_callback=captured.append,
     )
@@ -368,8 +414,10 @@ def test_time_offset_shifts_query_time(tmp_path):
 
     # Offset well past the tail + extrapolation budget → immediate end.
     result = track(
-        cli, provider,
-        dry_run=True, max_duration_s=10.0,
+        cli,
+        provider,
+        dry_run=True,
+        max_duration_s=10.0,
         offset_provider=lambda: OffsetSnapshot(time_offset_s=30.0),
     )
     assert result.exit_reason == "end_of_track"

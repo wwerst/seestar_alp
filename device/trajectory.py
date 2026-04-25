@@ -30,11 +30,11 @@ from device.velocity_controller import wrap_pm180
 
 @dataclass(frozen=True)
 class TrajectoryPoint:
-    t: float        # seconds from trajectory start
-    pos: float      # signed azimuth position (may exceed [-180, +180); use
-                    # wrap_pm180 when comparing to measured)
-    vel: float      # signed rate (deg/s)
-    acc: float      # signed accel (deg/s^2)
+    t: float  # seconds from trajectory start
+    pos: float  # signed azimuth position (may exceed [-180, +180); use
+    # wrap_pm180 when comparing to measured)
+    vel: float  # signed rate (deg/s)
+    acc: float  # signed accel (deg/s^2)
 
 
 @dataclass
@@ -78,7 +78,9 @@ class PlannedTrajectory:
 _POS_EPS_DEG = 0.01  # below this, consider "already at target"
 
 
-def _path_crosses_forbidden(p0: float, delta_signed: float, az_forbidden: float) -> bool:
+def _path_crosses_forbidden(
+    p0: float, delta_signed: float, az_forbidden: float
+) -> bool:
     """Does traveling from p0 by signed-delta cross az_forbidden (interior)?
 
     Crossing means the forbidden point is strictly between p0 and p0+delta
@@ -96,7 +98,9 @@ def _path_crosses_forbidden(p0: float, delta_signed: float, az_forbidden: float)
 
 
 def _select_delta(
-    p0: float, p_target: float, az_forbidden: float | None,
+    p0: float,
+    p_target: float,
+    az_forbidden: float | None,
 ) -> float:
     """Compute the signed delta from p0 to p_target, avoiding az_forbidden
     if set. Returns a delta in the shorter path whenever that's feasible;
@@ -118,7 +122,9 @@ def _select_delta(
 
 
 def _apply_t_offset(
-    traj: PlannedTrajectory, t_offset: float, tick_dt: float,
+    traj: PlannedTrajectory,
+    t_offset: float,
+    tick_dt: float,
 ) -> PlannedTrajectory:
     """Prepend a hold phase of `t_offset` seconds at (p0, v=0, a=0) and shift
     every existing sample by `+t_offset`.
@@ -135,13 +141,21 @@ def _apply_t_offset(
     hold_points: list[TrajectoryPoint] = []
     k = 0
     while k * tick_dt < t_offset - 1e-9:
-        hold_points.append(TrajectoryPoint(
-            t=k * tick_dt, pos=p0, vel=0.0, acc=0.0,
-        ))
+        hold_points.append(
+            TrajectoryPoint(
+                t=k * tick_dt,
+                pos=p0,
+                vel=0.0,
+                acc=0.0,
+            )
+        )
         k += 1
     shifted = tuple(
         TrajectoryPoint(
-            t=p.t + t_offset, pos=p.pos, vel=p.vel, acc=p.acc,
+            t=p.t + t_offset,
+            pos=p.pos,
+            vel=p.vel,
+            acc=p.acc,
         )
         for p in traj.points
     )
@@ -152,8 +166,13 @@ def _apply_t_offset(
 
 
 def _sample_phase(
-    out: list, t_start: float, p_start: float, v_start: float,
-    a: float, dur: float, tick_dt: float,
+    out: list,
+    t_start: float,
+    p_start: float,
+    v_start: float,
+    a: float,
+    dur: float,
+    tick_dt: float,
     include_endpoint: bool,
 ) -> tuple[float, float, float]:
     """Append `TrajectoryPoint`s from t_start for dur seconds under
@@ -185,8 +204,11 @@ def _sample_phase(
 
 
 def trapezoidal_profile(
-    p0: float, v0: float, p_target: float,
-    v_max: float, a_max: float,
+    p0: float,
+    v0: float,
+    p_target: float,
+    v_max: float,
+    a_max: float,
     tick_dt: float = 0.1,
     t_offset: float = 0.0,
     az_forbidden_deg: float | None = None,
@@ -248,7 +270,13 @@ def trapezoidal_profile(
         dur0 = abs(v0) / a_max
         a0 = -math.copysign(a_max, v0)
         t_cur, p_cur, v_cur = _sample_phase(
-            out, t_cur, p_cur, v_cur, a=a0, dur=dur0, tick_dt=tick_dt,
+            out,
+            t_cur,
+            p_cur,
+            v_cur,
+            a=a0,
+            dur=dur0,
+            tick_dt=tick_dt,
             include_endpoint=True,
         )
         # Update abs_delta given we may have moved during phase 0
@@ -282,24 +310,39 @@ def trapezoidal_profile(
     # --- Phase 1: accelerate to v_cruise in dir_sign. ---
     if t_accel > 1e-9:
         t_cur, p_cur, v_cur = _sample_phase(
-            out, t_cur, p_cur, v_cur,
-            a=dir_sign * a_max, dur=t_accel, tick_dt=tick_dt,
+            out,
+            t_cur,
+            p_cur,
+            v_cur,
+            a=dir_sign * a_max,
+            dur=t_accel,
+            tick_dt=tick_dt,
             include_endpoint=True,
         )
 
     # --- Phase 2: cruise at v_cruise (a=0). ---
     if t_cruise > 1e-9:
         t_cur, p_cur, v_cur = _sample_phase(
-            out, t_cur, p_cur, v_cur,
-            a=0.0, dur=t_cruise, tick_dt=tick_dt,
+            out,
+            t_cur,
+            p_cur,
+            v_cur,
+            a=0.0,
+            dur=t_cruise,
+            tick_dt=tick_dt,
             include_endpoint=True,
         )
 
     # --- Phase 3: decelerate to 0. ---
     if t_decel > 1e-9:
         t_cur, p_cur, v_cur = _sample_phase(
-            out, t_cur, p_cur, v_cur,
-            a=-dir_sign * a_max, dur=t_decel, tick_dt=tick_dt,
+            out,
+            t_cur,
+            p_cur,
+            v_cur,
+            a=-dir_sign * a_max,
+            dur=t_decel,
+            tick_dt=tick_dt,
             include_endpoint=True,
         )
 
@@ -320,8 +363,12 @@ def trapezoidal_profile(
 
 
 def scurve_profile(
-    p0: float, v0: float, p_target: float,
-    v_max: float, a_max: float, j_max: float,
+    p0: float,
+    v0: float,
+    p_target: float,
+    v_max: float,
+    a_max: float,
+    j_max: float,
     tick_dt: float = 0.1,
     t_offset: float = 0.0,
     az_forbidden_deg: float | None = None,
@@ -356,21 +403,33 @@ def scurve_profile(
         # the v0 decel), then append an S-curve from rest. The lead-in
         # hold for t_offset is applied only at the outer return.
         pre = trapezoidal_profile(
-            p0=p0, v0=v0, p_target=p0,  # "rest in place"; trapezoid handles it
-            v_max=v_max, a_max=a_max, tick_dt=tick_dt,
+            p0=p0,
+            v0=v0,
+            p_target=p0,  # "rest in place"; trapezoid handles it
+            v_max=v_max,
+            a_max=a_max,
+            tick_dt=tick_dt,
         )
         # Start the S-curve at pre's endpoint.
         pre_end = pre.points[-1]
         tail = scurve_profile(
-            p0=pre_end.pos, v0=0.0, p_target=p_target,
-            v_max=v_max, a_max=a_max, j_max=j_max, tick_dt=tick_dt,
+            p0=pre_end.pos,
+            v0=0.0,
+            p_target=p_target,
+            v_max=v_max,
+            a_max=a_max,
+            j_max=j_max,
+            tick_dt=tick_dt,
             az_forbidden_deg=az_forbidden_deg,
             wrap_target=wrap_target,
         )
         # Concatenate (shift tail by pre.total_duration).
         shifted = tuple(
             TrajectoryPoint(
-                t=p.t + pre.total_duration, pos=p.pos, vel=p.vel, acc=p.acc,
+                t=p.t + pre.total_duration,
+                pos=p.pos,
+                vel=p.vel,
+                acc=p.acc,
             )
             for p in tail.points
         )
@@ -410,19 +469,21 @@ def scurve_profile(
         t_a_full = (v_max - 2 * v_j) / a_max
         d_full_accel = (
             # jerk-up phase
-            (1.0 / 6.0) * j_max * (t_j ** 3)
+            (1.0 / 6.0) * j_max * (t_j**3)
             # const-accel phase (v at start of const-accel = v_j)
-            + v_j * t_a_full + 0.5 * a_max * (t_a_full ** 2)
+            + v_j * t_a_full
+            + 0.5 * a_max * (t_a_full**2)
             # jerk-down phase (v at start = v_j + a_max*t_a; accel goes
             # from a_max to 0 linearly, integrated over t_j)
-            + (v_j + a_max * t_a_full) * t_j + 0.5 * a_max * t_j * t_j
-            - (1.0 / 6.0) * j_max * (t_j ** 3)
+            + (v_j + a_max * t_a_full) * t_j
+            + 0.5 * a_max * t_j * t_j
+            - (1.0 / 6.0) * j_max * (t_j**3)
         )
-        reach_full = (2 * d_full_accel <= abs_delta)
+        reach_full = 2 * d_full_accel <= abs_delta
     else:
         reach_full = False
         # d under pure-triangular-jerk (no const-accel) to reach v = 2*v_j:
-        d_full_accel = 2 * (1.0 / 6.0) * j_max * (t_j ** 3) + v_j * t_j
+        d_full_accel = 2 * (1.0 / 6.0) * j_max * (t_j**3) + v_j * t_j
         # Actually for rest→v_peak via symmetric j ramps of t_j each,
         # the distance is just v_j * t_j = (a_max²/(2 j_max)) * (a_max/j_max)
         # = a_max³ / (2 j_max²). That's a purely derived formula — fall
@@ -435,9 +496,14 @@ def scurve_profile(
         # don't require S-curve in short-move cases. Pass t_offset through
         # so the lead-in hold still happens.
         return trapezoidal_profile(
-            p0=p0, v0=0.0, p_target=p_target,
-            v_max=v_max, a_max=a_max, tick_dt=tick_dt,
-            t_offset=t_offset, az_forbidden_deg=az_forbidden_deg,
+            p0=p0,
+            v0=0.0,
+            p_target=p_target,
+            v_max=v_max,
+            a_max=a_max,
+            tick_dt=tick_dt,
+            t_offset=t_offset,
+            az_forbidden_deg=az_forbidden_deg,
             wrap_target=wrap_target,
         )
 
@@ -457,11 +523,11 @@ def scurve_profile(
         dt = min(k * tick_dt, t_j)
         a = dir_sign * j_max * dt
         v = v_cur + dir_sign * 0.5 * j_max * dt * dt
-        p = p_cur + v_cur * dt + dir_sign * (1.0 / 6.0) * j_max * dt ** 3
+        p = p_cur + v_cur * dt + dir_sign * (1.0 / 6.0) * j_max * dt**3
         out.append(TrajectoryPoint(t=t_cur + dt, pos=p, vel=v, acc=a))
     # advance state by full t_j
     dt = t_j
-    p_cur = p_cur + v_cur * dt + dir_sign * (1.0 / 6.0) * j_max * dt ** 3
+    p_cur = p_cur + v_cur * dt + dir_sign * (1.0 / 6.0) * j_max * dt**3
     v_cur = v_cur + dir_sign * 0.5 * j_max * dt * dt
     t_cur = t_cur + dt
     a_cur = dir_sign * a_max
@@ -469,8 +535,14 @@ def scurve_profile(
     # Segment 2: const accel at +a_max during t_a_full
     if t_a_full > 1e-9:
         t_cur, p_cur, v_cur = _sample_phase(
-            out, t_cur, p_cur, v_cur,
-            a=a_cur, dur=t_a_full, tick_dt=tick_dt, include_endpoint=True,
+            out,
+            t_cur,
+            p_cur,
+            v_cur,
+            a=a_cur,
+            dur=t_a_full,
+            tick_dt=tick_dt,
+            include_endpoint=True,
         )
 
     # Segment 3: jerk down (a: +a_max → 0) during t_j
@@ -478,20 +550,34 @@ def scurve_profile(
         dt = min(k * tick_dt, t_j)
         a = a_cur - dir_sign * j_max * dt
         v = v_cur + a_cur * dt - dir_sign * 0.5 * j_max * dt * dt
-        p = (p_cur + v_cur * dt + 0.5 * a_cur * dt * dt
-             - dir_sign * (1.0 / 6.0) * j_max * dt ** 3)
+        p = (
+            p_cur
+            + v_cur * dt
+            + 0.5 * a_cur * dt * dt
+            - dir_sign * (1.0 / 6.0) * j_max * dt**3
+        )
         out.append(TrajectoryPoint(t=t_cur + dt, pos=p, vel=v, acc=a))
     dt = t_j
-    p_cur = (p_cur + v_cur * dt + 0.5 * a_cur * dt * dt
-             - dir_sign * (1.0 / 6.0) * j_max * dt ** 3)
+    p_cur = (
+        p_cur
+        + v_cur * dt
+        + 0.5 * a_cur * dt * dt
+        - dir_sign * (1.0 / 6.0) * j_max * dt**3
+    )
     v_cur = v_cur + a_cur * dt - dir_sign * 0.5 * j_max * dt * dt
     t_cur = t_cur + dt
 
     # Segment 4: cruise at v_max
     if t_cruise > 1e-9:
         t_cur, p_cur, v_cur = _sample_phase(
-            out, t_cur, p_cur, v_cur,
-            a=0.0, dur=t_cruise, tick_dt=tick_dt, include_endpoint=True,
+            out,
+            t_cur,
+            p_cur,
+            v_cur,
+            a=0.0,
+            dur=t_cruise,
+            tick_dt=tick_dt,
+            include_endpoint=True,
         )
 
     # Segment 5: jerk up (a: 0 → -a_max) during t_j (decel begins)
@@ -499,10 +585,10 @@ def scurve_profile(
         dt = min(k * tick_dt, t_j)
         a = -dir_sign * j_max * dt
         v = v_cur - dir_sign * 0.5 * j_max * dt * dt
-        p = p_cur + v_cur * dt - dir_sign * (1.0 / 6.0) * j_max * dt ** 3
+        p = p_cur + v_cur * dt - dir_sign * (1.0 / 6.0) * j_max * dt**3
         out.append(TrajectoryPoint(t=t_cur + dt, pos=p, vel=v, acc=a))
     dt = t_j
-    p_cur = p_cur + v_cur * dt - dir_sign * (1.0 / 6.0) * j_max * dt ** 3
+    p_cur = p_cur + v_cur * dt - dir_sign * (1.0 / 6.0) * j_max * dt**3
     v_cur = v_cur - dir_sign * 0.5 * j_max * dt * dt
     t_cur = t_cur + dt
     a_cur = -dir_sign * a_max
@@ -510,8 +596,14 @@ def scurve_profile(
     # Segment 6: const decel at -a_max during t_a_full
     if t_a_full > 1e-9:
         t_cur, p_cur, v_cur = _sample_phase(
-            out, t_cur, p_cur, v_cur,
-            a=a_cur, dur=t_a_full, tick_dt=tick_dt, include_endpoint=True,
+            out,
+            t_cur,
+            p_cur,
+            v_cur,
+            a=a_cur,
+            dur=t_a_full,
+            tick_dt=tick_dt,
+            include_endpoint=True,
         )
 
     # Segment 7: jerk down (a: -a_max → 0) during t_j
@@ -519,12 +611,20 @@ def scurve_profile(
         dt = min(k * tick_dt, t_j)
         a = a_cur + dir_sign * j_max * dt
         v = v_cur + a_cur * dt + dir_sign * 0.5 * j_max * dt * dt
-        p = (p_cur + v_cur * dt + 0.5 * a_cur * dt * dt
-             + dir_sign * (1.0 / 6.0) * j_max * dt ** 3)
+        p = (
+            p_cur
+            + v_cur * dt
+            + 0.5 * a_cur * dt * dt
+            + dir_sign * (1.0 / 6.0) * j_max * dt**3
+        )
         out.append(TrajectoryPoint(t=t_cur + dt, pos=p, vel=v, acc=a))
     dt = t_j
-    p_cur = (p_cur + v_cur * dt + 0.5 * a_cur * dt * dt
-             + dir_sign * (1.0 / 6.0) * j_max * dt ** 3)
+    p_cur = (
+        p_cur
+        + v_cur * dt
+        + 0.5 * a_cur * dt * dt
+        + dir_sign * (1.0 / 6.0) * j_max * dt**3
+    )
     v_cur = v_cur + a_cur * dt + dir_sign * 0.5 * j_max * dt * dt
     t_cur = t_cur + dt
 
@@ -555,9 +655,12 @@ def scurve_profile(
 
 
 def _plan_2d(
-    p0_az: float, p0_el: float,
-    p_target_az: float, p_target_el: float,
-    v_max: float, a_max: float,
+    p0_az: float,
+    p0_el: float,
+    p_target_az: float,
+    p_target_el: float,
+    v_max: float,
+    a_max: float,
     j_max: float | None,
     tick_dt: float,
     wrap_az: bool,
@@ -602,16 +705,25 @@ def _plan_2d(
 
     if j_max is None:
         path_traj = trapezoidal_profile(
-            p0=0.0, v0=0.0, p_target=path_len,
-            v_max=v_max_path, a_max=a_max_path,
-            tick_dt=tick_dt, wrap_target=False,
+            p0=0.0,
+            v0=0.0,
+            p_target=path_len,
+            v_max=v_max_path,
+            a_max=a_max_path,
+            tick_dt=tick_dt,
+            wrap_target=False,
         )
     else:
         j_max_path = j_max * scale
         path_traj = scurve_profile(
-            p0=0.0, v0=0.0, p_target=path_len,
-            v_max=v_max_path, a_max=a_max_path, j_max=j_max_path,
-            tick_dt=tick_dt, wrap_target=False,
+            p0=0.0,
+            v0=0.0,
+            p_target=path_len,
+            v_max=v_max_path,
+            a_max=a_max_path,
+            j_max=j_max_path,
+            tick_dt=tick_dt,
+            wrap_target=False,
         )
 
     az_points = tuple(
@@ -639,9 +751,12 @@ def _plan_2d(
 
 
 def trapezoidal_profile_2d(
-    p0_az: float, p0_el: float,
-    p_target_az: float, p_target_el: float,
-    v_max: float, a_max: float,
+    p0_az: float,
+    p0_el: float,
+    p_target_az: float,
+    p_target_el: float,
+    v_max: float,
+    a_max: float,
     tick_dt: float = 0.1,
     wrap_az: bool = True,
     az_forbidden_deg: float | None = None,
@@ -650,16 +765,27 @@ def trapezoidal_profile_2d(
     both axes arriving simultaneously. `v_max` and `a_max` are per-axis caps.
     """
     return _plan_2d(
-        p0_az, p0_el, p_target_az, p_target_el,
-        v_max=v_max, a_max=a_max, j_max=None,
-        tick_dt=tick_dt, wrap_az=wrap_az, az_forbidden_deg=az_forbidden_deg,
+        p0_az,
+        p0_el,
+        p_target_az,
+        p_target_el,
+        v_max=v_max,
+        a_max=a_max,
+        j_max=None,
+        tick_dt=tick_dt,
+        wrap_az=wrap_az,
+        az_forbidden_deg=az_forbidden_deg,
     )
 
 
 def scurve_profile_2d(
-    p0_az: float, p0_el: float,
-    p_target_az: float, p_target_el: float,
-    v_max: float, a_max: float, j_max: float,
+    p0_az: float,
+    p0_el: float,
+    p_target_az: float,
+    p_target_el: float,
+    v_max: float,
+    a_max: float,
+    j_max: float,
     tick_dt: float = 0.1,
     wrap_az: bool = True,
     az_forbidden_deg: float | None = None,
@@ -669,7 +795,14 @@ def scurve_profile_2d(
     per-axis caps.
     """
     return _plan_2d(
-        p0_az, p0_el, p_target_az, p_target_el,
-        v_max=v_max, a_max=a_max, j_max=j_max,
-        tick_dt=tick_dt, wrap_az=wrap_az, az_forbidden_deg=az_forbidden_deg,
+        p0_az,
+        p0_el,
+        p_target_az,
+        p_target_el,
+        v_max=v_max,
+        a_max=a_max,
+        j_max=j_max,
+        tick_dt=tick_dt,
+        wrap_az=wrap_az,
+        az_forbidden_deg=az_forbidden_deg,
     )

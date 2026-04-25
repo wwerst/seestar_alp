@@ -122,10 +122,9 @@ def _make_altaz_reader() -> _ss.AltazReader:
                 lat=Config.init_lat * u.deg,
                 lon=Config.init_long * u.deg,
             )
-            altaz = (
-                SkyCoord(ra=ra_h * u.hour, dec=dec_d * u.deg, frame="icrs")
-                .transform_to(AltAz(obstime=Time.now(), location=loc))
-            )
+            altaz = SkyCoord(
+                ra=ra_h * u.hour, dec=dec_d * u.deg, frame="icrs"
+            ).transform_to(AltAz(obstime=Time.now(), location=loc))
             return float(altaz.az.deg) % 360.0, float(altaz.alt.deg)
         except Exception:
             logger.debug("altaz_reader failed", exc_info=True)
@@ -157,6 +156,7 @@ def _abort_active_sessions() -> None:
     scope. Runs inside the monitor's trigger sequence; exceptions are
     caught at the monitor level."""
     import device.rotation_calibration as _rc
+
     mgr = _lt.get_manager()
     for dev in getattr(Config, "seestars", []) or []:
         try:

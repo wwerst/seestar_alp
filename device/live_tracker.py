@@ -112,27 +112,32 @@ class AtomicOffsets:
             if "time_offset_s" in kwargs:
                 patch["time_offset_s"] = _clamp(
                     float(kwargs["time_offset_s"]),
-                    -TIME_OFFSET_BOUND_S, TIME_OFFSET_BOUND_S,
+                    -TIME_OFFSET_BOUND_S,
+                    TIME_OFFSET_BOUND_S,
                 )
             if "az_bias_deg" in kwargs:
                 patch["az_bias_deg"] = _clamp(
                     float(kwargs["az_bias_deg"]),
-                    -AZ_BIAS_BOUND_DEG, AZ_BIAS_BOUND_DEG,
+                    -AZ_BIAS_BOUND_DEG,
+                    AZ_BIAS_BOUND_DEG,
                 )
             if "el_bias_deg" in kwargs:
                 patch["el_bias_deg"] = _clamp(
                     float(kwargs["el_bias_deg"]),
-                    -EL_BIAS_BOUND_DEG, EL_BIAS_BOUND_DEG,
+                    -EL_BIAS_BOUND_DEG,
+                    EL_BIAS_BOUND_DEG,
                 )
             if "along_deg" in kwargs:
                 patch["along_deg"] = _clamp(
                     float(kwargs["along_deg"]),
-                    -ALONG_BOUND_DEG, ALONG_BOUND_DEG,
+                    -ALONG_BOUND_DEG,
+                    ALONG_BOUND_DEG,
                 )
             if "cross_deg" in kwargs:
                 patch["cross_deg"] = _clamp(
                     float(kwargs["cross_deg"]),
-                    -CROSS_BOUND_DEG, CROSS_BOUND_DEG,
+                    -CROSS_BOUND_DEG,
+                    CROSS_BOUND_DEG,
                 )
             self._snapshot = replace(self._snapshot, **patch)
             return self._snapshot
@@ -188,10 +193,10 @@ def load_session_mount_frame() -> MountFrame:
 @dataclass
 class CachedTarget:
     path: Path
-    id: str               # stem of the file, used as the UI id
+    id: str  # stem of the file, used as the UI id
     display_name: str
-    kind: str             # "aircraft" or "satellite" (derived from subdir)
-    source: str           # header "source" field if present
+    kind: str  # "aircraft" or "satellite" (derived from subdir)
+    source: str  # header "source" field if present
     duration_s: float
     peak_el_deg: float
     min_slant_m: float
@@ -316,9 +321,14 @@ class LiveADSBProvider:
         if len(t) < 2:
             return
         try:
-            traj = self._mount_frame.ecef_traj_to_mount(
-                ecef, t,
-            ) if len(t) >= 4 else None
+            traj = (
+                self._mount_frame.ecef_traj_to_mount(
+                    ecef,
+                    t,
+                )
+                if len(t) >= 4
+                else None
+            )
         except Exception:
             traj = None
         if traj is not None:
@@ -336,6 +346,7 @@ class LiveADSBProvider:
             # linear-interp table with forward-diff velocities.
             az, el, _slant = self._mount_frame.ecef_array_to_mount(ecef)
             from scripts.trajectory.observer import unwrap_az_series
+
             az_cum = unwrap_az_series(az)
             self._t_arr = np.asarray(t, dtype=float)
             self._az_cum = az_cum
@@ -374,10 +385,15 @@ class LiveADSBProvider:
         self._ensure_inner()
         if self._t_arr.size < 2:
             return ReferenceSample(
-                t_unix=float(t_unix), az_cum_deg=0.0, el_deg=45.0,
-                v_az_degs=0.0, v_el_degs=0.0,
-                a_az_degs2=0.0, a_el_degs2=0.0,
-                stale=True, extrapolated=True,
+                t_unix=float(t_unix),
+                az_cum_deg=0.0,
+                el_deg=45.0,
+                v_az_degs=0.0,
+                v_el_degs=0.0,
+                a_az_degs2=0.0,
+                a_el_degs2=0.0,
+                stale=True,
+                extrapolated=True,
             )
 
         t = float(t_unix)
@@ -410,10 +426,15 @@ class LiveADSBProvider:
             a_az = float(np.interp(t, t_arr, self._a_az))
             a_el = float(np.interp(t, t_arr, self._a_el))
             return ReferenceSample(
-                t_unix=t, az_cum_deg=az, el_deg=el,
-                v_az_degs=v_az, v_el_degs=v_el,
-                a_az_degs2=a_az, a_el_degs2=a_el,
-                stale=False, extrapolated=False,
+                t_unix=t,
+                az_cum_deg=az,
+                el_deg=el,
+                v_az_degs=v_az,
+                v_el_degs=v_el,
+                a_az_degs2=a_az,
+                a_el_degs2=a_el,
+                stale=False,
+                extrapolated=False,
             )
 
         # Past the tail — constant-velocity extrapolation.
@@ -462,8 +483,10 @@ class TargetCatalog:
     LIVE_REBUILD_S = 2.0
 
     def __init__(
-        self, trajectory_root: Path | None = None,
-        *, live_enabled: bool = True,
+        self,
+        trajectory_root: Path | None = None,
+        *,
+        live_enabled: bool = True,
         session: requests.Session | None = None,
     ) -> None:
         self.root = Path(trajectory_root) if trajectory_root else _DEFAULT_TRAJ_DIR
@@ -495,22 +518,24 @@ class TargetCatalog:
                 meta = _read_header(p)
                 if meta is None:
                     continue
-                out.append(CachedTarget(
-                    path=p,
-                    id=p.stem,
-                    display_name=(
-                        meta.get("name")
-                        or meta.get("callsign")
-                        or meta.get("id")
-                        or p.stem
-                    ),
-                    kind=kind,
-                    source=str(meta.get("source", "")),
-                    duration_s=float(meta.get("duration_s", 0.0)),
-                    peak_el_deg=float(meta.get("peak_el_deg", 0.0)),
-                    min_slant_m=float(meta.get("min_slant_m", 0.0)),
-                    n_samples=int(meta.get("n_samples", 0)),
-                ))
+                out.append(
+                    CachedTarget(
+                        path=p,
+                        id=p.stem,
+                        display_name=(
+                            meta.get("name")
+                            or meta.get("callsign")
+                            or meta.get("id")
+                            or p.stem
+                        ),
+                        kind=kind,
+                        source=str(meta.get("source", "")),
+                        duration_s=float(meta.get("duration_s", 0.0)),
+                        peak_el_deg=float(meta.get("peak_el_deg", 0.0)),
+                        min_slant_m=float(meta.get("min_slant_m", 0.0)),
+                        n_samples=int(meta.get("n_samples", 0)),
+                    )
+                )
         return out
 
     # ---------- live ADS-B ----------
@@ -580,7 +605,10 @@ class TargetCatalog:
         # 100 km ≈ 54 nm radius around the observer. adsb.fi's endpoint
         # takes a radius in nautical miles, not km.
         ac_list = poll_once_adsbfi(
-            self._session, site.lat_deg, site.lon_deg, dist_nm=54.0,
+            self._session,
+            site.lat_deg,
+            site.lon_deg,
+            dist_nm=54.0,
         )
         if not ac_list:
             return False
@@ -638,7 +666,8 @@ class TargetCatalog:
 
     @staticmethod
     def _extract_ground_aircraft(
-        ac: dict, t_now: float,
+        ac: dict,
+        t_now: float,
     ) -> tuple[str, str, RawSample] | None:
         """Parse an adsb.fi dict for a ground aircraft that
         `extract_sample_adsbfi` would have dropped (alt_baro == "ground").
@@ -663,10 +692,18 @@ class TargetCatalog:
         velocity_mps = float(gs_kts) * 0.514444 if gs_kts is not None else 0.0
         heading = ac.get("track")
         heading_deg = float(heading) if heading is not None else None
-        return icao24, callsign, RawSample(
-            t_unix=t_now, lat=float(lat), lon=float(lon), alt_m=alt_m,
-            velocity_mps=velocity_mps, heading_deg=heading_deg,
-            vertical_rate_mps=0.0,
+        return (
+            icao24,
+            callsign,
+            RawSample(
+                t_unix=t_now,
+                lat=float(lat),
+                lon=float(lon),
+                alt_m=alt_m,
+                velocity_mps=velocity_mps,
+                heading_deg=heading_deg,
+                vertical_rate_mps=0.0,
+            ),
         )
 
     def _prune_stale_buffers(self) -> None:
@@ -706,7 +743,10 @@ class TargetCatalog:
         ]
 
     def make_provider(
-        self, kind: str, target_id: str, mount_frame: MountFrame,
+        self,
+        kind: str,
+        target_id: str,
+        mount_frame: MountFrame,
     ) -> ReferenceProvider:
         """Build a provider for a target identified by UI (kind, id)."""
         if kind == "file":
@@ -725,7 +765,8 @@ class TargetCatalog:
                     f"need ≥ {self.LIVE_MIN_SAMPLES}"
                 )
             return LiveADSBProvider(
-                buf, mount_frame,
+                buf,
+                mount_frame,
                 rebuild_s=self.LIVE_REBUILD_S,
                 extrapolation_s=self.LIVE_EXTRAPOLATION_S,
             )
@@ -835,7 +876,8 @@ class LiveTrackSession:
         self._t_start = time.time()
         self._phase = "starting"
         self._thread = threading.Thread(
-            target=self._run, name=f"LiveTrackSession({self.telescope_id})",
+            target=self._run,
+            name=f"LiveTrackSession({self.telescope_id})",
             daemon=True,
         )
         self._thread.start()
@@ -1042,8 +1084,10 @@ class LiveTrackSession:
         # rotation calibration, conservative otherwise since we refuse
         # a wider neighborhood than strictly needed.
         from device.sun_safety import is_sun_safe as _is_sun_safe
+
         sun_safe, sun_reason = _is_sun_safe(
-            target_az_wrapped % 360.0, float(target_el),
+            target_az_wrapped % 360.0,
+            float(target_el),
         )
         if not sun_safe:
             with self._lock:
@@ -1114,13 +1158,14 @@ class LiveTrackSession:
         cli = AlpacaClient(self._alpaca_host, self._alpaca_port, self.telescope_id)
         site = build_site()
         loc = EarthLocation.from_geodetic(
-            lon=site.lon_deg, lat=site.lat_deg, height=site.alt_m,
+            lon=site.lon_deg,
+            lat=site.lat_deg,
+            height=site.alt_m,
         )
         self._log_dir.mkdir(parents=True, exist_ok=True)
         run_tag = time.strftime("%Y-%m-%dT%H-%M-%S", time.localtime())
         self._log_path = (
-            self._log_dir
-            / f"{run_tag}.live_tracker-{self.target_id}.jsonl"
+            self._log_dir / f"{run_tag}.live_tracker-{self.target_id}.jsonl"
         )
         try:
             self._position_logger = PositionLogger(cli, loc, self._log_path)
@@ -1166,7 +1211,8 @@ class LiveTrackSession:
 
             try:
                 result = track(
-                    cli, self._provider,
+                    cli,
+                    self._provider,
                     az_limits=self._az_limits,
                     az_tracker=tracker,
                     position_logger=self._position_logger,
@@ -1219,6 +1265,7 @@ class LiveTrackManager:
         # `device.rotation_calibration` at import time.
         try:
             from device.rotation_calibration import get_calibration_manager
+
             if get_calibration_manager().is_running(tid):
                 raise RuntimeError(
                     f"telescope {tid} is calibrating; stop the calibration first"
@@ -1228,9 +1275,7 @@ class LiveTrackManager:
         with self._lock:
             existing = self._sessions.get(tid)
             if existing is not None and existing.is_alive():
-                raise RuntimeError(
-                    f"telescope {tid} already tracking; stop first"
-                )
+                raise RuntimeError(f"telescope {tid} already tracking; stop first")
             # Start the thread inside the lock so the is_alive() check,
             # thread spawn, and registry write are atomic. Otherwise two
             # concurrent /track POSTs can both pass the check (the first
@@ -1255,7 +1300,9 @@ class LiveTrackManager:
         return s.status() if s is not None else None
 
     def set_offsets(
-        self, telescope_id: int, **kwargs,
+        self,
+        telescope_id: int,
+        **kwargs,
     ) -> OffsetSnapshot | None:
         s = self.get(telescope_id)
         if s is None:
@@ -1263,7 +1310,9 @@ class LiveTrackManager:
         return s.offsets.set(**kwargs)
 
     def reset_offsets(
-        self, telescope_id: int, scope: str = "all",
+        self,
+        telescope_id: int,
+        scope: str = "all",
     ) -> OffsetSnapshot | None:
         s = self.get(telescope_id)
         if s is None:

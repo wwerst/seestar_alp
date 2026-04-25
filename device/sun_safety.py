@@ -54,7 +54,9 @@ class SafetyTrip:
     jog_angle_deg: int
     jog_speed: int
     jog_duration_s: int
-    message: str = "Sun safety triggered: mount jogged away from sun and tracking aborted."
+    message: str = (
+        "Sun safety triggered: mount jogged away from sun and tracking aborted."
+    )
 
 
 @dataclass
@@ -72,11 +74,13 @@ def _site_from_config_or(lat_deg: Optional[float], lon_deg: Optional[float]) -> 
     if lat_deg is not None and lon_deg is not None:
         return _Site(float(lat_deg), float(lon_deg))
     from device.config import Config
+
     return _Site(float(Config.init_lat), float(Config.init_long))
 
 
-def angular_separation(a_az_deg: float, a_el_deg: float,
-                       b_az_deg: float, b_el_deg: float) -> float:
+def angular_separation(
+    a_az_deg: float, a_el_deg: float, b_az_deg: float, b_el_deg: float
+) -> float:
     """Great-circle angular separation between two (az, el) directions.
 
     Returns degrees in [0, 180]. Pure function — no observer, no time.
@@ -87,10 +91,9 @@ def angular_separation(a_az_deg: float, a_el_deg: float,
     b_az = math.radians(b_az_deg)
     b_el = math.radians(b_el_deg)
     # Spherical law of cosines, clamped for numerical safety.
-    cos_sep = (
-        math.sin(a_el) * math.sin(b_el)
-        + math.cos(a_el) * math.cos(b_el) * math.cos(a_az - b_az)
-    )
+    cos_sep = math.sin(a_el) * math.sin(b_el) + math.cos(a_el) * math.cos(
+        b_el
+    ) * math.cos(a_az - b_az)
     cos_sep = max(-1.0, min(1.0, cos_sep))
     return math.degrees(math.acos(cos_sep))
 
@@ -143,7 +146,9 @@ def is_sun_safe(
     (separation, cone, sun alt) when unsafe so callers can log it.
     """
     sun_az, sun_alt = compute_sun_altaz(
-        lat_deg=lat_deg, lon_deg=lon_deg, when=when,
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+        when=when,
     )
     if sun_alt < alt_threshold_deg:
         return True, ""
@@ -177,8 +182,10 @@ def _wrap_pm180(x: float) -> float:
 
 
 def compute_jog_angle(
-    mount_az_deg: float, mount_el_deg: float,
-    sun_az_deg: float, sun_alt_deg: float,
+    mount_az_deg: float,
+    mount_el_deg: float,
+    sun_az_deg: float,
+    sun_alt_deg: float,
     *,
     jog_speed: int = 1440,
     jog_duration_s: float = 3.0,
@@ -222,9 +229,9 @@ def compute_jog_angle(
 
     # Primary: reverse of direction-to-sun in (daz, del).
     if norm > 1e-6:
-        candidate = int(round(
-            (math.degrees(math.atan2(-del_diff, -daz_diff)) + 360.0) % 360.0
-        ))
+        candidate = int(
+            round((math.degrees(math.atan2(-del_diff, -daz_diff)) + 360.0) % 360.0)
+        )
         if _verify(candidate):
             return candidate
 
@@ -237,10 +244,16 @@ def compute_jog_angle(
         return 270
     # Fallback 3: pure +az or -az — choose whichever increases separation more.
     new_sep_plus_az = angular_separation(
-        (mount_az_deg + step) % 360.0, mount_el_deg, sun_az_deg, sun_alt_deg,
+        (mount_az_deg + step) % 360.0,
+        mount_el_deg,
+        sun_az_deg,
+        sun_alt_deg,
     )
     new_sep_minus_az = angular_separation(
-        (mount_az_deg - step) % 360.0, mount_el_deg, sun_az_deg, sun_alt_deg,
+        (mount_az_deg - step) % 360.0,
+        mount_el_deg,
+        sun_az_deg,
+        sun_alt_deg,
     )
     return 0 if new_sep_plus_az >= new_sep_minus_az else 180
 
@@ -325,14 +338,17 @@ class SunSafetyMonitor:
             return
         self._stop_evt.clear()
         self._thread = threading.Thread(
-            target=self._loop, name="SunSafetyMonitor", daemon=True,
+            target=self._loop,
+            name="SunSafetyMonitor",
+            daemon=True,
         )
         self._thread.start()
         logger.info(
-            "SunSafetyMonitor started: cone=%.1f° alt_thr=%.1f° "
-            "jog=speed=%d dur=%ds",
-            self._min_separation_deg, self._alt_threshold_deg,
-            self._jog_speed, self._jog_duration_s,
+            "SunSafetyMonitor started: cone=%.1f° alt_thr=%.1f° jog=speed=%d dur=%ds",
+            self._min_separation_deg,
+            self._alt_threshold_deg,
+            self._jog_speed,
+            self._jog_duration_s,
         )
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -398,7 +414,8 @@ class SunSafetyMonitor:
             # recompute.
             try:
                 _, sun_alt = compute_sun_altaz(
-                    lat_deg=self._lat_deg, lon_deg=self._lon_deg,
+                    lat_deg=self._lat_deg,
+                    lon_deg=self._lon_deg,
                 )
                 wait = (
                     self._tick_active
@@ -413,7 +430,8 @@ class SunSafetyMonitor:
         if not self._enabled or self._emergency_lockout.is_set():
             return
         sun_az, sun_alt = compute_sun_altaz(
-            lat_deg=self._lat_deg, lon_deg=self._lon_deg,
+            lat_deg=self._lat_deg,
+            lon_deg=self._lon_deg,
         )
         if sun_alt < self._alt_threshold_deg:
             return
@@ -432,19 +450,28 @@ class SunSafetyMonitor:
 
     def _trigger_emergency(
         self,
-        mount_az: float, mount_el: float,
-        sun_az: float, sun_alt: float, sep: float,
+        mount_az: float,
+        mount_el: float,
+        sun_az: float,
+        sun_alt: float,
+        sep: float,
     ) -> None:
         jog_angle = compute_jog_angle(
-            mount_az, mount_el, sun_az, sun_alt,
+            mount_az,
+            mount_el,
+            sun_az,
+            sun_alt,
             jog_speed=self._jog_speed,
             jog_duration_s=float(self._jog_duration_s),
         )
         trip = SafetyTrip(
             when_utc=datetime.now(timezone.utc),
-            sun_az_deg=sun_az, sun_alt_deg=sun_alt,
-            mount_az_deg=mount_az, mount_el_deg=mount_el,
-            separation_deg=sep, cone_deg=self._min_separation_deg,
+            sun_az_deg=sun_az,
+            sun_alt_deg=sun_alt,
+            mount_az_deg=mount_az,
+            mount_el_deg=mount_el,
+            separation_deg=sep,
+            cone_deg=self._min_separation_deg,
             jog_angle_deg=jog_angle,
             jog_speed=self._jog_speed,
             jog_duration_s=self._jog_duration_s,
@@ -453,9 +480,15 @@ class SunSafetyMonitor:
             "SUN SAFETY TRIP: sep=%.1f° < cone=%.1f° "
             "(mount az=%.1f° el=%.1f°, sun az=%.1f° alt=%.1f°) — "
             "jogging at speed=%d angle=%d° for %ds",
-            sep, self._min_separation_deg,
-            mount_az, mount_el, sun_az, sun_alt,
-            self._jog_speed, jog_angle, self._jog_duration_s,
+            sep,
+            self._min_separation_deg,
+            mount_az,
+            mount_el,
+            sun_az,
+            sun_alt,
+            self._jog_speed,
+            jog_angle,
+            self._jog_duration_s,
         )
         with self._lock:
             self._last_trip = trip
@@ -473,7 +506,9 @@ class SunSafetyMonitor:
             # 3. Issue the jog (raw path — bypasses the wrapper).
             try:
                 self._jog_command(
-                    self._jog_speed, jog_angle, self._jog_duration_s,
+                    self._jog_speed,
+                    jog_angle,
+                    self._jog_duration_s,
                 )
             except Exception:
                 logger.exception("jog_command raised — NOT retrying")

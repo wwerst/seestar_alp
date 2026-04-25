@@ -26,6 +26,7 @@ def _stub_load_toml(monkeypatch):
     Config.sun_avoidance_* survive start/reload calls (otherwise the
     TOML reader overwrites them from disk)."""
     from device.config import Config
+
     monkeypatch.setattr(Config, "load_toml", lambda *a, **kw: None)
 
 
@@ -55,7 +56,9 @@ def test_start_respects_sun_avoidance_disabled_flag(monkeypatch, _stub_load_toml
     assert ss.get_sun_monitor() is None  # never installed
 
 
-def test_reload_pushes_updated_thresholds_into_running_monitor(monkeypatch, _stub_load_toml):
+def test_reload_pushes_updated_thresholds_into_running_monitor(
+    monkeypatch, _stub_load_toml
+):
     from device.config import Config
 
     monkeypatch.setattr(ss.SunSafetyMonitor, "start", lambda self: None)
@@ -94,7 +97,8 @@ def test_abort_active_sessions_stops_manager_per_seestar(monkeypatch):
     from device.live_tracker_service import _abort_active_sessions
 
     monkeypatch.setattr(
-        Config, "seestars",
+        Config,
+        "seestars",
         [{"device_num": 1}, {"device_num": 2}],
         raising=False,
     )
@@ -107,6 +111,7 @@ def test_abort_active_sessions_stops_manager_per_seestar(monkeypatch):
 
     import device.live_tracker as lt
     import device.rotation_calibration as rc
+
     monkeypatch.setattr(lt, "get_manager", lambda: _FakeMgr())
     monkeypatch.setattr(rc, "get_calibration_manager", lambda: _FakeMgr())
 
