@@ -438,9 +438,13 @@ def write_calibration(
         },
         "landmarks": landmark_records,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    # Atomic write: every consumer (MountFrame.from_calibration_json,
+    # the live-tracker boot path) reads this file unconditionally on
+    # session start. A non-atomic open(..., "w") leaves a truncated file
+    # on SIGKILL/power-loss mid-write and blocks the next session.
+    from device._atomic_json import write_atomic_json
+
+    write_atomic_json(path, payload, indent=2)
 
 
 # ---------- CalibrationSession --------------------------------------

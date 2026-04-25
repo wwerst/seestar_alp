@@ -222,6 +222,68 @@ def test_write_calibration_parents_created(tmp_path):
     assert out.exists()
 
 
+def test_write_calibration_is_atomic_under_simulated_crash(tmp_path, monkeypatch):
+    """P1-3: a SIGKILL/power-loss mid-write must NOT leave the
+    destination file truncated. Pre-existing valid contents must
+    survive an interrupted overwrite.
+
+    Strategy: pre-populate the destination with a known-good payload,
+    then monkeypatch json.dump to raise mid-write. The atomic-write
+    contract guarantees the destination file still parses as the
+    original payload (the tmp file may exist or be cleaned up; we
+    don't make a contract about that).
+    """
+    site = build_site(**DOCKWEILER)
+    sol = RotationSolution(
+        yaw_deg=12.345,
+        pitch_deg=0.5,
+        roll_deg=-0.25,
+        residual_rms_deg=0.05,
+        per_landmark=[],
+    )
+    out = tmp_path / "cal.json"
+
+    # First write: creates a known-good baseline.
+    write_calibration(out, sol, site, [])
+    baseline = json.loads(out.read_text())
+    assert baseline["yaw_offset_deg"] == pytest.approx(12.345)
+
+    # Second write: simulate a crash mid-json.dump.
+    import device._atomic_json as aj
+
+    real_dump = json.dump
+
+    def boom_after_partial(*args, **kwargs):
+        # Write some bytes to the tmp file so a non-atomic open(..., "w")
+        # would have already truncated the destination — then crash.
+        f = args[1] if len(args) >= 2 else kwargs.get("fp")
+        if f is not None:
+            f.write('{"calibration_method": "rotation_landmarks",\n')
+            f.flush()
+        raise RuntimeError("simulated SIGKILL mid-write")
+
+    monkeypatch.setattr(aj.json, "dump", boom_after_partial)
+
+    sol2 = RotationSolution(
+        yaw_deg=99.0,
+        pitch_deg=0.0,
+        roll_deg=0.0,
+        residual_rms_deg=0.0,
+        per_landmark=[],
+    )
+    with pytest.raises(RuntimeError, match="simulated SIGKILL"):
+        write_calibration(out, sol2, site, [])
+
+    # Baseline contents are intact — the destination was never partially
+    # overwritten. Restore json.dump to be a good monkeypatch citizen.
+    monkeypatch.setattr(aj.json, "dump", real_dump)
+    survived = json.loads(out.read_text())
+    assert survived == baseline, (
+        "Atomic write contract violated: destination was partially "
+        "overwritten during a simulated crash."
+    )
+
+
 # ---------- haversine + elevation lookup -----------------------------
 
 
