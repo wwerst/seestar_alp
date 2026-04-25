@@ -44,21 +44,32 @@ class _FakeObs:
 
 
 def _write_geotiff(
-    path: Path, data: np.ndarray,
+    path: Path,
+    data: np.ndarray,
     *,
-    west: float, south: float, east: float, north: float,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
 ) -> Path:
     """Write a single-band float32 GeoTIFF at ``path`` with EPSG:4326
     and the given bounds. Returns ``path``."""
     height, width = data.shape
     transform = from_bounds(
-        west=west, south=south, east=east, north=north,
-        width=width, height=height,
+        west=west,
+        south=south,
+        east=east,
+        north=north,
+        width=width,
+        height=height,
     )
     with rasterio.open(
-        path, "w",
+        path,
+        "w",
         driver="GTiff",
-        height=height, width=width, count=1,
+        height=height,
+        width=width,
+        count=1,
         dtype="float32",
         crs="EPSG:4326",
         transform=transform,
@@ -73,8 +84,10 @@ def _make_provider(tif_path: Path):
     rasterio datasets are context managers, so callers use
     ``with provider(...) as ds:`` and the dataset closes on exit.
     """
+
     def _prov(lat, lon, source):
         return rasterio.open(tif_path)
+
     return _prov
 
 
@@ -90,16 +103,19 @@ def _flat_tif(tmp_path: Path, height_m: float = 0.0) -> Path:
 
 
 def _single_hill_tif(
-    tmp_path: Path, *, peak_m: float = 200.0,
-    center_col: int = 50, center_row: int = 50, sigma_cells: float = 5.0,
+    tmp_path: Path,
+    *,
+    peak_m: float = 200.0,
+    center_col: int = 50,
+    center_row: int = 50,
+    sigma_cells: float = 5.0,
 ) -> Path:
     h, w = 100, 100
     cols = np.arange(w)[None, :]
     rows = np.arange(h)[:, None]
     r2 = (cols - center_col) ** 2 + (rows - center_row) ** 2
-    arr = peak_m * np.exp(-r2 / (2.0 * sigma_cells ** 2))
-    return _write_geotiff(tmp_path / "hill.tif", arr.astype(np.float32),
-                          **_MDR_BOUNDS)
+    arr = peak_m * np.exp(-r2 / (2.0 * sigma_cells**2))
+    return _write_geotiff(tmp_path / "hill.tif", arr.astype(np.float32), **_MDR_BOUNDS)
 
 
 def _two_hills_tif(tmp_path: Path) -> Path:
@@ -109,12 +125,8 @@ def _two_hills_tif(tmp_path: Path) -> Path:
     h, w = 100, 100
     cols = np.arange(w)[None, :]
     rows = np.arange(h)[:, None]
-    g1 = 180.0 * np.exp(
-        -((cols - 55) ** 2 + (rows - 18) ** 2) / (2.0 * 3.0 ** 2)
-    )
-    g2 = 300.0 * np.exp(
-        -((cols - 80) ** 2 + (rows - 18) ** 2) / (2.0 * 3.0 ** 2)
-    )
+    g1 = 180.0 * np.exp(-((cols - 55) ** 2 + (rows - 18) ** 2) / (2.0 * 3.0**2))
+    g2 = 300.0 * np.exp(-((cols - 80) ** 2 + (rows - 18) ** 2) / (2.0 * 3.0**2))
     arr = np.maximum(g1, g2).astype(np.float32)
     return _write_geotiff(tmp_path / "two_hills.tif", arr, **_MDR_BOUNDS)
 
@@ -135,9 +147,13 @@ def _trough_observer_tif(tmp_path: Path) -> Path:
 def test_losresult_shape_and_fields():
     """Acceptance §1: dataclass fields match the plan."""
     r = LosResult(
-        visible=True, min_clearance_m=5.0,
-        obstacle_distance_m=None, obstacle_altitude_m=None,
-        used_refraction_k=0.13, sample_count=50, warnings=(),
+        visible=True,
+        min_clearance_m=5.0,
+        obstacle_distance_m=None,
+        obstacle_altitude_m=None,
+        used_refraction_k=0.13,
+        sample_count=50,
+        warnings=(),
     )
     assert r.visible is True
     assert r.min_clearance_m == 5.0
@@ -178,7 +194,11 @@ def test_effective_earth_radius_rejects_duct():
 
 def test_great_circle_samples_endpoints():
     lats, lons, dists, total = _great_circle_samples(
-        33.0, -118.0, 34.0, -117.0, n_interior=10,
+        33.0,
+        -118.0,
+        34.0,
+        -117.0,
+        n_interior=10,
     )
     assert len(lats) == 12
     assert lats[0] == 33.0
@@ -193,7 +213,11 @@ def test_great_circle_samples_endpoints():
 
 def test_great_circle_samples_monotone_distance():
     _lats, _lons, dists, total = _great_circle_samples(
-        0.0, 0.0, 0.0, 0.5, n_interior=20,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        n_interior=20,
     )
     # Distances must be strictly increasing from observer outward.
     assert np.all(np.diff(dists) > 0.0)
@@ -209,8 +233,12 @@ def test_bilinear_sample_dem_known_corners(tmp_path):
     # 2x2 cell, values form a gradient 0, 10, 20, 30 at pixel centres.
     arr = np.array([[0.0, 10.0], [20.0, 30.0]], dtype=np.float32)
     path = _write_geotiff(
-        tmp_path / "g.tif", arr,
-        west=-118.0, south=33.0, east=-117.0, north=34.0,
+        tmp_path / "g.tif",
+        arr,
+        west=-118.0,
+        south=33.0,
+        east=-117.0,
+        north=34.0,
     )
     with rasterio.open(path) as ds:
         # Pixel centres for a 1°×1° DEM with 2×2 cells are at
@@ -231,8 +259,12 @@ def test_bilinear_sample_dem_out_of_bounds_clamps(tmp_path):
     cell; must not raise IndexError."""
     arr = np.array([[5.0, 5.0], [5.0, 5.0]], dtype=np.float32)
     path = _write_geotiff(
-        tmp_path / "c.tif", arr,
-        west=-118.0, south=33.0, east=-117.0, north=34.0,
+        tmp_path / "c.tif",
+        arr,
+        west=-118.0,
+        south=33.0,
+        east=-117.0,
+        north=34.0,
     )
     with rasterio.open(path) as ds:
         vals = _bilinear_sample_dem(
@@ -272,7 +304,10 @@ def test_check_los_flat_ocean_visible(tmp_path):
     tif = _flat_tif(tmp_path, height_m=0.0)
     tgt_lat, tgt_lon, tgt_h = 33.918889, -118.427223, 103.3
     res = check_los(
-        _OBS, tgt_lat, tgt_lon, tgt_h,
+        _OBS,
+        tgt_lat,
+        tgt_lon,
+        tgt_h,
         dem_provider=_make_provider(tif),
     )
     assert res.visible is True
@@ -288,7 +323,10 @@ def test_check_los_single_hill_blocks(tmp_path):
     # Target at the hill's far side, 50 m AMSL (below hill top)
     tgt_lat, tgt_lon, tgt_h = 33.90, -118.42, 50.0
     res = check_los(
-        _OBS, tgt_lat, tgt_lon, tgt_h,
+        _OBS,
+        tgt_lat,
+        tgt_lon,
+        tgt_h,
         dem_provider=_make_provider(tif),
     )
     assert res.visible is False
@@ -318,7 +356,10 @@ def test_check_los_two_hills_reports_worst_obstruction(tmp_path):
     # E-heading target at the observer's latitude; crosses both hills.
     tgt_lat, tgt_lon, tgt_h = 33.9615, -118.405, 10.0
     res = check_los(
-        _OBS, tgt_lat, tgt_lon, tgt_h,
+        _OBS,
+        tgt_lat,
+        tgt_lon,
+        tgt_h,
         dem_provider=_make_provider(tif),
     )
     assert res.visible is False
@@ -335,7 +376,10 @@ def test_check_los_observer_under_ground_warns(tmp_path):
     # Use a distant, high target so the geometry is otherwise clear.
     tgt_lat, tgt_lon, tgt_h = 33.90, -118.42, 400.0
     res = check_los(
-        _OBS, tgt_lat, tgt_lon, tgt_h,
+        _OBS,
+        tgt_lat,
+        tgt_lon,
+        tgt_h,
         dem_provider=_make_provider(tif),
     )
     assert any("below DEM" in w for w in res.warnings), res.warnings
@@ -347,10 +391,8 @@ def test_check_los_refraction_k_increases_clearance(tmp_path):
     tif = _single_hill_tif(tmp_path, peak_m=250.0, sigma_cells=6.0)
     tgt_lat, tgt_lon, tgt_h = 33.90, -118.42, 200.0
     prov = _make_provider(tif)
-    r_k0 = check_los(_OBS, tgt_lat, tgt_lon, tgt_h, k=0.0,
-                     dem_provider=prov)
-    r_k5 = check_los(_OBS, tgt_lat, tgt_lon, tgt_h, k=0.5,
-                     dem_provider=prov)
+    r_k0 = check_los(_OBS, tgt_lat, tgt_lon, tgt_h, k=0.0, dem_provider=prov)
+    r_k5 = check_los(_OBS, tgt_lat, tgt_lon, tgt_h, k=0.5, dem_provider=prov)
     assert r_k5.min_clearance_m > r_k0.min_clearance_m
     assert r_k0.used_refraction_k == 0.0
     assert r_k5.used_refraction_k == 0.5
@@ -361,7 +403,10 @@ def test_check_los_k_default_matches_module_constant(tmp_path):
     repo-wide 0.13 convention."""
     tif = _flat_tif(tmp_path)
     res = check_los(
-        _OBS, 33.90, -118.42, 100.0,
+        _OBS,
+        33.90,
+        -118.42,
+        100.0,
         dem_provider=_make_provider(tif),
     )
     assert res.used_refraction_k == pytest.approx(DEFAULT_K)
@@ -383,7 +428,10 @@ def test_check_los_ignore_radius_suppresses_near_blocker(tmp_path):
     # A large ignore radius (e.g. 2 km) should mask the spike even if
     # it would otherwise block. With 0 m radius, the blocker shows.
     r_large = check_los(
-        _OBS, tgt_lat, tgt_lon, tgt_h,
+        _OBS,
+        tgt_lat,
+        tgt_lon,
+        tgt_h,
         ignore_radius_m=2000.0,
         dem_provider=_make_provider(tif),
     )
@@ -398,7 +446,10 @@ def test_check_los_observer_at_target(tmp_path):
     """Observer coincident with target → visible, sample_count=2."""
     tif = _flat_tif(tmp_path)
     res = check_los(
-        _OBS, _OBS.lat_deg, _OBS.lon_deg, _OBS.alt_m,
+        _OBS,
+        _OBS.lat_deg,
+        _OBS.lon_deg,
+        _OBS.alt_m,
         dem_provider=_make_provider(tif),
     )
     assert res.visible is True
@@ -408,10 +459,8 @@ def test_check_los_observer_at_target(tmp_path):
 def test_check_los_sample_count_scales_with_path(tmp_path):
     """Longer paths use more samples (floor at 50)."""
     tif = _flat_tif(tmp_path)
-    short = check_los(_OBS, 33.96, -118.457, 5.0,
-                      dem_provider=_make_provider(tif))
-    long = check_los(_OBS, 33.92, -118.42, 100.0,
-                     dem_provider=_make_provider(tif))
+    short = check_los(_OBS, 33.96, -118.457, 5.0, dem_provider=_make_provider(tif))
+    long = check_los(_OBS, 33.92, -118.42, 100.0, dem_provider=_make_provider(tif))
     assert short.sample_count == 52  # floor 50 + 2 endpoints
     assert long.sample_count > short.sample_count
 
@@ -424,7 +473,9 @@ def test_dem_lookup_elevation_reads_cell(tmp_path):
     arr = np.full((100, 100), 42.0, dtype=np.float32)
     tif = _write_geotiff(tmp_path / "const.tif", arr, **_MDR_BOUNDS)
     val = dem_lookup_elevation(
-        33.93, -118.45, dem_provider=_make_provider(tif),
+        33.93,
+        -118.45,
+        dem_provider=_make_provider(tif),
     )
     assert val == pytest.approx(42.0, abs=0.01)
 
@@ -432,6 +483,7 @@ def test_dem_lookup_elevation_reads_cell(tmp_path):
 def test_dem_lookup_elevation_raises_runtimeerror_on_provider_failure():
     def _bad_provider(lat, lon, source):
         raise OSError("simulated disk error")
+
     with pytest.raises(RuntimeError, match="DEM lookup failed"):
         dem_lookup_elevation(33.93, -118.45, dem_provider=_bad_provider)
 
@@ -447,7 +499,9 @@ def test_default_provider_auto_fetch_false_raises_on_miss(tmp_path, monkeypatch)
     # the underlying function with auto_fetch=False directly.
     with pytest.raises(FileNotFoundError, match="not cached"):
         terrain_los._default_dem_provider(
-            33.96, -118.45, "srtm1",
+            33.96,
+            -118.45,
+            "srtm1",
             cache_dir=tmp_path / "dem",
             auto_fetch=False,
         )
@@ -456,7 +510,9 @@ def test_default_provider_auto_fetch_false_raises_on_miss(tmp_path, monkeypatch)
 def test_default_provider_rejects_non_srtm_source():
     with pytest.raises(NotImplementedError, match="not available in MVP"):
         terrain_los._default_dem_provider(
-            33.96, -118.45, source="3dep",
+            33.96,
+            -118.45,
+            source="3dep",
         )
 
 
@@ -475,16 +531,16 @@ def _mdr_hyperion_dem(tmp_path: Path) -> Path:
     # observer around col=60, row=120 (south-east).
     cols = np.arange(w)[None, :]
     rows = np.arange(h)[:, None]
-    hyperion = 30.0 * np.exp(
-        -((cols - 90) ** 2 + (rows - 130) ** 2) / (2.0 * 10.0 ** 2)
-    )
-    baldwin = 180.0 * np.exp(
-        -((cols - 140) ** 2 + (rows - 50) ** 2) / (2.0 * 15.0 ** 2)
-    )
+    hyperion = 30.0 * np.exp(-((cols - 90) ** 2 + (rows - 130) ** 2) / (2.0 * 10.0**2))
+    baldwin = 180.0 * np.exp(-((cols - 140) ** 2 + (rows - 50) ** 2) / (2.0 * 15.0**2))
     arr = np.maximum(hyperion, baldwin).astype(np.float32)
     return _write_geotiff(
-        tmp_path / "mdr.tif", arr,
-        west=-118.55, south=33.85, east=-118.35, north=34.05,
+        tmp_path / "mdr.tif",
+        arr,
+        west=-118.55,
+        south=33.85,
+        east=-118.35,
+        north=34.05,
     )
 
 
@@ -495,7 +551,10 @@ def test_mdr_to_hyperion_is_visible(tmp_path):
     tif = _mdr_hyperion_dem(tmp_path)
     obs = _FakeObs(lat_deg=33.9615051, lon_deg=-118.4581361, alt_m=2.0)
     res = check_los(
-        obs, 33.918889, -118.427223, 103.33,
+        obs,
+        33.918889,
+        -118.427223,
+        103.33,
         dem_provider=_make_provider(tif),
     )
     assert res.visible is True, res
@@ -509,7 +568,10 @@ def test_mdr_to_low_target_behind_baldwin_is_blocked(tmp_path):
     obs = _FakeObs(lat_deg=33.9615051, lon_deg=-118.4581361, alt_m=2.0)
     # Target NE, low altitude, past the Baldwin bump
     res = check_los(
-        obs, 34.00, -118.38, 5.0,
+        obs,
+        34.00,
+        -118.38,
+        5.0,
         dem_provider=_make_provider(tif),
     )
     assert res.visible is False
@@ -544,15 +606,23 @@ def test_filter_visible_check_terrain_drops_blocked(tmp_path):
     # Height is high enough to pass the horizon check but the
     # synthetic 180 m Baldwin bump sits in the intervening path.
     blocked = Landmark(
-        oas="00-BLOCKED", name="behind_baldwin",
-        lat_deg=34.01, lon_deg=-118.37, height_amsl_m=50.0,
-        lit=True, accuracy_class="1A",
+        oas="00-BLOCKED",
+        name="behind_baldwin",
+        lat_deg=34.01,
+        lon_deg=-118.37,
+        height_amsl_m=50.0,
+        lit=True,
+        accuracy_class="1A",
     )
     # Target we know is visible (ocean path + top of Hyperion-like bump)
     clear = Landmark(
-        oas="00-CLEAR", name="hyperion_like",
-        lat_deg=33.918889, lon_deg=-118.427223, height_amsl_m=103.33,
-        lit=True, accuracy_class="1A",
+        oas="00-CLEAR",
+        name="hyperion_like",
+        lat_deg=33.918889,
+        lon_deg=-118.427223,
+        height_amsl_m=103.33,
+        lit=True,
+        accuracy_class="1A",
     )
 
     tif = _mdr_hyperion_dem(tmp_path)
@@ -567,8 +637,11 @@ def test_filter_visible_check_terrain_drops_blocked(tmp_path):
 
     # With check_terrain=True + our synthetic DEM, blocked should drop.
     hits = filter_visible(
-        [blocked, clear], site, min_el_deg=0.0,
-        check_terrain=True, dem_provider=prov,
+        [blocked, clear],
+        site,
+        min_el_deg=0.0,
+        check_terrain=True,
+        dem_provider=prov,
     )
     oas = {h[0].oas for h in hits}
     assert "00-BLOCKED" not in oas
@@ -583,19 +656,31 @@ def test_filter_visible_check_terrain_k_is_plumbed(tmp_path):
 
     site = build_site(lat_deg=33.9615051, lon_deg=-118.4581361, alt_m=2.0)
     clear = Landmark(
-        oas="00-CLEAR", name="hyperion_like",
-        lat_deg=33.918889, lon_deg=-118.427223, height_amsl_m=103.33,
-        lit=True, accuracy_class="1A",
+        oas="00-CLEAR",
+        name="hyperion_like",
+        lat_deg=33.918889,
+        lon_deg=-118.427223,
+        height_amsl_m=103.33,
+        lit=True,
+        accuracy_class="1A",
     )
     tif = _mdr_hyperion_dem(tmp_path)
     prov = _make_provider(tif)
     hits_k0 = filter_visible(
-        [clear], site, min_el_deg=0.0,
-        check_terrain=True, k=0.0, dem_provider=prov,
+        [clear],
+        site,
+        min_el_deg=0.0,
+        check_terrain=True,
+        k=0.0,
+        dem_provider=prov,
     )
     hits_k13 = filter_visible(
-        [clear], site, min_el_deg=0.0,
-        check_terrain=True, k=0.13, dem_provider=prov,
+        [clear],
+        site,
+        min_el_deg=0.0,
+        check_terrain=True,
+        k=0.13,
+        dem_provider=prov,
     )
     # Clear target stays visible under both.
     assert len(hits_k0) == 1

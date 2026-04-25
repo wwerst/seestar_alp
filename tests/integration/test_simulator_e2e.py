@@ -87,9 +87,7 @@ def _build_front_test_app():
         "/{telescope_id:int}/schedule/state", front_app.ScheduleToggleResource()
     )
     app.add_route("/{telescope_id:int}/startup", front_app.StartupResource())
-    app.add_route(
-        "/{telescope_id:int}/live_tracker", front_app.LiveTrackerResource()
-    )
+    app.add_route("/{telescope_id:int}/live_tracker", front_app.LiveTrackerResource())
     app.add_route(
         "/api/{telescope_id:int}/live_tracker/targets",
         front_app.LiveTrackerTargetsResource(),
@@ -559,7 +557,8 @@ def test_06d_sun_safety_status_and_dismiss(front_sim_bridge):
         monitor = ss.SunSafetyMonitor(
             altaz_reader=lambda: None,
             jog_command=lambda *a, **kw: None,
-            lat_deg=33.96, lon_deg=-118.46,
+            lat_deg=33.96,
+            lon_deg=-118.46,
             jog_duration_s=0,
         )
         ss.set_sun_monitor(monitor)
@@ -570,10 +569,15 @@ def test_06d_sun_safety_status_and_dismiss(front_sim_bridge):
         # (3) Stuff a SafetyTrip directly → tripped=True + full payload.
         trip = ss.SafetyTrip(
             when_utc=datetime(2026, 4, 24, 18, 0, tzinfo=timezone.utc),
-            sun_az_deg=180.0, sun_alt_deg=33.0,
-            mount_az_deg=181.0, mount_el_deg=34.0,
-            separation_deg=1.4, cone_deg=30.0,
-            jog_angle_deg=225, jog_speed=1440, jog_duration_s=3,
+            sun_az_deg=180.0,
+            sun_alt_deg=33.0,
+            mount_az_deg=181.0,
+            mount_el_deg=34.0,
+            separation_deg=1.4,
+            cone_deg=30.0,
+            jog_angle_deg=225,
+            jog_speed=1440,
+            jog_duration_s=3,
         )
         with monitor._lock:
             monitor._last_trip = trip
@@ -606,8 +610,7 @@ def test_06e_live_tracker_adsbfi_poller_deferred_to_first_list_live():
     from device.live_tracker import TargetCatalog
 
     catalog = TargetCatalog(live_enabled=True)
-    assert catalog._live_thread is None, \
-        "poller must not start at catalog construction"
+    assert catalog._live_thread is None, "poller must not start at catalog construction"
 
     try:
         catalog.list_live()
@@ -661,7 +664,8 @@ def test_06c_calibrate_rotation_smoke(front_sim_bridge):
     # Command posts against a nonexistent session → 404.
     for path in ("sight", "cancel"):
         r = client.simulate_post(
-            f"/api/1/calibration/{path}", json={},
+            f"/api/1/calibration/{path}",
+            json={},
         )
         assert r.status_code == 404
 

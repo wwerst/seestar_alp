@@ -43,13 +43,20 @@ DOCKWEILER = dict(lat_deg=33.9615051, lon_deg=-118.4581361, alt_m=2.0)
 
 
 def _synth_sighting(
-    landmark: Landmark, site, yaw: float, pitch: float, roll: float,
+    landmark: Landmark,
+    site,
+    yaw: float,
+    pitch: float,
+    roll: float,
 ) -> Sighting:
     """Forward-model: for a given rotation, produce what the encoder
     would read when the scope is exactly on the landmark (including
     the terrestrial-refraction lift applied by the solver)."""
     mf = MountFrame.from_euler_deg(
-        yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll, site=site,
+        yaw_deg=yaw,
+        pitch_deg=pitch,
+        roll_deg=roll,
+        site=site,
     )
     az, el, slant = mf.ecef_to_mount_azel(landmark.ecef())
     # Match the solver: the scope sees the apparent (refracted) el.
@@ -100,7 +107,10 @@ def test_solver_recovers_small_tilt():
     # Reconstruct the rotation and verify it maps both landmarks back
     # to the synthesized encoder (az, el) within 0.05°.
     mf_sol = MountFrame.from_euler_deg(
-        yaw_deg=sol.yaw_deg, pitch_deg=sol.pitch_deg, roll_deg=sol.roll_deg, site=site,
+        yaw_deg=sol.yaw_deg,
+        pitch_deg=sol.pitch_deg,
+        roll_deg=sol.roll_deg,
+        site=site,
     )
     for s in sightings:
         az, el, _ = mf_sol.ecef_to_mount_azel(s.landmark.ecef())
@@ -161,18 +171,26 @@ def test_write_calibration_produces_readable_schema(tmp_path):
     """Round-trip: write → MountFrame.from_calibration_json reads back."""
     site = build_site(**DOCKWEILER)
     sol = RotationSolution(
-        yaw_deg=-75.123, pitch_deg=0.2, roll_deg=-0.1,
+        yaw_deg=-75.123,
+        pitch_deg=0.2,
+        roll_deg=-0.1,
         residual_rms_deg=0.08,
         per_landmark=[
             {
-                "oas": "06-000301", "name": "Hyperion",
-                "lat_deg": 33.918889, "lon_deg": -118.427223,
+                "oas": "06-000301",
+                "name": "Hyperion",
+                "lat_deg": 33.918889,
+                "lon_deg": -118.427223,
                 "height_amsl_m": 103.3,
-                "encoder_az_deg": 73.75, "encoder_el_deg": 1.03,
-                "true_az_deg": 148.87, "true_el_deg": 1.03,
+                "encoder_az_deg": 73.75,
+                "encoder_el_deg": 1.03,
+                "true_az_deg": 148.87,
+                "true_el_deg": 1.03,
                 "slant_m": 5523.0,
-                "predicted_az_deg": 73.75, "predicted_el_deg": 1.03,
-                "residual_az_deg": 0.0, "residual_el_deg": 0.0,
+                "predicted_az_deg": 73.75,
+                "predicted_el_deg": 1.03,
+                "residual_az_deg": 0.0,
+                "residual_el_deg": 0.0,
             },
         ],
     )
@@ -196,8 +214,9 @@ def test_write_calibration_produces_readable_schema(tmp_path):
 def test_write_calibration_parents_created(tmp_path):
     """Nested path gets its parent dir created."""
     site = build_site(**DOCKWEILER)
-    sol = RotationSolution(yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0,
-                           residual_rms_deg=0.0, per_landmark=[])
+    sol = RotationSolution(
+        yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0, residual_rms_deg=0.0, per_landmark=[]
+    )
     out = tmp_path / "nested" / "dir" / "cal.json"
     write_calibration(out, sol, site, [])
     assert out.exists()
@@ -219,18 +238,23 @@ def test_haversine_same_point_is_zero():
 
 def test_lookup_elevation_happy(monkeypatch):
     """Open-Meteo returns {"elevation": [2.0]} — we return 2.0."""
+
     class _FakeResp:
         def raise_for_status(self):
             pass
+
         def json(self):
             return {"elevation": [2.3]}
 
     called = {}
+
     def fake_get(url, params=None, timeout=None):
         called["url"] = url
         called["params"] = params
         return _FakeResp()
+
     import requests
+
     monkeypatch.setattr(requests, "get", fake_get)
 
     assert lookup_elevation(33.96, -118.46) == pytest.approx(2.3)
@@ -241,8 +265,10 @@ def test_lookup_elevation_happy(monkeypatch):
 
 def test_lookup_elevation_raises_on_http_error(monkeypatch):
     import requests
+
     def bad_get(url, params=None, timeout=None):
         raise requests.ConnectionError("no network")
+
     monkeypatch.setattr(requests, "get", bad_get)
     with pytest.raises(RuntimeError, match="elevation lookup failed"):
         lookup_elevation(33.96, -118.46)
@@ -252,11 +278,15 @@ def test_lookup_elevation_raises_on_malformed_payload(monkeypatch):
     class _FakeResp:
         def raise_for_status(self):
             pass
+
         def json(self):
             return {"elevation": "not a list"}
+
     import requests
+
     monkeypatch.setattr(
-        requests, "get",
+        requests,
+        "get",
         lambda url, params=None, timeout=None: _FakeResp(),
     )
     with pytest.raises(RuntimeError, match="malformed"):
@@ -293,13 +323,23 @@ def testparse_calibrated_at_none_on_missing_or_bad():
 
 
 def _write_prior(
-    path, *, lat, lon, alt, ts_iso,
+    path,
+    *,
+    lat,
+    lon,
+    alt,
+    ts_iso,
 ) -> None:
-    path.write_text(json.dumps({
-        "yaw_offset_deg": -79.0, "residual_rms_deg": 0.2,
-        "calibrated_at": ts_iso,
-        "observer": {"lat_deg": lat, "lon_deg": lon, "alt_m": alt},
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "yaw_offset_deg": -79.0,
+                "residual_rms_deg": 0.2,
+                "calibrated_at": ts_iso,
+                "observer": {"lat_deg": lat, "lon_deg": lon, "alt_m": alt},
+            }
+        )
+    )
 
 
 def _now_dash(offset_hours: float = 0.0) -> str:
@@ -314,8 +354,7 @@ def testinspect_prior_missing_file(tmp_path):
 
 def testinspect_prior_recent_local_defaults_keep(tmp_path):
     p = tmp_path / "cal.json"
-    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0,
-                 ts_iso=_now_dash(offset_hours=1.0))
+    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0, ts_iso=_now_dash(offset_hours=1.0))
     info = inspect_prior(p, current_lat=33.96, current_lon=-118.46)
     assert info is not None
     assert info.age_s is not None and info.age_s < 6 * 3600
@@ -326,19 +365,18 @@ def testinspect_prior_recent_local_defaults_keep(tmp_path):
 
 def testinspect_prior_stale_defaults_clear(tmp_path):
     p = tmp_path / "cal.json"
-    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0,
-                 ts_iso=_now_dash(offset_hours=10.0))
+    _write_prior(
+        p, lat=33.96, lon=-118.46, alt=2.0, ts_iso=_now_dash(offset_hours=10.0)
+    )
     info = inspect_prior(p, current_lat=33.96, current_lon=-118.46)
     assert info.should_default_keep is False
 
 
 def testinspect_prior_moved_defaults_clear(tmp_path):
     p = tmp_path / "cal.json"
-    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0,
-                 ts_iso=_now_dash(offset_hours=0.0))
+    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0, ts_iso=_now_dash(offset_hours=0.0))
     # Current GPS 50 m north of prior — well beyond the 10 m threshold.
-    info = inspect_prior(p, current_lat=33.96 + 50 / 111_320.0,
-                          current_lon=-118.46)
+    info = inspect_prior(p, current_lat=33.96 + 50 / 111_320.0, current_lon=-118.46)
     assert info.should_default_keep is False
 
 
@@ -346,10 +384,15 @@ def testinspect_prior_without_observer_block_cannot_default_keep(tmp_path):
     """Legacy compass output has no `observer` block; fail safe →
     default clear."""
     p = tmp_path / "cal.json"
-    p.write_text(json.dumps({
-        "yaw_offset_deg": -79.0, "residual_rms_deg": 0.2,
-        "calibrated_at": _now_dash(offset_hours=0.1),
-    }))
+    p.write_text(
+        json.dumps(
+            {
+                "yaw_offset_deg": -79.0,
+                "residual_rms_deg": 0.2,
+                "calibrated_at": _now_dash(offset_hours=0.1),
+            }
+        )
+    )
     info = inspect_prior(p, 33.96, -118.46)
     assert info is not None
     assert info.observer_lat_deg is None
@@ -368,8 +411,7 @@ def _fake_args(**overrides):
 def test_handle_clear_or_keep_default_keep(monkeypatch, tmp_path):
     """Recent+local prior, user hits Enter → keep, file stays."""
     p = tmp_path / "cal.json"
-    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0,
-                 ts_iso=_now_dash(offset_hours=0.5))
+    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0, ts_iso=_now_dash(offset_hours=0.5))
     prior = inspect_prior(p, 33.96, -118.46)
     monkeypatch.setattr("builtins.input", lambda _p: "")  # Enter
     kept = _handle_clear_or_keep(_fake_args(), prior)
@@ -381,8 +423,9 @@ def test_handle_clear_or_keep_default_keep(monkeypatch, tmp_path):
 def test_handle_clear_or_keep_default_clear(monkeypatch, tmp_path):
     """Stale prior, user hits Enter → clear, backed up to .bak."""
     p = tmp_path / "cal.json"
-    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0,
-                 ts_iso=_now_dash(offset_hours=20.0))
+    _write_prior(
+        p, lat=33.96, lon=-118.46, alt=2.0, ts_iso=_now_dash(offset_hours=20.0)
+    )
     prior = inspect_prior(p, 33.96, -118.46)
     monkeypatch.setattr("builtins.input", lambda _p: "")
     kept = _handle_clear_or_keep(_fake_args(), prior)
@@ -394,8 +437,7 @@ def test_handle_clear_or_keep_default_clear(monkeypatch, tmp_path):
 def test_handle_clear_or_keep_yes_flag_forces_clear(tmp_path):
     """`--yes-clear` bypasses the prompt even for a fresh prior."""
     p = tmp_path / "cal.json"
-    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0,
-                 ts_iso=_now_dash(offset_hours=0.1))
+    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0, ts_iso=_now_dash(offset_hours=0.1))
     prior = inspect_prior(p, 33.96, -118.46)
     kept = _handle_clear_or_keep(_fake_args(yes_clear=True), prior)
     assert kept is False
@@ -405,8 +447,9 @@ def test_handle_clear_or_keep_yes_flag_forces_clear(tmp_path):
 def test_handle_clear_or_keep_keep_flag_forces_keep(tmp_path):
     """`--keep-prior` bypasses the prompt even for a stale prior."""
     p = tmp_path / "cal.json"
-    _write_prior(p, lat=33.96, lon=-118.46, alt=2.0,
-                 ts_iso=_now_dash(offset_hours=30.0))
+    _write_prior(
+        p, lat=33.96, lon=-118.46, alt=2.0, ts_iso=_now_dash(offset_hours=30.0)
+    )
     prior = inspect_prior(p, 33.96, -118.46)
     kept = _handle_clear_or_keep(_fake_args(keep_prior=True), prior)
     assert kept is True
@@ -423,9 +466,12 @@ def test_handle_clear_or_keep_no_prior_returns_false(tmp_path):
 def _prior(lat=33.96, lon=-118.46, alt=5.0, dist=1.0):
     return PriorInfo(
         path=__import__("pathlib").Path("/nonexistent"),
-        observer_lat_deg=lat, observer_lon_deg=lon, observer_alt_m=alt,
+        observer_lat_deg=lat,
+        observer_lon_deg=lon,
+        observer_alt_m=alt,
         calibrated_at=datetime.now(timezone.utc),
-        age_s=3600.0, distance_from_current_m=dist,
+        age_s=3600.0,
+        distance_from_current_m=dist,
     )
 
 
@@ -442,15 +488,19 @@ def test_resolve_altitude_flag_wins(monkeypatch):
 
 def test_resolve_altitude_source_prior_requires_prior(monkeypatch):
     with pytest.raises(SystemExit, match="prior"):
-        _resolve_altitude(_fake_args(altitude_source="prior"),
-                          33.96, -118.46, None, False)
+        _resolve_altitude(
+            _fake_args(altitude_source="prior"), 33.96, -118.46, None, False
+        )
 
 
 def test_resolve_altitude_source_prior_uses_it(monkeypatch):
     prior = _prior(alt=7.5, dist=1.0)
     val = _resolve_altitude(
         _fake_args(altitude_source="prior"),
-        33.96, -118.46, prior, prior_kept=True,
+        33.96,
+        -118.46,
+        prior,
+        prior_kept=True,
     )
     assert val == pytest.approx(7.5)
 
@@ -462,7 +512,11 @@ def test_resolve_altitude_source_lookup(monkeypatch):
         return_value=4.2,
     ) as m:
         val = _resolve_altitude(
-            _fake_args(altitude_source="lookup"), 33.96, -118.46, None, False,
+            _fake_args(altitude_source="lookup"),
+            33.96,
+            -118.46,
+            None,
+            False,
         )
     assert val == pytest.approx(4.2)
     m.assert_called_once_with(33.96, -118.46)
@@ -471,7 +525,11 @@ def test_resolve_altitude_source_lookup(monkeypatch):
 def test_resolve_altitude_source_prompt(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _p: "99.5")
     val = _resolve_altitude(
-        _fake_args(altitude_source="prompt"), 33.96, -118.46, None, False,
+        _fake_args(altitude_source="prompt"),
+        33.96,
+        -118.46,
+        None,
+        False,
     )
     assert val == pytest.approx(99.5)
 
@@ -500,7 +558,10 @@ def test_altitude_menu_prior_available_still_defaults_to_dem(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _p: next(answers))
     prior = _prior(alt=11.0)
     val = _altitude_menu(
-        33.96, -118.46, prior=prior, prior_available=True,
+        33.96,
+        -118.46,
+        prior=prior,
+        prior_available=True,
     )
     assert val == pytest.approx(11.0)
 
@@ -510,15 +571,21 @@ def test_altitude_menu_dem_failure_falls_back_to_open_meteo(monkeypatch):
     can pick Open-Meteo at [2]."""
     answers = iter(["1", "2"])  # try DEM → pick Open-Meteo
     monkeypatch.setattr("builtins.input", lambda _p: next(answers))
-    with mock.patch(
-        "scripts.trajectory.calibrate_rotation.dem_lookup_elevation",
-        side_effect=RuntimeError("no net"),
-    ), mock.patch(
-        "scripts.trajectory.calibrate_rotation.lookup_elevation",
-        return_value=3.1,
+    with (
+        mock.patch(
+            "scripts.trajectory.calibrate_rotation.dem_lookup_elevation",
+            side_effect=RuntimeError("no net"),
+        ),
+        mock.patch(
+            "scripts.trajectory.calibrate_rotation.lookup_elevation",
+            return_value=3.1,
+        ),
     ):
         val = _altitude_menu(
-            33.96, -118.46, prior=None, prior_available=False,
+            33.96,
+            -118.46,
+            prior=None,
+            prior_available=False,
         )
     assert val == pytest.approx(3.1)
 
@@ -528,15 +595,21 @@ def test_altitude_menu_both_lookups_fail_user_picks_manual(monkeypatch):
     manual entry."""
     answers = iter(["1", "2", "3", "15.5"])
     monkeypatch.setattr("builtins.input", lambda _p: next(answers))
-    with mock.patch(
-        "scripts.trajectory.calibrate_rotation.dem_lookup_elevation",
-        side_effect=RuntimeError("no net"),
-    ), mock.patch(
-        "scripts.trajectory.calibrate_rotation.lookup_elevation",
-        side_effect=RuntimeError("no net"),
+    with (
+        mock.patch(
+            "scripts.trajectory.calibrate_rotation.dem_lookup_elevation",
+            side_effect=RuntimeError("no net"),
+        ),
+        mock.patch(
+            "scripts.trajectory.calibrate_rotation.lookup_elevation",
+            side_effect=RuntimeError("no net"),
+        ),
     ):
         val = _altitude_menu(
-            33.96, -118.46, prior=None, prior_available=False,
+            33.96,
+            -118.46,
+            prior=None,
+            prior_available=False,
         )
     assert val == pytest.approx(15.5)
 
@@ -550,7 +623,10 @@ def test_resolve_altitude_source_dem_lookup(monkeypatch):
     ) as m:
         val = _resolve_altitude(
             _fake_args(altitude_source="dem_lookup"),
-            33.96, -118.46, None, False,
+            33.96,
+            -118.46,
+            None,
+            False,
         )
     # 10.0 + 1.6 = 11.6
     assert val == pytest.approx(11.6, abs=1e-6)
@@ -570,7 +646,9 @@ def test_pointing_uncertainty_analytic_hyperion_1A():
       σ_el = hypot(0.457, 10) / 5523 rad = 10.01 / 5523 rad → 0.104°
     """
     sigma_az, sigma_el = pointing_uncertainty_deg(
-        slant_m=5523.0, horizontal_ft=50.0, vertical_ft=3.0,
+        slant_m=5523.0,
+        horizontal_ft=50.0,
+        vertical_ft=3.0,
         observer_sigma_m=10.0,
     )
     assert sigma_az == pytest.approx(0.130, abs=0.005)
@@ -584,7 +662,9 @@ def test_pointing_uncertainty_analytic_la_broadcast_1B():
       σ_el = hypot(1.524, 10) / 10750 rad → 0.054°
     """
     sigma_az, sigma_el = pointing_uncertainty_deg(
-        slant_m=10750.0, horizontal_ft=50.0, vertical_ft=10.0,
+        slant_m=10750.0,
+        horizontal_ft=50.0,
+        vertical_ft=10.0,
         observer_sigma_m=10.0,
     )
     assert sigma_az == pytest.approx(0.067, abs=0.005)
@@ -594,16 +674,22 @@ def test_pointing_uncertainty_analytic_la_broadcast_1B():
 def test_pointing_uncertainty_nan_inputs_yield_nan():
     """Unknown FAA class → nan tolerance → nan output, not a crash."""
     import math as _m
+
     sigma_az, sigma_el = pointing_uncertainty_deg(
-        slant_m=5000.0, horizontal_ft=float("nan"), vertical_ft=float("nan"),
+        slant_m=5000.0,
+        horizontal_ft=float("nan"),
+        vertical_ft=float("nan"),
     )
     assert _m.isnan(sigma_az) and _m.isnan(sigma_el)
 
 
 def test_pointing_uncertainty_zero_slant_is_nan():
     import math as _m
+
     sigma_az, sigma_el = pointing_uncertainty_deg(
-        slant_m=0.0, horizontal_ft=50.0, vertical_ft=3.0,
+        slant_m=0.0,
+        horizontal_ft=50.0,
+        vertical_ft=3.0,
     )
     assert _m.isnan(sigma_az) and _m.isnan(sigma_el)
 
@@ -641,18 +727,18 @@ def test_pointing_uncertainty_monte_carlo_matches_analytic():
     # Landmark at (east=0, north=slant, up=0) in ENU so az≈0, el≈0.
     east0, north0, up0 = 0.0, slant_m, 0.0
     # 2-D horizontal offset (east, north) + 1-D vertical (up).
-    lm_east  = east0  + rng.normal(0.0, h_1sigma_m / _m.sqrt(2.0), n)
+    lm_east = east0 + rng.normal(0.0, h_1sigma_m / _m.sqrt(2.0), n)
     lm_north = north0 + rng.normal(0.0, h_1sigma_m / _m.sqrt(2.0), n)
-    lm_up    = up0    + rng.normal(0.0, v_1sigma_m, n)
+    lm_up = up0 + rng.normal(0.0, v_1sigma_m, n)
     # Observer position offset in each axis (independent).
-    obs_east  = rng.normal(0.0, obs_sigma_m / _m.sqrt(3.0), n)
+    obs_east = rng.normal(0.0, obs_sigma_m / _m.sqrt(3.0), n)
     obs_north = rng.normal(0.0, obs_sigma_m / _m.sqrt(3.0), n)
-    obs_up    = rng.normal(0.0, obs_sigma_m / _m.sqrt(3.0), n)
+    obs_up = rng.normal(0.0, obs_sigma_m / _m.sqrt(3.0), n)
 
-    d_east  = lm_east  - obs_east
+    d_east = lm_east - obs_east
     d_north = lm_north - obs_north
-    d_up    = lm_up    - obs_up
-    d_slant = np.sqrt(d_east ** 2 + d_north ** 2 + d_up ** 2)
+    d_up = lm_up - obs_up
+    d_slant = np.sqrt(d_east**2 + d_north**2 + d_up**2)
     az = np.degrees(np.arctan2(d_east, d_north))
     el = np.degrees(np.arcsin(d_up / d_slant))
 

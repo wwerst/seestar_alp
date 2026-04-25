@@ -99,7 +99,9 @@ class MountFrame:
         roll_offset = float(cal.get("roll_offset_deg", 0.0))
         off = cal.get("origin_offset_ecef_m")
         origin_offset = (
-            np.asarray(off, dtype=np.float64) if off is not None else np.zeros(3, dtype=np.float64)
+            np.asarray(off, dtype=np.float64)
+            if off is not None
+            else np.zeros(3, dtype=np.float64)
         )
         if site is None:
             obs = cal.get("observer")
@@ -137,21 +139,21 @@ class MountFrame:
         """
         if site is None:
             site = build_site()
-        cy, sy = np.cos(np.radians(yaw_deg)),   np.sin(np.radians(yaw_deg))
+        cy, sy = np.cos(np.radians(yaw_deg)), np.sin(np.radians(yaw_deg))
         cp, sp = np.cos(np.radians(pitch_deg)), np.sin(np.radians(pitch_deg))
-        cr, sr = np.cos(np.radians(roll_deg)),  np.sin(np.radians(roll_deg))
+        cr, sr = np.cos(np.radians(roll_deg)), np.sin(np.radians(roll_deg))
         # Explicit float64: rotation matrices end up in matmul against
         # ECEF vectors where 1 m precision at Earth-radius scale needs
         # ~1e-7 relative precision — well beyond float32's mantissa.
-        r_yaw = np.array([[cy, -sy, 0.0],
-                          [sy,  cy, 0.0],
-                          [0.0, 0.0, 1.0]], dtype=np.float64)
-        r_pitch = np.array([[1.0, 0.0, 0.0],
-                            [0.0,  cp, -sp],
-                            [0.0,  sp,  cp]], dtype=np.float64)
-        r_roll = np.array([[ cr, 0.0, sr],
-                           [0.0, 1.0, 0.0],
-                           [-sr, 0.0, cr]], dtype=np.float64)
+        r_yaw = np.array(
+            [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+        r_pitch = np.array(
+            [[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float64
+        )
+        r_roll = np.array(
+            [[cr, 0.0, sr], [0.0, 1.0, 0.0], [-sr, 0.0, cr]], dtype=np.float64
+        )
         return cls(
             site=site,
             topo_to_mount=r_roll @ r_pitch @ r_yaw,
@@ -177,7 +179,8 @@ class MountFrame:
         return enu @ self.topo_to_mount.T
 
     def ecef_to_mount_azel(
-        self, ecef_xyz: np.ndarray | tuple[float, float, float],
+        self,
+        ecef_xyz: np.ndarray | tuple[float, float, float],
     ) -> tuple[float, float, float]:
         """Single-point ECEF → (az_deg, el_deg, slant_m) in the mount frame.
 
@@ -194,7 +197,8 @@ class MountFrame:
         return (float(az), float(el), slant)
 
     def ecef_array_to_mount(
-        self, ecef_xyz: np.ndarray,
+        self,
+        ecef_xyz: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Batched ECEF → (az_deg, el_deg, slant_m). Input shape (N, 3)."""
         arr = np.asarray(ecef_xyz, dtype=np.float64)

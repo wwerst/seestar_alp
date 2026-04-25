@@ -107,8 +107,11 @@ def test_is_safe_when_sun_below_threshold_for_any_pointing():
     # Even pointing straight at where the sun will be at noon must be
     # safe at midnight, because the sun is below -10°.
     safe, reason = is_sun_safe(
-        180.0, 33.0,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_midnight_utc(),
+        180.0,
+        33.0,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_midnight_utc(),
     )
     assert safe is True
     assert reason == ""
@@ -116,11 +119,16 @@ def test_is_safe_when_sun_below_threshold_for_any_pointing():
 
 def test_is_unsafe_when_pointing_at_sun_during_day():
     sun_az, sun_alt = compute_sun_altaz(
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     safe, reason = is_sun_safe(
-        sun_az, sun_alt,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        sun_az,
+        sun_alt,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     assert safe is False
     assert "sun_avoidance" in reason
@@ -129,55 +137,78 @@ def test_is_unsafe_when_pointing_at_sun_during_day():
 
 def test_is_safe_when_pointing_well_away_from_sun_during_day():
     sun_az, sun_alt = compute_sun_altaz(
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     # Point opposite the sun — separation should be ~180°.
     opp_az = (sun_az + 180.0) % 360.0
     opp_alt = -sun_alt
     safe, _ = is_sun_safe(
-        opp_az, opp_alt,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        opp_az,
+        opp_alt,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     assert safe is True
 
 
 def test_unsafe_at_just_inside_cone_edge():
     sun_az, sun_alt = compute_sun_altaz(
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     # 29° away in pure elevation → exact 29° great-circle separation.
     safe, _ = is_sun_safe(
-        sun_az, sun_alt + 29.0,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        sun_az,
+        sun_alt + 29.0,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     assert safe is False
 
 
 def test_safe_at_just_outside_cone_edge():
     sun_az, sun_alt = compute_sun_altaz(
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     # 31° away in pure elevation → exact 31° great-circle separation.
     safe, _ = is_sun_safe(
-        sun_az, sun_alt + 31.0,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        sun_az,
+        sun_alt + 31.0,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     assert safe is True
 
 
 def test_custom_cone_angle_overrides_default():
     sun_az, sun_alt = compute_sun_altaz(
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     # 31° away (pure elevation) — outside default 30° cone, inside 60°.
     target_alt = sun_alt + 31.0
     safe_default, _ = is_sun_safe(
-        sun_az, target_alt,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        sun_az,
+        target_alt,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
     )
     safe_wider, _ = is_sun_safe(
-        sun_az, target_alt,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc(),
+        sun_az,
+        target_alt,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_noon_utc(),
         min_separation_deg=60.0,
     )
     assert safe_default is True
@@ -189,18 +220,26 @@ def test_custom_alt_threshold_overrides_default():
     # disabled). Use a small cone so we can flip behavior.
     when = datetime(2026, 1, 1, 14, 5, tzinfo=timezone.utc)  # ~near civil dawn
     sun_az, sun_alt = compute_sun_altaz(
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=when,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=when,
     )
     # Pick a time close to civil dawn; verify behavior changes if we
     # raise the threshold above the actual sun altitude.
     target_az, target_alt = sun_az, sun_alt  # pointing right at sun
     safe_default, _ = is_sun_safe(
-        target_az, target_alt,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=when,
+        target_az,
+        target_alt,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=when,
     )
     safe_disabled, _ = is_sun_safe(
-        target_az, target_alt,
-        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=when,
+        target_az,
+        target_alt,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=when,
         alt_threshold_deg=sun_alt + 1.0,
     )
     # With default threshold (-10°): if sun_alt > -10°, unsafe (pointing at sun).
@@ -216,10 +255,15 @@ def test_custom_alt_threshold_overrides_default():
 def test_safety_trip_is_immutable():
     trip = SafetyTrip(
         when_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        sun_az_deg=180.0, sun_alt_deg=33.0,
-        mount_az_deg=181.0, mount_el_deg=34.0,
-        separation_deg=1.4, cone_deg=30.0,
-        jog_angle_deg=90, jog_speed=1440, jog_duration_s=3,
+        sun_az_deg=180.0,
+        sun_alt_deg=33.0,
+        mount_az_deg=181.0,
+        mount_el_deg=34.0,
+        separation_deg=1.4,
+        cone_deg=30.0,
+        jog_angle_deg=90,
+        jog_speed=1440,
+        jog_duration_s=3,
     )
     with pytest.raises(Exception):
         trip.cone_deg = 15.0  # frozen dataclass — must raise
@@ -228,9 +272,15 @@ def test_safety_trip_is_immutable():
 def test_safety_trip_default_message():
     trip = SafetyTrip(
         when_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        sun_az_deg=0, sun_alt_deg=0, mount_az_deg=0, mount_el_deg=0,
-        separation_deg=0, cone_deg=30.0,
-        jog_angle_deg=0, jog_speed=1440, jog_duration_s=3,
+        sun_az_deg=0,
+        sun_alt_deg=0,
+        mount_az_deg=0,
+        mount_el_deg=0,
+        separation_deg=0,
+        cone_deg=30.0,
+        jog_angle_deg=0,
+        jog_speed=1440,
+        jog_duration_s=3,
     )
     assert "Sun safety triggered" in trip.message
 
@@ -259,7 +309,9 @@ def test_jog_increases_separation_sun_east_mount_west():
     sep_before = angular_separation(mount_az, mount_el, sun_az, sun_alt)
     angle = compute_jog_angle(mount_az, mount_el, sun_az, sun_alt)
     sep_after = _sep_after_jog(mount_az, mount_el, sun_az, sun_alt, angle)
-    assert sep_after > sep_before, f"angle={angle} sep before={sep_before} after={sep_after}"
+    assert sep_after > sep_before, (
+        f"angle={angle} sep before={sep_before} after={sep_after}"
+    )
 
 
 def test_jog_increases_separation_sun_west_mount_east():
@@ -298,7 +350,7 @@ def test_jog_direction_is_opposite_from_sun_in_az_el_space():
     # 45° diagonal from sun in (daz, del) space → jog should be ~225°
     # (i.e. 45° + 180°).
     sun_az, sun_alt = 100.0, 40.0
-    mount_az, mount_el = 110.0, 50.0   # +10° in az, +10° in el from sun
+    mount_az, mount_el = 110.0, 50.0  # +10° in az, +10° in el from sun
     angle = compute_jog_angle(mount_az, mount_el, sun_az, sun_alt)
     # direction-to-sun has atan2(-10, -10) = -135° → -135 + 360 = 225°.
     # away-from-sun direction: atan2(10, 10) = 45° ≈ the answer.
@@ -355,17 +407,19 @@ def test_monitor_trips_and_calls_abort_then_jog_then_releases():
 
     # Patch compute_sun_altaz via the module so tick() sees a known sun.
     from device import sun_safety as ss
+
     real = ss.compute_sun_altaz
     ss.compute_sun_altaz = lambda **kw: sun_pos
     try:
         aborts: list[int] = []
         jog = _FakeJog()
         m = SunSafetyMonitor(
-            altaz_reader=lambda: (181.0, 31.0),   # 1.4° from sun
+            altaz_reader=lambda: (181.0, 31.0),  # 1.4° from sun
             jog_command=jog,
             abort_active=lambda: aborts.append(1),
-            lat_deg=33.96, lon_deg=-118.46,
-            jog_duration_s=0,   # make the post-jog sleep fast
+            lat_deg=33.96,
+            lon_deg=-118.46,
+            jog_duration_s=0,  # make the post-jog sleep fast
         )
         jog.bind(m)
         # Drive one tick in-line; don't bother with the thread loop.
@@ -392,6 +446,7 @@ def test_monitor_trips_and_calls_abort_then_jog_then_releases():
 
 def test_monitor_skips_when_sun_below_threshold():
     from device import sun_safety as ss
+
     real = ss.compute_sun_altaz
     ss.compute_sun_altaz = lambda **kw: (180.0, -15.0)  # below -10° default
     try:
@@ -399,7 +454,8 @@ def test_monitor_skips_when_sun_below_threshold():
         m = SunSafetyMonitor(
             altaz_reader=lambda: (180.0, -15.0),  # pointing RIGHT at sun
             jog_command=jog,
-            lat_deg=33.96, lon_deg=-118.46,
+            lat_deg=33.96,
+            lon_deg=-118.46,
             jog_duration_s=0,
         )
         m._tick()
@@ -412,6 +468,7 @@ def test_monitor_skips_when_sun_below_threshold():
 def test_monitor_does_not_trip_when_altaz_reader_returns_none():
     # Simulates "mount not plate-solved; RA/Dec unreliable".
     from device import sun_safety as ss
+
     real = ss.compute_sun_altaz
     ss.compute_sun_altaz = lambda **kw: (180.0, 30.0)
     try:
@@ -419,7 +476,8 @@ def test_monitor_does_not_trip_when_altaz_reader_returns_none():
         m = SunSafetyMonitor(
             altaz_reader=lambda: None,
             jog_command=jog,
-            lat_deg=33.96, lon_deg=-118.46,
+            lat_deg=33.96,
+            lon_deg=-118.46,
             jog_duration_s=0,
         )
         m._tick()
@@ -431,6 +489,7 @@ def test_monitor_does_not_trip_when_altaz_reader_returns_none():
 
 def test_monitor_skip_when_disabled():
     from device import sun_safety as ss
+
     real = ss.compute_sun_altaz
     ss.compute_sun_altaz = lambda **kw: (180.0, 30.0)
     try:
@@ -438,7 +497,8 @@ def test_monitor_skip_when_disabled():
         m = SunSafetyMonitor(
             altaz_reader=lambda: (180.0, 30.0),
             jog_command=jog,
-            lat_deg=33.96, lon_deg=-118.46,
+            lat_deg=33.96,
+            lon_deg=-118.46,
             jog_duration_s=0,
             enabled=False,
         )
@@ -450,13 +510,15 @@ def test_monitor_skip_when_disabled():
 
 def test_monitor_dismiss_hides_last_trip():
     from device import sun_safety as ss
+
     real = ss.compute_sun_altaz
     ss.compute_sun_altaz = lambda **kw: (180.0, 30.0)
     try:
         m = SunSafetyMonitor(
             altaz_reader=lambda: (181.0, 31.0),
             jog_command=_FakeJog(),
-            lat_deg=33.96, lon_deg=-118.46,
+            lat_deg=33.96,
+            lon_deg=-118.46,
             jog_duration_s=0,
         )
         m._tick()
@@ -471,7 +533,8 @@ def test_reload_updates_thresholds_without_restart():
     m = SunSafetyMonitor(
         altaz_reader=lambda: None,
         jog_command=_FakeJog(),
-        lat_deg=33.96, lon_deg=-118.46,
+        lat_deg=33.96,
+        lon_deg=-118.46,
     )
     assert m.min_separation_deg == 30.0
     assert m.enabled is True
@@ -489,6 +552,7 @@ def test_sun_safety_is_locked_out_without_monitor():
         set_sun_monitor,
         sun_safety_is_locked_out,
     )
+
     prev = get_sun_monitor()
     set_sun_monitor(None)
     try:
@@ -499,11 +563,13 @@ def test_sun_safety_is_locked_out_without_monitor():
 
 def test_set_and_get_sun_monitor_roundtrip():
     from device.sun_safety import get_sun_monitor, set_sun_monitor
+
     prev = get_sun_monitor()
     m = SunSafetyMonitor(
         altaz_reader=lambda: None,
         jog_command=_FakeJog(),
-        lat_deg=0.0, lon_deg=0.0,
+        lat_deg=0.0,
+        lon_deg=0.0,
     )
     set_sun_monitor(m)
     try:
@@ -529,6 +595,7 @@ class _DummyCli:
 def test_speed_move_passes_through_when_not_locked():
     from device.sun_safety import get_sun_monitor, set_sun_monitor
     from device.velocity_controller import speed_move
+
     prev = get_sun_monitor()
     set_sun_monitor(None)
     try:
@@ -544,11 +611,13 @@ def test_speed_move_passes_through_when_not_locked():
 def test_speed_move_refuses_while_monitor_locked_out():
     from device.sun_safety import SunSafetyLocked, get_sun_monitor, set_sun_monitor
     from device.velocity_controller import speed_move
+
     prev = get_sun_monitor()
     m = SunSafetyMonitor(
         altaz_reader=lambda: None,
         jog_command=_FakeJog(),
-        lat_deg=0.0, lon_deg=0.0,
+        lat_deg=0.0,
+        lon_deg=0.0,
     )
     # Simulate the monitor mid-jog.
     m._emergency_lockout.set()

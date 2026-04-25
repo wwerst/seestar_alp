@@ -38,7 +38,9 @@ def _targets(site):
     """The two visible defaults, as ``(lm, az, el, slant)`` tuples —
     same shape the CLI and web backends pass to the session."""
     return filter_visible(
-        [HYPERION_06_000301, LA_BROADCAST_06_000177], site, min_el_deg=0.0,
+        [HYPERION_06_000301, LA_BROADCAST_06_000177],
+        site,
+        min_el_deg=0.0,
     )
 
 
@@ -68,14 +70,23 @@ def _install_fakes(monkeypatch, cli: _FakeCli):
     lightweight fakes. ``move_to_ff`` updates the cli's encoder state
     to ``(target_az, target_el)`` and returns (new_el, new_az, {})."""
     import device.rotation_calibration as rc
+
     monkeypatch.setattr(
         "device.alpaca_client.AlpacaClient",
         lambda *a, **kw: cli,
     )
 
-    def fake_move_to_ff(client, *, target_az_deg, target_el_deg,
-                       cur_az_deg, cur_el_deg, loc,
-                       tag="", arrive_tolerance_deg=0.3):
+    def fake_move_to_ff(
+        client,
+        *,
+        target_az_deg,
+        target_el_deg,
+        cur_az_deg,
+        cur_el_deg,
+        loc,
+        tag="",
+        arrive_tolerance_deg=0.3,
+    ):
         # Teleport the fake mount to the requested target, mimicking
         # perfect convergence.
         client.encoder_az = float(target_az_deg)
@@ -106,6 +117,7 @@ def _install_fakes(monkeypatch, cli: _FakeCli):
     )
     # Make Config.port resolution cheap.
     import device.config as cfg
+
     monkeypatch.setattr(cfg.Config, "port", 5555, raising=False)
     return rc
 
@@ -133,7 +145,9 @@ def test_session_starts_and_slews_to_first_target(monkeypatch, tmp_path):
     _install_fakes(monkeypatch, cli)
 
     session = CalibrationSession(
-        telescope_id=1, targets=targets, site=site,
+        telescope_id=1,
+        targets=targets,
+        site=site,
         out_path=tmp_path / "cal.json",
     )
     session.start()
@@ -172,13 +186,17 @@ def test_slew_to_target_refuses_when_landmark_inside_sun_cone(monkeypatch, tmp_p
     _install_fakes(monkeypatch, cli)
 
     from device import sun_safety as ss
+
     monkeypatch.setattr(
-        ss, "is_sun_safe",
+        ss,
+        "is_sun_safe",
         lambda *a, **kw: (False, "sun_avoidance: forced by test"),
     )
 
     session = CalibrationSession(
-        telescope_id=1, targets=_targets(site), site=site,
+        telescope_id=1,
+        targets=_targets(site),
+        site=site,
         out_path=tmp_path / "cal.json",
     )
     session.start()
@@ -200,7 +218,9 @@ def test_nudge_updates_target_and_encoder(monkeypatch, tmp_path):
     cli = _FakeCli()
     _install_fakes(monkeypatch, cli)
     session = CalibrationSession(
-        telescope_id=1, targets=_targets(site), site=site,
+        telescope_id=1,
+        targets=_targets(site),
+        site=site,
         out_path=tmp_path / "cal.json",
     )
     session.start()
@@ -210,8 +230,12 @@ def test_nudge_updates_target_and_encoder(monkeypatch, tmp_path):
         session.nudge(0.5, -0.3)
         time.sleep(0.3)
         after = session.status()
-        assert after.target_az_deg == pytest.approx(before.target_az_deg + 0.5, abs=1e-6)
-        assert after.target_el_deg == pytest.approx(before.target_el_deg - 0.3, abs=1e-6)
+        assert after.target_az_deg == pytest.approx(
+            before.target_az_deg + 0.5, abs=1e-6
+        )
+        assert after.target_el_deg == pytest.approx(
+            before.target_el_deg - 0.3, abs=1e-6
+        )
         assert after.encoder_az_deg == pytest.approx(after.target_az_deg, abs=1e-6)
     finally:
         session.stop()
@@ -222,7 +246,9 @@ def test_nudge_per_command_is_clamped(monkeypatch, tmp_path):
     cli = _FakeCli()
     _install_fakes(monkeypatch, cli)
     session = CalibrationSession(
-        telescope_id=1, targets=_targets(site), site=site,
+        telescope_id=1,
+        targets=_targets(site),
+        site=site,
         out_path=tmp_path / "cal.json",
     )
     session.start()
@@ -234,7 +260,8 @@ def test_nudge_per_command_is_clamped(monkeypatch, tmp_path):
         time.sleep(0.3)
         after = session.status()
         assert after.target_az_deg == pytest.approx(
-            before.target_az_deg + MAX_NUDGE_PER_CMD_DEG, abs=1e-6,
+            before.target_az_deg + MAX_NUDGE_PER_CMD_DEG,
+            abs=1e-6,
         )
     finally:
         session.stop()
@@ -248,7 +275,10 @@ def test_full_flow_sight_advance_commit(monkeypatch, tmp_path):
     _install_fakes(monkeypatch, cli)
     out = tmp_path / "cal.json"
     session = CalibrationSession(
-        telescope_id=1, targets=targets, site=site, out_path=out,
+        telescope_id=1,
+        targets=targets,
+        site=site,
+        out_path=out,
     )
     session.start()
     try:
@@ -284,7 +314,10 @@ def test_commit_refuses_with_fewer_than_two_sightings(monkeypatch, tmp_path):
     _install_fakes(monkeypatch, cli)
     out = tmp_path / "cal.json"
     session = CalibrationSession(
-        telescope_id=1, targets=_targets(site), site=site, out_path=out,
+        telescope_id=1,
+        targets=_targets(site),
+        site=site,
+        out_path=out,
     )
     session.start()
     try:
@@ -308,7 +341,9 @@ def test_skip_refused_when_would_leave_under_two(monkeypatch, tmp_path):
     cli = _FakeCli()
     _install_fakes(monkeypatch, cli)
     session = CalibrationSession(
-        telescope_id=1, targets=_targets(site), site=site,
+        telescope_id=1,
+        targets=_targets(site),
+        site=site,
         out_path=tmp_path / "cal.json",
     )
     session.start()
@@ -328,7 +363,9 @@ def test_cancel_terminates_worker(monkeypatch, tmp_path):
     cli = _FakeCli()
     _install_fakes(monkeypatch, cli)
     session = CalibrationSession(
-        telescope_id=1, targets=_targets(site), site=site,
+        telescope_id=1,
+        targets=_targets(site),
+        site=site,
         out_path=tmp_path / "cal.json",
     )
     session.start()
@@ -352,7 +389,9 @@ def test_manager_refuses_concurrent_calibration(monkeypatch, tmp_path):
 
     def _new():
         return CalibrationSession(
-            telescope_id=99, targets=_targets(site), site=site,
+            telescope_id=99,
+            targets=_targets(site),
+            site=site,
             out_path=tmp_path / "cal.json",
         )
 
@@ -382,17 +421,25 @@ def test_manager_refuses_while_tracker_running(monkeypatch, tmp_path):
     class _StationaryProvider:
         def sample(self, t):
             return ReferenceSample(
-                t_unix=float(t), az_cum_deg=0.0, el_deg=45.0,
-                v_az_degs=0.0, v_el_degs=0.0,
-                a_az_degs2=0.0, a_el_degs2=0.0,
-                stale=False, extrapolated=False,
+                t_unix=float(t),
+                az_cum_deg=0.0,
+                el_deg=45.0,
+                v_az_degs=0.0,
+                v_el_degs=0.0,
+                a_az_degs2=0.0,
+                a_el_degs2=0.0,
+                stale=False,
+                extrapolated=False,
             )
+
         def valid_range(self):
             return (time.time(), time.time() + 5.0)
 
     tracker = LiveTrackSession(
         telescope_id=7,
-        target_kind="file", target_id="fix", target_display_name="Fix",
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
         provider=_StationaryProvider(),
         offsets=AtomicOffsets(),
         dry_run=True,
@@ -402,16 +449,21 @@ def test_manager_refuses_while_tracker_running(monkeypatch, tmp_path):
     # Patch the module-global get_manager to return *this* manager so
     # CalibrationManager's cross-check finds the running tracker.
     import device.live_tracker as lt
+
     monkeypatch.setattr(lt, "_MANAGER", tracker_mgr)
     monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: cli)
     tracker_mgr.start(tracker)
     try:
         cal_mgr = CalibrationManager()
         with pytest.raises(RuntimeError, match="is live-tracking"):
-            cal_mgr.start(CalibrationSession(
-                telescope_id=7, targets=_targets(site), site=site,
-                out_path=tmp_path / "cal.json",
-            ))
+            cal_mgr.start(
+                CalibrationSession(
+                    telescope_id=7,
+                    targets=_targets(site),
+                    site=site,
+                    out_path=tmp_path / "cal.json",
+                )
+            )
     finally:
         tracker_mgr.stop(7)
 

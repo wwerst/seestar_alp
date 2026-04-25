@@ -52,11 +52,12 @@ from scripts.trajectory.observer import ObserverSite, haversine_m
 @dataclass(frozen=True)
 class Sighting:
     """One landmark → encoder (az, el) record."""
+
     landmark: Landmark
     encoder_az_deg: float
     encoder_el_deg: float
-    true_az_deg: float          # topocentric az of landmark (metadata)
-    true_el_deg: float          # topocentric el of landmark (metadata)
+    true_az_deg: float  # topocentric az of landmark (metadata)
+    true_el_deg: float  # topocentric el of landmark (metadata)
     slant_m: float
     t_unix: float
 
@@ -86,6 +87,7 @@ _EARTH_R_M = 6_371_000.0
 class PriorInfo:
     """Minimum of what we need to know about the on-disk calibration
     to decide whether to keep it as a seed."""
+
     path: Path
     observer_lat_deg: float | None
     observer_lon_deg: float | None
@@ -114,8 +116,8 @@ def parse_calibrated_at(raw: str | None) -> datetime | None:
     if not isinstance(raw, str) or not raw:
         return None
     candidates = (
-        "%Y-%m-%dT%H-%M-%S%z",   # legacy: 2026-04-21T23-28-52-0700
-        "%Y-%m-%dT%H:%M:%S%z",   # standard ISO 8601 with colons
+        "%Y-%m-%dT%H-%M-%S%z",  # legacy: 2026-04-21T23-28-52-0700
+        "%Y-%m-%dT%H:%M:%S%z",  # standard ISO 8601 with colons
         "%Y-%m-%dT%H:%M:%S.%f%z",
     )
     for fmt in candidates:
@@ -134,7 +136,9 @@ def parse_calibrated_at(raw: str | None) -> datetime | None:
 
 
 def inspect_prior(
-    path: Path, current_lat: float, current_lon: float,
+    path: Path,
+    current_lat: float,
+    current_lon: float,
 ) -> PriorInfo | None:
     """Parse the prior calibration JSON (if any) and return age +
     distance metadata the clear-or-keep prompt uses. Returns ``None``
@@ -162,11 +166,16 @@ def inspect_prior(
     age = (now - dt).total_seconds() if dt is not None else None
     dist = (
         haversine_m(lat, lon, current_lat, current_lon)
-        if lat is not None and lon is not None else None
+        if lat is not None and lon is not None
+        else None
     )
     return PriorInfo(
-        path=path, observer_lat_deg=lat, observer_lon_deg=lon,
-        observer_alt_m=alt, calibrated_at=dt, age_s=age,
+        path=path,
+        observer_lat_deg=lat,
+        observer_lon_deg=lon,
+        observer_alt_m=alt,
+        calibrated_at=dt,
+        age_s=age,
         distance_from_current_m=dist,
     )
 
@@ -221,8 +230,14 @@ def pointing_uncertainty_deg(
         return (float("nan"), float("nan"))
     ft_to_m = 0.3048
     # Treat FAA bounds as 2σ → divide by 2 to get 1σ.
-    sigma_h_m = (horizontal_ft * ft_to_m) / 2.0 if math.isfinite(horizontal_ft) else float("nan")
-    sigma_v_m = (vertical_ft * ft_to_m) / 2.0 if math.isfinite(vertical_ft) else float("nan")
+    sigma_h_m = (
+        (horizontal_ft * ft_to_m) / 2.0
+        if math.isfinite(horizontal_ft)
+        else float("nan")
+    )
+    sigma_v_m = (
+        (vertical_ft * ft_to_m) / 2.0 if math.isfinite(vertical_ft) else float("nan")
+    )
     obs = float(observer_sigma_m)
     if math.isfinite(sigma_h_m):
         sigma_az_rad = math.hypot(sigma_h_m, obs) / slant_m
@@ -257,16 +272,23 @@ def terrestrial_refraction_deg(slant_m: float, k: float = 0.13) -> float:
 
 
 def predict_mount_azel(
-    yaw_deg: float, pitch_deg: float, roll_deg: float,
-    site: ObserverSite, landmark: Landmark,
-    *, apply_refraction: bool = True,
+    yaw_deg: float,
+    pitch_deg: float,
+    roll_deg: float,
+    site: ObserverSite,
+    landmark: Landmark,
+    *,
+    apply_refraction: bool = True,
 ) -> tuple[float, float, float]:
     """Predict (az, el, slant) in the mount frame for ``landmark``
     under the given rotation. With ``apply_refraction=True`` the el
     is lifted by the terrestrial-refraction correction so the
     prediction matches what the scope actually sees."""
     mf = MountFrame.from_euler_deg(
-        yaw_deg=yaw_deg, pitch_deg=pitch_deg, roll_deg=roll_deg, site=site,
+        yaw_deg=yaw_deg,
+        pitch_deg=pitch_deg,
+        roll_deg=roll_deg,
+        site=site,
     )
     az, el, slant = mf.ecef_to_mount_azel(landmark.ecef())
     if apply_refraction:
@@ -313,7 +335,11 @@ def solve_rotation(
         out = np.empty(2 * len(sightings), dtype=np.float64)
         for i, s in enumerate(sightings):
             pred_az, pred_el, _ = predict_mount_azel(
-                yaw, pitch, roll, site, s.landmark,
+                yaw,
+                pitch,
+                roll,
+                site,
+                s.landmark,
             )
             d_az = _wrap_pm180(_wrap_pm180(pred_az) - _wrap_pm180(s.encoder_az_deg))
             d_el = pred_el - s.encoder_el_deg
@@ -322,17 +348,22 @@ def solve_rotation(
         return out
 
     if yaw_only:
+
         def residuals(x: np.ndarray) -> np.ndarray:
             return _resid(float(x[0]), pitch_seed_deg, roll_seed_deg)
+
         x0 = np.array([yaw_seed_deg], dtype=np.float64)
         result = least_squares(residuals, x0, method="lm")
         yaw = float(result.x[0])
         pitch, roll = pitch_seed_deg, roll_seed_deg
     else:
+
         def residuals(x: np.ndarray) -> np.ndarray:
             return _resid(float(x[0]), float(x[1]), float(x[2]))
+
         x0 = np.array(
-            [yaw_seed_deg, pitch_seed_deg, roll_seed_deg], dtype=np.float64,
+            [yaw_seed_deg, pitch_seed_deg, roll_seed_deg],
+            dtype=np.float64,
         )
         result = least_squares(residuals, x0, method="lm")
         yaw, pitch, roll = [float(v) for v in result.x]
@@ -344,28 +375,33 @@ def solve_rotation(
         pred_az, pred_el, _ = predict_mount_azel(yaw, pitch, roll, site, s.landmark)
         r_az = _wrap_pm180(_wrap_pm180(pred_az) - _wrap_pm180(s.encoder_az_deg))
         r_el = pred_el - s.encoder_el_deg
-        per_landmark.append({
-            "oas": s.landmark.oas,
-            "name": s.landmark.name,
-            "lat_deg": s.landmark.lat_deg,
-            "lon_deg": s.landmark.lon_deg,
-            "height_amsl_m": s.landmark.height_amsl_m,
-            "encoder_az_deg": s.encoder_az_deg,
-            "encoder_el_deg": s.encoder_el_deg,
-            "true_az_deg": s.true_az_deg,
-            "true_el_deg": s.true_el_deg,
-            "slant_m": s.slant_m,
-            "predicted_az_deg": float(pred_az),
-            "predicted_el_deg": float(pred_el),
-            "residual_az_deg": float(r_az),
-            "residual_el_deg": float(r_el),
-        })
+        per_landmark.append(
+            {
+                "oas": s.landmark.oas,
+                "name": s.landmark.name,
+                "lat_deg": s.landmark.lat_deg,
+                "lon_deg": s.landmark.lon_deg,
+                "height_amsl_m": s.landmark.height_amsl_m,
+                "encoder_az_deg": s.encoder_az_deg,
+                "encoder_el_deg": s.encoder_el_deg,
+                "true_az_deg": s.true_az_deg,
+                "true_el_deg": s.true_el_deg,
+                "slant_m": s.slant_m,
+                "predicted_az_deg": float(pred_az),
+                "predicted_el_deg": float(pred_el),
+                "residual_az_deg": float(r_az),
+                "residual_el_deg": float(r_el),
+            }
+        )
         sq_sum += r_az * r_az + r_el * r_el
         n += 2
     rms = float(np.sqrt(sq_sum / n)) if n else 0.0
     return RotationSolution(
-        yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll,
-        residual_rms_deg=rms, per_landmark=per_landmark,
+        yaw_deg=yaw,
+        pitch_deg=pitch,
+        roll_deg=roll,
+        residual_rms_deg=rms,
+        per_landmark=per_landmark,
     )
 
 
@@ -423,23 +459,27 @@ ARRIVE_TOL_NUDGE_DEG = 0.1
 @dataclass
 class _Command:
     """Worker-thread queue entry."""
-    kind: str                       # "slew" | "nudge" | "sight" | "skip" | "commit" | "cancel"
+
+    kind: str  # "slew" | "nudge" | "sight" | "skip" | "commit" | "cancel"
     payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class CalibrationStatus:
     """JSON-serialisable session snapshot for the browser."""
+
     active: bool
-    phase: str                      # init / slewing / nudging / sighting / review / committed / cancelled / error
+    phase: str  # init / slewing / nudging / sighting / review / committed / cancelled / error
     target_idx: int
     n_targets: int
-    current_landmark: dict | None    # {oas, name, true_az_deg, true_el_deg, slant_m, lit, accuracy_class}
-    target_az_deg: float | None      # pending encoder target (drives the mount)
+    current_landmark: (
+        dict | None
+    )  # {oas, name, true_az_deg, true_el_deg, slant_m, lit, accuracy_class}
+    target_az_deg: float | None  # pending encoder target (drives the mount)
     target_el_deg: float | None
-    encoder_az_deg: float | None     # last-read encoder (polled each cycle)
+    encoder_az_deg: float | None  # last-read encoder (polled each cycle)
     encoder_el_deg: float | None
-    solution: dict | None            # {yaw, pitch, roll, rms, per_landmark}
+    solution: dict | None  # {yaw, pitch, roll, rms, per_landmark}
     errors: list[str]
 
 
@@ -618,8 +658,9 @@ class CalibrationSession:
             # Best-effort stop of any lingering motion.
             if cli is not None and not self.dry_run:
                 try:
-                    cli.method_sync("scope_speed_move",
-                                    {"speed": 0, "angle": 0, "dur_sec": 0})
+                    cli.method_sync(
+                        "scope_speed_move", {"speed": 0, "angle": 0, "dur_sec": 0}
+                    )
                 except Exception:
                     pass
 
@@ -629,14 +670,17 @@ class CalibrationSession:
         side-effect."""
         from device.alpaca_client import AlpacaClient
         from device.config import Config
+
         port = self._alpaca_port if self._alpaca_port is not None else int(Config.port)
         cli = AlpacaClient(self._alpaca_host, port, self.telescope_id)
         if self.dry_run:
             return cli
         try:
             from device.velocity_controller import (
-                ensure_scenery_mode, set_tracking,
+                ensure_scenery_mode,
+                set_tracking,
             )
+
             ensure_scenery_mode(cli)
             set_tracking(cli, False)
         except Exception as exc:
@@ -665,8 +709,7 @@ class CalibrationSession:
 
     def _dispatch(self, cli, cmd: _Command) -> None:
         if cmd.kind == "nudge":
-            self._on_nudge(cli, float(cmd.payload["d_az"]),
-                           float(cmd.payload["d_el"]))
+            self._on_nudge(cli, float(cmd.payload["d_az"]), float(cmd.payload["d_el"]))
         elif cmd.kind == "sight":
             self._on_sight(cli)
         elif cmd.kind == "skip":
@@ -710,14 +753,19 @@ class CalibrationSession:
             return
         try:
             from device.velocity_controller import move_to_ff
+
             loc = EarthLocation.from_geodetic(0, 0, 0)
             cur_el = self._encoder_el if self._encoder_el is not None else target_el
             cur_az = self._encoder_az if self._encoder_az is not None else target_az
             new_el, new_az, _ = move_to_ff(
                 cli,
-                target_az_deg=target_az, target_el_deg=target_el,
-                cur_az_deg=cur_az, cur_el_deg=cur_el, loc=loc,
-                tag="[calibrate_web]", arrive_tolerance_deg=ARRIVE_TOL_NUDGE_DEG,
+                target_az_deg=target_az,
+                target_el_deg=target_el,
+                cur_az_deg=cur_az,
+                cur_el_deg=cur_el,
+                loc=loc,
+                tag="[calibrate_web]",
+                arrive_tolerance_deg=ARRIVE_TOL_NUDGE_DEG,
             )
             with self._lock:
                 self._encoder_az = new_az
@@ -772,9 +820,7 @@ class CalibrationSession:
             projected = already_sighted + remaining
         if projected < 2:
             with self._lock:
-                self._errors.append(
-                    "cannot skip: would leave fewer than 2 sightings"
-                )
+                self._errors.append("cannot skip: would leave fewer than 2 sightings")
             return
         with self._lock:
             next_idx = self._target_idx + 1
@@ -820,8 +866,10 @@ class CalibrationSession:
         # the (possibly wrong) prior frame. Stop the worker on failure
         # so `_run()` bails before transitioning to the nudging phase.
         from device.sun_safety import is_sun_safe as _is_sun_safe
+
         sun_safe, sun_reason = _is_sun_safe(
-            float(_true_az) % 360.0, float(_true_el),
+            float(_true_az) % 360.0,
+            float(_true_el),
         )
         if not sun_safe:
             with self._lock:
@@ -843,15 +891,20 @@ class CalibrationSession:
             return
         try:
             from device.velocity_controller import move_to_ff
+
             loc = EarthLocation.from_geodetic(0, 0, 0)
             cur_el, cur_az = self._read_encoder_nonfatal(cli)
             if cur_el is None or cur_az is None:
                 cur_el, cur_az = pred_el, pred_az_wrapped
             new_el, new_az, _ = move_to_ff(
                 cli,
-                target_az_deg=pred_az_wrapped, target_el_deg=pred_el,
-                cur_az_deg=cur_az, cur_el_deg=cur_el, loc=loc,
-                tag="[calibrate_web]", arrive_tolerance_deg=ARRIVE_TOL_SLEW_DEG,
+                target_az_deg=pred_az_wrapped,
+                target_el_deg=pred_el,
+                cur_az_deg=cur_az,
+                cur_el_deg=cur_el,
+                loc=loc,
+                tag="[calibrate_web]",
+                arrive_tolerance_deg=ARRIVE_TOL_SLEW_DEG,
             )
             with self._lock:
                 self._encoder_az = new_az
@@ -872,8 +925,10 @@ class CalibrationSession:
                 return self._encoder_el, self._encoder_az
         try:
             from device.velocity_controller import measure_altaz_timed
+
             alt, az, _ = measure_altaz_timed(
-                cli, EarthLocation.from_geodetic(0, 0, 0),
+                cli,
+                EarthLocation.from_geodetic(0, 0, 0),
             )
             return float(alt), float(az)
         except Exception:
@@ -914,19 +969,16 @@ class CalibrationManager:
         # the other unnecessarily.
         try:
             from device.live_tracker import get_manager as _get_tracker_mgr
+
             tracker = _get_tracker_mgr().get(tid)
             if tracker is not None and tracker.is_alive():
-                raise RuntimeError(
-                    f"telescope {tid} is live-tracking; stop first"
-                )
+                raise RuntimeError(f"telescope {tid} is live-tracking; stop first")
         except ImportError:
             pass
         with self._lock:
             existing = self._sessions.get(tid)
             if existing is not None and existing.is_alive():
-                raise RuntimeError(
-                    f"telescope {tid} already calibrating; stop first"
-                )
+                raise RuntimeError(f"telescope {tid} already calibrating; stop first")
             self._sessions[tid] = session
         session.start()
         return session
