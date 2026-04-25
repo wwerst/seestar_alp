@@ -257,6 +257,55 @@ def test_session_double_start_raises(monkeypatch, tmp_path):
         session.stop(timeout=3.0)
 
 
+def test_session_outer_motor_stop_bypasses_sun_safety_lockout(monkeypatch, tmp_path):
+    """If the streaming controller's inner ``speed_move(0, 0, ...)`` cleanup
+    is refused mid-lockout (``SunSafetyLocked``), the session's outer
+    finally must still issue a direct ``method_sync('scope_speed_move',
+    {0,0,1})`` so the motor halts. Without the outer guard the previous
+    tick's command keeps running until its firmware ``dur_sec`` TTL.
+    """
+    import device.streaming_controller as sc
+    from device.sun_safety import SunSafetyLocked
+
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=30.0)
+    _install_fake_cli(monkeypatch, cli)
+
+    # Tick command observed by the fake before stop (non-zero so we can
+    # distinguish a successful zero-cleanup from "no cleanup ran").
+    cli.method_sync(
+        "scope_speed_move",
+        {"speed": 100, "angle": 0, "dur_sec": 5},
+    )
+    assert cli.state.last_cmd == (100, 0, 5)
+
+    # Refuse all subsequent ``speed_move`` calls to simulate sun-safety
+    # lockout. ``streaming_controller.track``'s tick loop and inner
+    # ``finally`` both go through this wrapper, so neither will issue a
+    # zero command. Only the outer ``method_sync`` we added to
+    # ``CalibrateMotionSession._run`` can clear the motor.
+    def _refused(*_a, **_kw):
+        raise SunSafetyLocked("test: lockout active")
+
+    monkeypatch.setattr(sc, "speed_move", _refused)
+
+    session = CalibrateMotionSession(
+        telescope_id=99,
+        log_dir=tmp_path,
+        max_duration_s=5.0,
+    )
+    session.start()
+    try:
+        time.sleep(0.6)
+    finally:
+        session.stop(timeout=3.0)
+    assert not session.is_alive()
+    assert cli.state.last_cmd == (0, 0, 1), (
+        "outer motor-stop did not bypass speed_move lockout; "
+        f"last_cmd={cli.state.last_cmd}"
+    )
+
+
 def test_is_settled_false_until_history_full(monkeypatch, tmp_path):
     cli = FakeMountClient()
     _install_fake_cli(monkeypatch, cli)
