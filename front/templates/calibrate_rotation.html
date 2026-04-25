@@ -239,11 +239,23 @@
     kpiRMS: document.getElementById('cal-kpi-rms'),
   };
 
+  // Source of truth for the default step is the button marked
+  // `active` in the markup; fall back to the first button if no
+  // explicit default is set. Avoids drift if the markup default
+  // changes without a matching JS update.
+  function _initialStepDeg() {
+    const btn =
+      els.stepRow.querySelector('button.active') ||
+      els.stepRow.querySelector('button[data-step]');
+    const v = btn ? parseFloat(btn.dataset.step) : NaN;
+    return isFinite(v) ? v : 0.02;
+  }
+
   let state = {
     priorInfo: null,
     targets: [],           // [{oas, ..., aiming_hint, sigma_az_deg, sigma_el_deg}]
     selectedOas: new Set(),
-    stepDeg: 0.02,
+    stepDeg: _initialStepDeg(),
     sessionActive: false,
     phase: 'idle',
   };

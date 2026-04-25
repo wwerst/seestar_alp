@@ -1,4 +1,5 @@
 import json
+import re
 import pytest
 import front.app as front_app
 from device.config import Config
@@ -947,5 +948,12 @@ def test_calibrate_rotation_step_buttons_use_one_tenth_increments():
     assert "±0.02°" in html
     assert "±0.1°" in html
     # The default-active button is the middle (0.02°) so a fresh
-    # session lands on a sensible mid-range step.
-    assert '<button class="cal-btn active" data-step="0.02">' in html
+    # session lands on a sensible mid-range step. Match the button
+    # tag without depending on attribute order so unrelated edits
+    # (id, aria-*, etc.) don't break this test.
+    button_match = re.search(r"<button\b[^>]*\bdata-step=\"0\.02\"[^>]*>", html)
+    assert button_match is not None, "Button with data-step=0.02 not found"
+    button_tag = button_match.group(0)
+    assert re.search(r'\bclass="[^"]*\bactive\b[^"]*"', button_tag), (
+        f"data-step=0.02 button is not active: {button_tag}"
+    )
