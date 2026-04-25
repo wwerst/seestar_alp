@@ -391,9 +391,7 @@ def test_jog_clears_cone_for_any_starting_point_inside_cone():
         for del_ in (-25, -15, -5, 0, 5, 15, 25):
             mount_az = (sun_az + daz) % 360.0
             mount_el = max(-85.0, min(85.0, sun_alt + del_))
-            sep_before = angular_separation(
-                mount_az, mount_el, sun_az, sun_alt
-            )
+            sep_before = angular_separation(mount_az, mount_el, sun_az, sun_alt)
             if sep_before > 30.0:
                 continue  # outside cone — not in scope of test
             angle = compute_jog_angle(mount_az, mount_el, sun_az, sun_alt)
@@ -426,9 +424,7 @@ def test_jog_falls_back_to_max_separation_when_jog_too_short():
     assert 0 <= angle < 360
     # And the chosen direction must increase separation (best of 5
     # candidates beats the starting separation in this geometry).
-    new_az, new_el = _apply_jog(
-        mount_az, mount_el, angle, jog_duration_s=0.1
-    )
+    new_az, new_el = _apply_jog(mount_az, mount_el, angle, jog_duration_s=0.1)
     new_sep = angular_separation(new_az, new_el, sun_az, sun_alt)
     sep_before = angular_separation(mount_az, mount_el, sun_az, sun_alt)
     assert new_sep >= sep_before - 1e-6
