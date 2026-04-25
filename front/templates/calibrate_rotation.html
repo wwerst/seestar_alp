@@ -31,6 +31,17 @@
   .cal-target .aim  { opacity: 0.7; font-style: italic; }
   .cal-target .lit-badge  { background: rgba(34,197,94,0.15); color: #166534; padding: 1px 6px; border-radius: 999px; font-size: 11px; margin-left: 6px; }
   .cal-target .unlit-badge{ background: rgba(234,179,8,0.15);  color: #92400e; padding: 1px 6px; border-radius: 999px; font-size: 11px; margin-left: 6px; }
+  /* Celestial target rows reuse .cal-target; modifier classes paint the
+     star/planet glyph and a small ★ prefix to disambiguate from the
+     terrestrial FAA list above. */
+  .cal-target.celestial::before { content: "★ "; opacity: 0.75; margin-right: 2px; }
+  .cal-target.celestial.planet::before { content: "● "; }
+  .cal-target.celestial .name { font-weight: bold; }
+  .cal-target.celestial .bayer { opacity: 0.7; font-size: 11px; margin-left: 6px; }
+  .cal-target.celestial .mag { display: inline-block; padding: 1px 6px; border-radius: 999px; background: rgba(99,102,241,0.12); color: #3730a3; font-size: 11px; margin-left: 6px; }
+  .cal-celestial-toolbar { display: flex; gap: 10px; align-items: center; margin: 6px 0; font-size: 11px; }
+  .cal-celestial-toolbar label { display: flex; align-items: center; gap: 4px; }
+  .cal-celestial-toolbar input[type=number] { width: 70px; font-family: monospace; font-size: 11px; }
   .cal-btn-row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
   .cal-btn { padding: 6px 12px; border: 1px solid rgba(0,0,0,0.2); background: transparent; cursor: pointer; border-radius: 4px; font-family: monospace; font-size: 12px; }
   .cal-btn:hover:not(:disabled) { background: rgba(0,0,0,0.05); }
@@ -188,6 +199,21 @@
           <label style="margin-left:auto;"><input type="checkbox" id="cal-clear-prior"> clear prior</label>
         </div>
         <div class="cal-err" id="cal-setup-err" style="display:none;"></div>
+
+        <!-- Nighttime celestial-targets picker. Independent from the
+             FAA DOF list above; clicking a row commands the motion
+             primitive (already running) to slew to the picked altaz. -->
+        <h4 style="margin-top:14px;">Celestial targets</h4>
+        <div class="cal-celestial-toolbar">
+          <label>min el
+            <input type="number" id="cal-celestial-minel" step="1" value="20" min="0" max="89">°
+          </label>
+          <label>max mag
+            <input type="number" id="cal-celestial-maxmag" step="0.5" value="4.0" min="-2" max="6">
+          </label>
+          <span id="cal-celestial-status" style="opacity:0.6; margin-left:auto;"></span>
+        </div>
+        <div id="cal-celestial-list" style="max-height:260px; overflow-y:auto;">loading…</div>
       </div>
 
       <!-- ACTIVE -->
@@ -1100,13 +1126,147 @@
     } catch (e) {}
   }
 
+  // ---- celestial-targets picker (nighttime) ----
+  //
+  // Parallels the FAA DOF picker above but goes against
+  // /api/{tid}/calibration/celestial-targets. The list is filtered by
+  // horizon visibility + magnitude + sun/moon separation server-side;
+  // we just render rows. Auto-refreshes every 60s (alt/az drift over
+  // a few minutes is meaningful for a calibration aim point).
+  //
+  // Clicking a row commands the calibrate-motion primitive to slew to
+  // (az, el) — the motion session is already running for the click-to-go
+  // affordance, so we reuse it rather than starting our own slew.
+  const celestialEls = {
+    list: document.getElementById('cal-celestial-list'),
+    minEl: document.getElementById('cal-celestial-minel'),
+    maxMag: document.getElementById('cal-celestial-maxmag'),
+    status: document.getElementById('cal-celestial-status'),
+  };
+  let celestialDebounceId = null;
+
+  function _currentMountAz() {
+    // motionState.cur_cum_az_deg is the cumulative az (can wrap many
+    // turns in either direction). Wrap to [0, 360) for the API.
+    const v = (typeof motionState.cur_cum_az_deg === 'number')
+      ? motionState.cur_cum_az_deg : null;
+    return (v == null) ? null : ((v % 360) + 360) % 360;
+  }
+  function _currentMountEl() {
+    return (typeof motionState.cur_el_deg === 'number') ? motionState.cur_el_deg : null;
+  }
+
+  async function refreshCelestialTargets() {
+    if (!celestialEls.list) return;
+    const minEl = parseFloat(celestialEls.minEl.value);
+    const maxMag = parseFloat(celestialEls.maxMag.value);
+    if (!isFinite(minEl) || !isFinite(maxMag)) return;
+    const params = new URLSearchParams();
+    params.set('altitude_m', String(getAltitudeManualValue()));
+    params.set('min_el', String(minEl));
+    params.set('max_mag', String(maxMag));
+    params.set('top_n', '20');
+    const az = _currentMountAz(), el = _currentMountEl();
+    if (az != null && el != null) {
+      params.set('current_az', String(az));
+      params.set('current_el', String(el));
+    }
+    celestialEls.status.textContent = 'updating…';
+    try {
+      const r = await fetch(`${apiRoot}/celestial-targets?${params.toString()}`);
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({error: r.statusText}));
+        celestialEls.list.textContent = 'celestial targets unavailable: ' + (err.error || r.statusText);
+        celestialEls.status.textContent = '';
+        return;
+      }
+      const body = await r.json();
+      renderCelestialTargets(body);
+      celestialEls.status.textContent = body.observer && body.observer.when_utc
+        ? `as of ${body.observer.when_utc}` : '';
+    } catch (e) {
+      celestialEls.list.textContent = 'celestial targets error: ' + e;
+      celestialEls.status.textContent = '';
+    }
+  }
+
+  function renderCelestialTargets(body) {
+    const list = celestialEls.list;
+    list.innerHTML = '';
+    const visible = body.visible || [];
+    if (visible.length === 0) {
+      list.innerHTML = '<div style="opacity:0.6; padding:6px;">no targets pass the current filters (try lowering min el or raising max mag).</div>';
+      return;
+    }
+    visible.forEach(t => {
+      const row = document.createElement('div');
+      const planetCls = (t.kind === 'planet') ? ' planet' : '';
+      row.className = 'cal-target celestial' + planetCls;
+      const distFrag = (t.distance_deg != null)
+        ? ` · Δ ${t.distance_deg.toFixed(1)}° from current`
+        : '';
+      row.innerHTML =
+        `<div><span class="name">${t.name}</span>` +
+        (t.bayer ? `<span class="bayer">${t.bayer}</span>` : '') +
+        `<span class="mag">mag ${t.vmag.toFixed(2)}</span></div>` +
+        `<div class="geom">az ${t.az_deg.toFixed(2)}° · el ${t.el_deg.toFixed(2)}°` +
+          ` · sun Δ ${t.sun_sep_deg.toFixed(0)}° · moon Δ ${t.moon_sep_deg.toFixed(0)}°` +
+          `${distFrag}</div>` +
+        (t.notes ? `<div class="aim">${t.notes}</div>` : '');
+      row.addEventListener('click', () => slewToCelestial(t));
+      list.appendChild(row);
+    });
+  }
+
+  async function slewToCelestial(t) {
+    // Hand the (az, el) to the calibrate-motion primitive's
+    // /set_target endpoint. The motion session is already running
+    // (started by startMotion() at page load) so this just updates
+    // the static target — the streaming controller does the slew.
+    if (!motionState.active) {
+      celestialEls.status.textContent = 'motion session inactive';
+      return;
+    }
+    try {
+      const r = await fetch(`${motionRoot}/set_target`, {
+        method:'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({az: t.az_deg, el: t.el_deg}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        celestialEls.status.textContent = 'slew failed: ' + (err.error || r.statusText);
+        return;
+      }
+      showToast(`Slewing to ${t.name}`);
+    } catch (e) {
+      celestialEls.status.textContent = 'slew error: ' + e;
+    }
+  }
+
+  function scheduleCelestialRefresh() {
+    if (celestialDebounceId) clearTimeout(celestialDebounceId);
+    celestialDebounceId = setTimeout(() => {
+      celestialDebounceId = null;
+      refreshCelestialTargets();
+    }, 500);
+  }
+  if (celestialEls.minEl) {
+    celestialEls.minEl.addEventListener('input', scheduleCelestialRefresh);
+  }
+  if (celestialEls.maxMag) {
+    celestialEls.maxMag.addEventListener('input', scheduleCelestialRefresh);
+  }
+
   // Kick things off.
   loadSetup();
   startMotion();
   loadNightAvailability();
+  refreshCelestialTargets();
   setInterval(refreshStatus, 1000);
   setInterval(refreshMotionStatus, 1000);
   setInterval(refreshNightStatus, 1500);
+  setInterval(refreshCelestialTargets, 60000);
   refreshStatus();
 })();
 </script>
