@@ -256,3 +256,144 @@ def test_tracker_then_cal_same_scope_refused(monkeypatch):
             cal_mgr.start(_FakeCalSession(8))
     finally:
         track_mgr.stop(8)
+
+
+# ---------- CalibrateMotion vs LiveTrack TOCTOU coverage --------------
+#
+# ``CalibrateMotionManager.start`` and ``LiveTrackManager.start`` have
+# the same TOCTOU shape as the cal/tracker pair above: each manager
+# holds its own ``self._lock`` for its own registry, but the
+# cross-manager check + register sequence has to be atomic across both
+# managers, otherwise concurrent starts can both register sessions on
+# the same telescope. Both adopt the shared per-telescope start lock
+# from :mod:`device._scope_start_lock` to close the window.
+
+
+class _FakeMotionSession:
+    """Stand-in for :class:`CalibrateMotionSession`. Same contract as
+    :class:`_FakeCalSession`."""
+
+    def __init__(self, telescope_id: int) -> None:
+        self.telescope_id = int(telescope_id)
+        self._alive = False
+
+    def start(self) -> None:
+        time.sleep(0.005)
+        self._alive = True
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._alive = False
+
+    def status(self):
+        return None
+
+
+def test_motion_vs_tracker_start_lock_serializes_concurrent_starts(monkeypatch):
+    """Same TOCTOU shape as cal/tracker — calibrate-motion and live
+    tracker must serialize on the shared per-telescope start lock so
+    that exactly one wins when both start concurrently on the same
+    telescope id."""
+    import device.calibrate_motion as cm
+    import device.live_tracker as lt
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.live_tracker import LiveTrackManager
+
+    iterations = 100
+    tid = 199
+    bad_outcomes: list[tuple[int, dict]] = []
+
+    for i in range(iterations):
+        motion_mgr = CalibrateMotionManager()
+        track_mgr = LiveTrackManager()
+        monkeypatch.setattr(lt, "_MANAGER", track_mgr)
+        monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+
+        motion_session = _FakeMotionSession(tid)
+        track_session = _FakeTrackerSession(tid)
+
+        results: dict[str, object] = {}
+
+        def start_motion() -> None:
+            try:
+                motion_mgr.start(motion_session)
+                results["motion"] = "ok"
+            except RuntimeError as e:
+                results["motion"] = e
+
+        def start_track() -> None:
+            try:
+                track_mgr.start(track_session)
+                results["track"] = "ok"
+            except RuntimeError as e:
+                results["track"] = e
+
+        ta = threading.Thread(target=start_motion, daemon=True)
+        tb = threading.Thread(target=start_track, daemon=True)
+        try:
+            ta.start()
+            time.sleep(0.001)
+            tb.start()
+            ta.join(timeout=5.0)
+            tb.join(timeout=5.0)
+            assert not ta.is_alive(), "motion thread hung"
+            assert not tb.is_alive(), "track thread hung"
+
+            oks = [k for k, v in results.items() if v == "ok"]
+            errs = [k for k, v in results.items() if isinstance(v, RuntimeError)]
+            if not (len(oks) == 1 and len(errs) == 1):
+                bad_outcomes.append((i, dict(results)))
+        finally:
+            motion_mgr.stop(tid)
+            track_mgr.stop(tid)
+            ta.join(timeout=1.0)
+            tb.join(timeout=1.0)
+
+    assert not bad_outcomes, (
+        f"motion/tracker TOCTOU: {len(bad_outcomes)}/{iterations} "
+        f"iterations produced wrong outcome (sample: {bad_outcomes[:3]})"
+    )
+
+
+def test_motion_then_tracker_same_scope_refused(monkeypatch):
+    """Sequential sanity: motion first → tracker on the same scope must
+    be refused."""
+    import device.calibrate_motion as cm
+    import device.live_tracker as lt
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.live_tracker import LiveTrackManager
+
+    motion_mgr = CalibrateMotionManager()
+    track_mgr = LiveTrackManager()
+    monkeypatch.setattr(lt, "_MANAGER", track_mgr)
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+
+    motion_mgr.start(_FakeMotionSession(17))
+    try:
+        with pytest.raises(RuntimeError, match="calibrate-motion"):
+            track_mgr.start(_FakeTrackerSession(17))
+    finally:
+        motion_mgr.stop(17)
+
+
+def test_tracker_then_motion_same_scope_refused(monkeypatch):
+    """Mirror: tracker first → motion on the same scope must be
+    refused."""
+    import device.calibrate_motion as cm
+    import device.live_tracker as lt
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.live_tracker import LiveTrackManager
+
+    motion_mgr = CalibrateMotionManager()
+    track_mgr = LiveTrackManager()
+    monkeypatch.setattr(lt, "_MANAGER", track_mgr)
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+
+    track_mgr.start(_FakeTrackerSession(18))
+    try:
+        with pytest.raises(RuntimeError, match="live-tracking"):
+            motion_mgr.start(_FakeMotionSession(18))
+    finally:
+        track_mgr.stop(18)

@@ -1281,6 +1281,20 @@ class LiveTrackManager:
                     )
             except ImportError:
                 pass
+            # Refuse if the calibrate page has a continuous-motion session
+            # running on this telescope. Both the live tracker and the motion
+            # session command speed_move every tick; running them concurrently
+            # would have them overwriting each other's commands.
+            try:
+                from device.calibrate_motion import get_calibrate_motion_manager
+
+                if get_calibrate_motion_manager().is_running(tid):
+                    raise RuntimeError(
+                        f"telescope {tid} is in calibrate-motion mode; stop "
+                        "the calibrate page first"
+                    )
+            except ImportError:
+                pass
             with self._lock:
                 existing = self._sessions.get(tid)
                 if existing is not None and existing.is_alive():
