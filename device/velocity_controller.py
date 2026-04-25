@@ -29,17 +29,22 @@ that produced the calibration constants in this module.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Optional, Protocol, runtime_checkable
 
 from astropy import units as u
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord
 from astropy.time import Time
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -137,10 +142,22 @@ def unwrap_az_series(wrapped_samples: list[float]) -> list[float]:
 
     The first element is returned as-is; subsequent elements accumulate
     wrap_pm180(sample[i] - sample[i-1]).
+
+    Raises ``ValueError`` on any non-finite sample (NaN / Inf). Without
+    this guard a single bad reading silently propagates NaN across the
+    whole tail of the series and corrupts every downstream consumer
+    (``CumulativeAzTracker``, fit_auto_level, JSON persistence). Reject
+    at the boundary so the caller sees the failure.
     """
     if not wrapped_samples:
         return []
-    out = [wrapped_samples[0]]
+    out: list[float] = []
+    for i, v in enumerate(wrapped_samples):
+        if not math.isfinite(v):
+            raise ValueError(
+                f"unwrap_az_series: non-finite sample at index {i}: {v!r}"
+            )
+    out.append(wrapped_samples[0])
     for i in range(1, len(wrapped_samples)):
         d = wrap_pm180(wrapped_samples[i] - wrapped_samples[i - 1])
         out.append(out[-1] + d)
@@ -172,6 +189,37 @@ def speed_move(cli: MountClient, speed: int, angle: int, dur_sec: int) -> None:
         "scope_speed_move",
         {"speed": int(speed), "angle": int(angle), "dur_sec": int(dur_sec)},
     )
+
+
+@contextmanager
+def _motor_stop_on_exit(cli: MountClient) -> Iterator[None]:
+    """Guarantee a motor-stop ``scope_speed_move(0, 0, 1)`` on context
+    exit, including via exception.
+
+    Used to wrap the FF-tick loops in ``move_azimuth_to_ff``,
+    ``move_elevation_to_ff``, and ``move_to_ff``. Without this, a
+    ``SunSafetyLocked`` (or any other exception) raised mid-loop bypasses
+    the post-loop cleanup ``speed_move(cli, 0, 0, 1)``, leaving the motor
+    free-running until the firmware ``dur_sec`` TTL expires
+    (``VC_CMD_DUR_S`` = 5 s; bounded uncommanded motion of up to
+    ``v_max × VC_CMD_DUR_S`` ≈ 30°). With this guard the cleanup is
+    always issued.
+
+    Calls ``cli.method_sync`` **directly** rather than the lockout-aware
+    ``speed_move`` wrapper — otherwise a ``SunSafetyLocked``-mid-loop
+    would also block the cleanup path, which is exactly the failure
+    mode this guards against.
+    """
+    try:
+        yield
+    finally:
+        try:
+            cli.method_sync(
+                "scope_speed_move",
+                {"speed": 0, "angle": 0, "dur_sec": 1},
+            )
+        except Exception:
+            logger.warning("motor-stop on FF tick-loop exit failed", exc_info=True)
 
 
 def wait_for_mount_idle(
@@ -267,12 +315,16 @@ def set_tracking(cli: MountClient, enabled: bool) -> None:
     Disable for auto-level sweeps: on stop the firmware otherwise drives
     the mount at up to max slew speed toward stale targets. Observed
     ~5 °/s backward drift between sweep steps until this was disabled.
+
+    Failures are logged at WARNING and swallowed — the call is advisory
+    (no caller has a recovery path) but operators need visibility when
+    it silently fails (e.g. ``goto_origin`` then proceeds straight into
+    cable-hard-stop strikes).
     """
     try:
         cli.method_sync("scope_set_track_state", enabled)
-    except Exception:
-        # non-fatal; caller can log if needed
-        pass
+    except Exception as exc:
+        logger.warning("set_tracking(%s) failed: %s", enabled, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -722,129 +774,135 @@ def move_azimuth_to_ff(
     converged_count = 0
     t_settle_enter = None  # wall time when loop entered post-trajectory phase
 
-    while True:
-        now = time.monotonic()
-        t_rel = now - t_wall_start
+    # Wrap the FF tick-loop in _motor_stop_on_exit so a SunSafetyLocked
+    # (or any other exception) raised mid-loop still issues the firmware
+    # motor-stop. Without this guard, the post-loop speed_move(cli, 0, 0, 1)
+    # is bypassed and the motor free-runs until the VC_CMD_DUR_S TTL
+    # expires — bounded uncommanded motion of up to v_max × 5 s ≈ 30°.
+    with _motor_stop_on_exit(cli):
+        while True:
+            now = time.monotonic()
+            t_rel = now - t_wall_start
 
-        # Measure plant first so the correction uses fresh data.
-        _, measured_az, fw_t_now = measure_altaz_timed(cli, loc)
+            # Measure plant first so the correction uses fresh data.
+            _, measured_az, fw_t_now = measure_altaz_timed(cli, loc)
 
-        # Advance cumulative tracker (if any) with the fresh wrapped reading.
-        if az_tracker is not None:
-            az_tracker.update(measured_az)
+            # Advance cumulative tracker (if any) with the fresh wrapped reading.
+            if az_tracker is not None:
+                az_tracker.update(measured_az)
 
-        # Plant's trajectory-time (fw-clock based for RPC-jitter immunity).
-        if fw_t_now is not None and fw_t_start is not None:
-            t_plant = fw_t_now - fw_t_start
-        else:
-            t_plant = t_rel  # fallback if firmware lacks Timestamp
-        t_plant_clamped = max(0.0, min(t_plant, traj.total_duration))
-
-        # Single reference: use t_plant so ref.pos is compared against the
-        # plant state at the same timestamp (error signal) AND ref.vel
-        # is the trajectory rate at "now" as the plant sees it. Splitting
-        # into two refs (one at t_rel for cmd, one at t_plant for error)
-        # introduces a phase offset equal to RPC latency.
-        # When planning in cumulative coords, ref.pos lives in the same
-        # unwrapped frame as az_tracker.cum_az_deg and the trajectory can
-        # span multiple wraps — diff them directly. Wrapped mode compares
-        # against the wrapped measurement with wrap_pm180.
-        ref = traj.sample(t_plant_clamped)
-        if use_cumulative:
-            position_error = ref.pos - az_tracker.cum_az_deg
-        else:
-            position_error = wrap_pm180(ref.pos - measured_az)
-
-        # P-term feedback with clamp.
-        v_corr = kp_pos * position_error
-        if v_corr > v_corr_max:
-            v_corr = v_corr_max
-        elif v_corr < -v_corr_max:
-            v_corr = -v_corr_max
-
-        # Feedforward: invert the first-order plant lag so the commanded
-        # velocity leads the reference by τ·a. For a plant with transfer
-        # function 1/(τs+1), v_cmd = v_ref + τ·a_ref makes the output
-        # track v_ref exactly. VC_TAU_S = 0.348s from Phase 1 sysid.
-        v_ff = ref.vel + VC_TAU_S * ref.acc
-        cmd_vel = v_ff + v_corr
-        # Clamp at the PLANT's max rate (MAIN_RATE_DEGS), not the planner's
-        # cruise speed (v_max). The τ·a_ref term can briefly push v_ff above
-        # v_max during accel phases (≈ 0.348 × 4.0 = 1.4°/s); the 6°/s clamp
-        # caps at the plant limit and preserves the 1°/s FB headroom.
-        if cmd_vel > MAIN_RATE_DEGS:
-            cmd_vel = MAIN_RATE_DEGS
-        elif cmd_vel < -MAIN_RATE_DEGS:
-            cmd_vel = -MAIN_RATE_DEGS
-
-        # Convert to firmware (speed, angle).
-        if abs(cmd_vel) < 1e-6:
-            speed_cmd = 0
-            angle_cmd = 0
-        else:
-            speed_cmd = _rate_to_speed(abs(cmd_vel))
-            if speed_cmd < VC_FINE_MIN_SPEED:
-                speed_cmd = 0
-            angle_cmd = 0 if cmd_vel > 0 else 180
-
-        speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
-        stats["commands_issued"] += 1
-
-        tracking_errs.append(abs(position_error))
-        position_errs_abs.append(abs(position_error))
-        if abs(v_corr) > stats["max_v_corr_degs"]:
-            stats["max_v_corr_degs"] = abs(v_corr)
-
-        if position_logger is not None:
-            position_logger.mark_event(
-                "ff_tick",
-                t_rel=t_rel,
-                fw_t=fw_t_now,
-                t_plant=t_plant,
-                ref_pos=ref.pos,
-                ref_vel=ref.vel,
-                ref_acc=ref.acc,
-                meas_az=measured_az,
-                tracking_err_deg=abs(position_error),
-                position_error_deg=position_error,
-                v_ff_degs=v_ff,
-                v_corr_degs=v_corr,
-                cmd_vel_degs=cmd_vel,
-                cmd_speed=speed_cmd,
-                cmd_angle=angle_cmd,
-            )
-
-        tick_dts.append(now - prev_tick_t)
-        prev_tick_t = now
-        tick_idx += 1
-
-        # Termination — two distinct phases.
-        if t_plant < traj.total_duration:
-            # Still following the trajectory; keep going.
-            pass
-        else:
-            # Past the trajectory; ref_vel=0 from here on, feedback holds
-            # the plant at p_target. Count consecutive converged ticks.
-            if t_settle_enter is None:
-                t_settle_enter = now
-            if abs(position_error) <= arrive_tolerance_deg:
-                converged_count += 1
+            # Plant's trajectory-time (fw-clock based for RPC-jitter immunity).
+            if fw_t_now is not None and fw_t_start is not None:
+                t_plant = fw_t_now - fw_t_start
             else:
-                converged_count = 0
-            if converged_count >= converged_ticks_required:
-                stats["converged"] = True
-                break
-            if (now - t_settle_enter) >= settle_max_s:
-                break
+                t_plant = t_rel  # fallback if firmware lacks Timestamp
+            t_plant_clamped = max(0.0, min(t_plant, traj.total_duration))
 
-        # Deadline-based sleep to next tick.
-        next_tick_t = t_wall_start + tick_idx * tick_dt
-        sleep_dt = next_tick_t - time.monotonic()
-        if sleep_dt > 0:
-            time.sleep(sleep_dt)
+            # Single reference: use t_plant so ref.pos is compared against the
+            # plant state at the same timestamp (error signal) AND ref.vel
+            # is the trajectory rate at "now" as the plant sees it. Splitting
+            # into two refs (one at t_rel for cmd, one at t_plant for error)
+            # introduces a phase offset equal to RPC latency.
+            # When planning in cumulative coords, ref.pos lives in the same
+            # unwrapped frame as az_tracker.cum_az_deg and the trajectory can
+            # span multiple wraps — diff them directly. Wrapped mode compares
+            # against the wrapped measurement with wrap_pm180.
+            ref = traj.sample(t_plant_clamped)
+            if use_cumulative:
+                position_error = ref.pos - az_tracker.cum_az_deg
+            else:
+                position_error = wrap_pm180(ref.pos - measured_az)
 
-    # Clean stop after the loop exits.
-    speed_move(cli, 0, 0, 1)
+            # P-term feedback with clamp.
+            v_corr = kp_pos * position_error
+            if v_corr > v_corr_max:
+                v_corr = v_corr_max
+            elif v_corr < -v_corr_max:
+                v_corr = -v_corr_max
+
+            # Feedforward: invert the first-order plant lag so the commanded
+            # velocity leads the reference by τ·a. For a plant with transfer
+            # function 1/(τs+1), v_cmd = v_ref + τ·a_ref makes the output
+            # track v_ref exactly. VC_TAU_S = 0.348s from Phase 1 sysid.
+            v_ff = ref.vel + VC_TAU_S * ref.acc
+            cmd_vel = v_ff + v_corr
+            # Clamp at the PLANT's max rate (MAIN_RATE_DEGS), not the planner's
+            # cruise speed (v_max). The τ·a_ref term can briefly push v_ff above
+            # v_max during accel phases (≈ 0.348 × 4.0 = 1.4°/s); the 6°/s clamp
+            # caps at the plant limit and preserves the 1°/s FB headroom.
+            if cmd_vel > MAIN_RATE_DEGS:
+                cmd_vel = MAIN_RATE_DEGS
+            elif cmd_vel < -MAIN_RATE_DEGS:
+                cmd_vel = -MAIN_RATE_DEGS
+
+            # Convert to firmware (speed, angle).
+            if abs(cmd_vel) < 1e-6:
+                speed_cmd = 0
+                angle_cmd = 0
+            else:
+                speed_cmd = _rate_to_speed(abs(cmd_vel))
+                if speed_cmd < VC_FINE_MIN_SPEED:
+                    speed_cmd = 0
+                angle_cmd = 0 if cmd_vel > 0 else 180
+
+            speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
+            stats["commands_issued"] += 1
+
+            tracking_errs.append(abs(position_error))
+            position_errs_abs.append(abs(position_error))
+            if abs(v_corr) > stats["max_v_corr_degs"]:
+                stats["max_v_corr_degs"] = abs(v_corr)
+
+            if position_logger is not None:
+                position_logger.mark_event(
+                    "ff_tick",
+                    t_rel=t_rel,
+                    fw_t=fw_t_now,
+                    t_plant=t_plant,
+                    ref_pos=ref.pos,
+                    ref_vel=ref.vel,
+                    ref_acc=ref.acc,
+                    meas_az=measured_az,
+                    tracking_err_deg=abs(position_error),
+                    position_error_deg=position_error,
+                    v_ff_degs=v_ff,
+                    v_corr_degs=v_corr,
+                    cmd_vel_degs=cmd_vel,
+                    cmd_speed=speed_cmd,
+                    cmd_angle=angle_cmd,
+                )
+
+            tick_dts.append(now - prev_tick_t)
+            prev_tick_t = now
+            tick_idx += 1
+
+            # Termination — two distinct phases.
+            if t_plant < traj.total_duration:
+                # Still following the trajectory; keep going.
+                pass
+            else:
+                # Past the trajectory; ref_vel=0 from here on, feedback holds
+                # the plant at p_target. Count consecutive converged ticks.
+                if t_settle_enter is None:
+                    t_settle_enter = now
+                if abs(position_error) <= arrive_tolerance_deg:
+                    converged_count += 1
+                else:
+                    converged_count = 0
+                if converged_count >= converged_ticks_required:
+                    stats["converged"] = True
+                    break
+                if (now - t_settle_enter) >= settle_max_s:
+                    break
+
+            # Deadline-based sleep to next tick.
+            next_tick_t = t_wall_start + tick_idx * tick_dt
+            sleep_dt = next_tick_t - time.monotonic()
+            if sleep_dt > 0:
+                time.sleep(sleep_dt)
+
+    # Reached only on clean break — on any exception the motor-stop in
+    # _motor_stop_on_exit fires and the exception propagates here.
     stats["commands_issued"] += 1
     wait_for_mount_idle(cli, timeout_s=3.0)
     if settle_s > 0:
@@ -1166,95 +1224,99 @@ def move_elevation_to_ff(
     converged_count = 0
     t_settle_enter = None
 
-    while True:
-        now = time.monotonic()
-        t_rel = now - t_wall_start
+    # Wrap the FF tick-loop in _motor_stop_on_exit; same rationale as
+    # move_azimuth_to_ff (ensures motor-stop runs even on
+    # SunSafetyLocked / RPC error mid-loop).
+    with _motor_stop_on_exit(cli):
+        while True:
+            now = time.monotonic()
+            t_rel = now - t_wall_start
 
-        measured_alt, _, fw_t_now = measure_altaz_timed(cli, loc)
+            measured_alt, _, fw_t_now = measure_altaz_timed(cli, loc)
 
-        if fw_t_now is not None and fw_t_start is not None:
-            t_plant = fw_t_now - fw_t_start
-        else:
-            t_plant = t_rel
-        t_plant_clamped = max(0.0, min(t_plant, traj.total_duration))
-
-        ref = traj.sample(t_plant_clamped)
-        position_error = ref.pos - measured_alt  # no wrap for el
-
-        v_corr = kp_pos * position_error
-        if v_corr > v_corr_max:
-            v_corr = v_corr_max
-        elif v_corr < -v_corr_max:
-            v_corr = -v_corr_max
-
-        # Feedforward plant-inversion: v_cmd = v_ref + τ·a_ref + FB. See the
-        # matching block in move_azimuth_to_ff for the derivation.
-        v_ff = ref.vel + VC_TAU_S * ref.acc
-        cmd_vel = v_ff + v_corr
-        if cmd_vel > MAIN_RATE_DEGS:
-            cmd_vel = MAIN_RATE_DEGS
-        elif cmd_vel < -MAIN_RATE_DEGS:
-            cmd_vel = -MAIN_RATE_DEGS
-
-        if abs(cmd_vel) < 1e-6:
-            speed_cmd = 0
-            angle_cmd = 0
-        else:
-            speed_cmd = _rate_to_speed(abs(cmd_vel))
-            if speed_cmd < VC_FINE_MIN_SPEED:
-                speed_cmd = 0
-            angle_cmd = 90 if cmd_vel > 0 else 270
-
-        speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
-        stats["commands_issued"] += 1
-
-        position_errs_abs.append(abs(position_error))
-        if abs(v_corr) > stats["max_v_corr_degs"]:
-            stats["max_v_corr_degs"] = abs(v_corr)
-
-        if position_logger is not None:
-            position_logger.mark_event(
-                "el_ff_tick",
-                t_rel=t_rel,
-                fw_t=fw_t_now,
-                t_plant=t_plant,
-                ref_pos=ref.pos,
-                ref_vel=ref.vel,
-                ref_acc=ref.acc,
-                meas_el=measured_alt,
-                position_error_deg=position_error,
-                v_ff_degs=v_ff,
-                v_corr_degs=v_corr,
-                cmd_vel_degs=cmd_vel,
-                cmd_speed=speed_cmd,
-                cmd_angle=angle_cmd,
-            )
-
-        tick_dts.append(now - prev_tick_t)
-        prev_tick_t = now
-        tick_idx += 1
-
-        if t_plant < traj.total_duration:
-            pass
-        else:
-            if t_settle_enter is None:
-                t_settle_enter = now
-            if abs(position_error) <= arrive_tolerance_deg:
-                converged_count += 1
+            if fw_t_now is not None and fw_t_start is not None:
+                t_plant = fw_t_now - fw_t_start
             else:
-                converged_count = 0
-            if converged_count >= converged_ticks_required:
-                stats["converged"] = True
-                break
-            if (now - t_settle_enter) >= settle_max_s:
-                break
+                t_plant = t_rel
+            t_plant_clamped = max(0.0, min(t_plant, traj.total_duration))
 
-        next_tick_t = t_wall_start + tick_idx * tick_dt
-        sleep_dt = next_tick_t - time.monotonic()
-        if sleep_dt > 0:
-            time.sleep(sleep_dt)
+            ref = traj.sample(t_plant_clamped)
+            position_error = ref.pos - measured_alt  # no wrap for el
 
-    speed_move(cli, 0, 0, 1)
+            v_corr = kp_pos * position_error
+            if v_corr > v_corr_max:
+                v_corr = v_corr_max
+            elif v_corr < -v_corr_max:
+                v_corr = -v_corr_max
+
+            # Feedforward plant-inversion: v_cmd = v_ref + τ·a_ref + FB. See the
+            # matching block in move_azimuth_to_ff for the derivation.
+            v_ff = ref.vel + VC_TAU_S * ref.acc
+            cmd_vel = v_ff + v_corr
+            if cmd_vel > MAIN_RATE_DEGS:
+                cmd_vel = MAIN_RATE_DEGS
+            elif cmd_vel < -MAIN_RATE_DEGS:
+                cmd_vel = -MAIN_RATE_DEGS
+
+            if abs(cmd_vel) < 1e-6:
+                speed_cmd = 0
+                angle_cmd = 0
+            else:
+                speed_cmd = _rate_to_speed(abs(cmd_vel))
+                if speed_cmd < VC_FINE_MIN_SPEED:
+                    speed_cmd = 0
+                angle_cmd = 90 if cmd_vel > 0 else 270
+
+            speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
+            stats["commands_issued"] += 1
+
+            position_errs_abs.append(abs(position_error))
+            if abs(v_corr) > stats["max_v_corr_degs"]:
+                stats["max_v_corr_degs"] = abs(v_corr)
+
+            if position_logger is not None:
+                position_logger.mark_event(
+                    "el_ff_tick",
+                    t_rel=t_rel,
+                    fw_t=fw_t_now,
+                    t_plant=t_plant,
+                    ref_pos=ref.pos,
+                    ref_vel=ref.vel,
+                    ref_acc=ref.acc,
+                    meas_el=measured_alt,
+                    position_error_deg=position_error,
+                    v_ff_degs=v_ff,
+                    v_corr_degs=v_corr,
+                    cmd_vel_degs=cmd_vel,
+                    cmd_speed=speed_cmd,
+                    cmd_angle=angle_cmd,
+                )
+
+            tick_dts.append(now - prev_tick_t)
+            prev_tick_t = now
+            tick_idx += 1
+
+            if t_plant < traj.total_duration:
+                pass
+            else:
+                if t_settle_enter is None:
+                    t_settle_enter = now
+                if abs(position_error) <= arrive_tolerance_deg:
+                    converged_count += 1
+                else:
+                    converged_count = 0
+                if converged_count >= converged_ticks_required:
+                    stats["converged"] = True
+                    break
+                if (now - t_settle_enter) >= settle_max_s:
+                    break
+
+            next_tick_t = t_wall_start + tick_idx * tick_dt
+            sleep_dt = next_tick_t - time.monotonic()
+            if sleep_dt > 0:
+                time.sleep(sleep_dt)
+
+    # Reached only on clean break.
     stats["commands_issued"] += 1
     wait_for_mount_idle(cli, timeout_s=3.0)
     if settle_s > 0:
@@ -1475,124 +1537,131 @@ def move_to_ff(
     converged_count = 0
     t_settle_enter = None
 
-    while True:
-        now = time.monotonic()
-        t_rel = now - t_wall_start
+    # Wrap the FF tick-loop in _motor_stop_on_exit; same rationale as
+    # move_azimuth_to_ff (ensures motor-stop runs even on
+    # SunSafetyLocked / RPC error mid-loop).
+    with _motor_stop_on_exit(cli):
+        while True:
+            now = time.monotonic()
+            t_rel = now - t_wall_start
 
-        measured_alt, measured_az, fw_t_now = measure_altaz_timed(cli, loc)
-        if az_tracker is not None:
-            az_tracker.update(measured_az)
+            measured_alt, measured_az, fw_t_now = measure_altaz_timed(cli, loc)
+            if az_tracker is not None:
+                az_tracker.update(measured_az)
 
-        if fw_t_now is not None and fw_t_start is not None:
-            t_plant = fw_t_now - fw_t_start
-        else:
-            t_plant = t_rel
-
-        # Az reference + feedforward + feedback.
-        # When planning in cumulative coords (use_cum), ref_az.pos lives in
-        # the same unwrapped frame as az_tracker.cum_az_deg, and the
-        # trajectory can span multiple wraps — diff them directly. Wrapped
-        # mode compares against the wrapped measurement with wrap_pm180.
-        t_az = max(0.0, min(t_plant, traj_az.total_duration))
-        ref_az = traj_az.sample(t_az)
-        if use_cum:
-            err_az = ref_az.pos - az_tracker.cum_az_deg
-        else:
-            err_az = wrap_pm180(ref_az.pos - measured_az)
-        v_corr_az = max(-v_corr_max, min(v_corr_max, kp_pos * err_az))
-        v_ff_az = ref_az.vel + VC_TAU_S * ref_az.acc
-        v_cmd_az = v_ff_az + v_corr_az
-
-        # El reference + feedforward + feedback.
-        t_el = max(0.0, min(t_plant, traj_el.total_duration))
-        ref_el = traj_el.sample(t_el)
-        err_el = ref_el.pos - measured_alt
-        v_corr_el = max(-v_corr_max, min(v_corr_max, kp_pos * err_el))
-        v_ff_el = ref_el.vel + VC_TAU_S * ref_el.acc
-        v_cmd_el = v_ff_el + v_corr_el
-
-        # Clamp each axis independently at v_max. The firmware clamps
-        # per-axis at speed=1440 internally, so the total speed CAN exceed
-        # 1440 for diagonal moves (e.g. speed=2036 at angle=45° gives each
-        # axis its full 6°/s). We mirror that here by clamping per-axis
-        # rather than the magnitude.
-        v_cmd_az = max(-MAIN_RATE_DEGS, min(MAIN_RATE_DEGS, v_cmd_az))
-        v_cmd_el = max(-MAIN_RATE_DEGS, min(MAIN_RATE_DEGS, v_cmd_el))
-        v_mag = math.sqrt(v_cmd_az * v_cmd_az + v_cmd_el * v_cmd_el)
-
-        if v_mag < 1e-6:
-            speed_cmd = 0
-            angle_cmd = 0
-        else:
-            speed_cmd = _rate_to_speed(v_mag)
-            if speed_cmd < VC_FINE_MIN_SPEED:
-                speed_cmd = 0
-            angle_cmd = int(round(math.degrees(math.atan2(v_cmd_el, v_cmd_az)))) % 360
-
-        speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
-        stats["commands_issued"] += 1
-
-        if abs(err_az) > stats["max_pos_err_az_deg"]:
-            stats["max_pos_err_az_deg"] = abs(err_az)
-        if abs(err_el) > stats["max_pos_err_el_deg"]:
-            stats["max_pos_err_el_deg"] = abs(err_el)
-
-        if position_logger is not None:
-            position_logger.mark_event(
-                "2d_ff_tick",
-                t_rel=t_rel,
-                fw_t=fw_t_now,
-                t_plant=t_plant,
-                ref_az=ref_az.pos,
-                ref_el=ref_el.pos,
-                ref_vel_az=ref_az.vel,
-                ref_vel_el=ref_el.vel,
-                ref_acc_az=ref_az.acc,
-                ref_acc_el=ref_el.acc,
-                meas_az=measured_az,
-                meas_el=measured_alt,
-                err_az=err_az,
-                err_el=err_el,
-                v_ff_az=v_ff_az,
-                v_ff_el=v_ff_el,
-                v_cmd_az=v_cmd_az,
-                v_cmd_el=v_cmd_el,
-                v_mag=v_mag,
-                cmd_speed=speed_cmd,
-                cmd_angle=angle_cmd,
-            )
-
-        tick_dts.append(now - prev_tick_t)
-        prev_tick_t = now
-        tick_idx += 1
-
-        # Convergence: both axes past trajectory AND within tolerance.
-        both_past = (
-            t_plant >= traj_az.total_duration and t_plant >= traj_el.total_duration
-        )
-        if both_past:
-            if t_settle_enter is None:
-                t_settle_enter = now
-            both_ok = (
-                abs(err_az) <= arrive_tolerance_deg
-                and abs(err_el) <= arrive_tolerance_deg
-            )
-            if both_ok:
-                converged_count += 1
+            if fw_t_now is not None and fw_t_start is not None:
+                t_plant = fw_t_now - fw_t_start
             else:
-                converged_count = 0
-            if converged_count >= converged_ticks_required:
-                stats["converged"] = True
-                break
-            if (now - t_settle_enter) >= settle_max_s:
-                break
+                t_plant = t_rel
 
-        next_tick_t = t_wall_start + tick_idx * tick_dt
-        sleep_dt = next_tick_t - time.monotonic()
-        if sleep_dt > 0:
-            time.sleep(sleep_dt)
+            # Az reference + feedforward + feedback.
+            # When planning in cumulative coords (use_cum), ref_az.pos lives in
+            # the same unwrapped frame as az_tracker.cum_az_deg, and the
+            # trajectory can span multiple wraps — diff them directly. Wrapped
+            # mode compares against the wrapped measurement with wrap_pm180.
+            t_az = max(0.0, min(t_plant, traj_az.total_duration))
+            ref_az = traj_az.sample(t_az)
+            if use_cum:
+                err_az = ref_az.pos - az_tracker.cum_az_deg
+            else:
+                err_az = wrap_pm180(ref_az.pos - measured_az)
+            v_corr_az = max(-v_corr_max, min(v_corr_max, kp_pos * err_az))
+            v_ff_az = ref_az.vel + VC_TAU_S * ref_az.acc
+            v_cmd_az = v_ff_az + v_corr_az
 
-    speed_move(cli, 0, 0, 1)
+            # El reference + feedforward + feedback.
+            t_el = max(0.0, min(t_plant, traj_el.total_duration))
+            ref_el = traj_el.sample(t_el)
+            err_el = ref_el.pos - measured_alt
+            v_corr_el = max(-v_corr_max, min(v_corr_max, kp_pos * err_el))
+            v_ff_el = ref_el.vel + VC_TAU_S * ref_el.acc
+            v_cmd_el = v_ff_el + v_corr_el
+
+            # Clamp each axis independently at v_max. The firmware clamps
+            # per-axis at speed=1440 internally, so the total speed CAN exceed
+            # 1440 for diagonal moves (e.g. speed=2036 at angle=45° gives each
+            # axis its full 6°/s). We mirror that here by clamping per-axis
+            # rather than the magnitude.
+            v_cmd_az = max(-MAIN_RATE_DEGS, min(MAIN_RATE_DEGS, v_cmd_az))
+            v_cmd_el = max(-MAIN_RATE_DEGS, min(MAIN_RATE_DEGS, v_cmd_el))
+            v_mag = math.sqrt(v_cmd_az * v_cmd_az + v_cmd_el * v_cmd_el)
+
+            if v_mag < 1e-6:
+                speed_cmd = 0
+                angle_cmd = 0
+            else:
+                speed_cmd = _rate_to_speed(v_mag)
+                if speed_cmd < VC_FINE_MIN_SPEED:
+                    speed_cmd = 0
+                angle_cmd = (
+                    int(round(math.degrees(math.atan2(v_cmd_el, v_cmd_az)))) % 360
+                )
+
+            speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
+            stats["commands_issued"] += 1
+
+            if abs(err_az) > stats["max_pos_err_az_deg"]:
+                stats["max_pos_err_az_deg"] = abs(err_az)
+            if abs(err_el) > stats["max_pos_err_el_deg"]:
+                stats["max_pos_err_el_deg"] = abs(err_el)
+
+            if position_logger is not None:
+                position_logger.mark_event(
+                    "2d_ff_tick",
+                    t_rel=t_rel,
+                    fw_t=fw_t_now,
+                    t_plant=t_plant,
+                    ref_az=ref_az.pos,
+                    ref_el=ref_el.pos,
+                    ref_vel_az=ref_az.vel,
+                    ref_vel_el=ref_el.vel,
+                    ref_acc_az=ref_az.acc,
+                    ref_acc_el=ref_el.acc,
+                    meas_az=measured_az,
+                    meas_el=measured_alt,
+                    err_az=err_az,
+                    err_el=err_el,
+                    v_ff_az=v_ff_az,
+                    v_ff_el=v_ff_el,
+                    v_cmd_az=v_cmd_az,
+                    v_cmd_el=v_cmd_el,
+                    v_mag=v_mag,
+                    cmd_speed=speed_cmd,
+                    cmd_angle=angle_cmd,
+                )
+
+            tick_dts.append(now - prev_tick_t)
+            prev_tick_t = now
+            tick_idx += 1
+
+            # Convergence: both axes past trajectory AND within tolerance.
+            both_past = (
+                t_plant >= traj_az.total_duration
+                and t_plant >= traj_el.total_duration
+            )
+            if both_past:
+                if t_settle_enter is None:
+                    t_settle_enter = now
+                both_ok = (
+                    abs(err_az) <= arrive_tolerance_deg
+                    and abs(err_el) <= arrive_tolerance_deg
+                )
+                if both_ok:
+                    converged_count += 1
+                else:
+                    converged_count = 0
+                if converged_count >= converged_ticks_required:
+                    stats["converged"] = True
+                    break
+                if (now - t_settle_enter) >= settle_max_s:
+                    break
+
+            next_tick_t = t_wall_start + tick_idx * tick_dt
+            sleep_dt = next_tick_t - time.monotonic()
+            if sleep_dt > 0:
+                time.sleep(sleep_dt)
+
+    # Reached only on clean break.
     stats["commands_issued"] += 1
     wait_for_mount_idle(cli, timeout_s=3.0)
     if settle_s > 0:
