@@ -1425,3 +1425,209 @@ def test_calibrate_rotation_targets_default_first_is_hyperion(monkeypatch):
     assert len(defaults) >= 1
     assert defaults[0]["oas"] == HYPERION_06_000301.oas
     assert "Hyperion" in defaults[0]["name"]
+
+
+# ---------- CalibrationCelestialTargetsResource ----------------------
+
+
+class _CelestialReq:
+    """Minimal req with ``params`` dict — mirrors the FAA targets test
+    style. Only ``req.params.get(name)`` and ``req.params.get(name,
+    default)`` are used by the resource."""
+
+    def __init__(self, params=None):
+        self.params = dict(params or {})
+
+
+class _CelestialResp:
+    status = None
+    content_type = None
+    text = None
+
+
+def _patch_for_celestial(monkeypatch, *, lat=33.96, lon=-118.46):
+    """Stub out the AlpacaClient + telescope GPS fetch so the resource
+    tests run without a mount. Mirrors the FAA-targets test setup."""
+    from device.config import Config
+
+    monkeypatch.setattr(Config, "port", 5555)
+
+    class FakeAlpaca:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr("device.alpaca_client.AlpacaClient", FakeAlpaca)
+    monkeypatch.setattr(
+        "scripts.trajectory.observer.fetch_telescope_lonlat",
+        lambda _cli: (lat, lon),
+    )
+
+
+def test_celestial_targets_returns_visible_list(monkeypatch):
+    """Default call (no current_az/el) returns a list ordered brightest
+    first. At LA latitude there's always at least one bright target
+    above 20° (Polaris is at el ≈ 34° regardless of time of day)."""
+    _patch_for_celestial(monkeypatch)
+    req = _CelestialReq(params={"altitude_m": "2.0"})
+    resp = _CelestialResp()
+    front_app.CalibrationCelestialTargetsResource.on_get(
+        req,
+        resp,
+        telescope_id=1,
+    )
+    assert "200" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert "visible" in payload and isinstance(payload["visible"], list)
+    assert "observer" in payload
+    assert payload["observer"]["lat_deg"] == 33.96
+    assert payload["filters"]["min_el_deg"] == 20.0
+    assert payload["filters"]["max_mag"] == 4.0
+    # No proximity sort → distance_deg must be null on every entry.
+    for entry in payload["visible"]:
+        assert entry["distance_deg"] is None
+    # Brightest first (vmag ascending) when no current pointing supplied.
+    vmags = [e["vmag"] for e in payload["visible"]]
+    assert vmags == sorted(vmags)
+
+
+def test_celestial_targets_proximity_sort_when_current_pointing(monkeypatch):
+    """With ``current_az`` + ``current_el`` supplied, every entry has a
+    ``distance_deg`` and the list is sorted ascending by it."""
+    _patch_for_celestial(monkeypatch)
+    req = _CelestialReq(
+        params={
+            "altitude_m": "2.0",
+            "current_az": "0.0",
+            "current_el": "34.0",  # near Polaris
+            "top_n": "5",
+        }
+    )
+    resp = _CelestialResp()
+    front_app.CalibrationCelestialTargetsResource.on_get(
+        req,
+        resp,
+        telescope_id=1,
+    )
+    assert "200" in str(resp.status)
+    payload = json.loads(resp.text)
+    visible = payload["visible"]
+    assert len(visible) <= 5
+    distances = [e["distance_deg"] for e in visible]
+    assert all(d is not None for d in distances)
+    assert distances == sorted(distances)
+    # Polaris should be near the top (within a few degrees of az=0,
+    # el=34) — assert it's in the returned set.
+    names = {e["name"] for e in visible}
+    assert "Polaris" in names
+
+
+def test_celestial_targets_400_on_non_numeric_min_el(monkeypatch):
+    _patch_for_celestial(monkeypatch)
+    req = _CelestialReq(params={"min_el": "abc"})
+    resp = _CelestialResp()
+    front_app.CalibrationCelestialTargetsResource.on_get(
+        req,
+        resp,
+        telescope_id=1,
+    )
+    assert "400" in str(resp.status)
+    err = json.loads(resp.text)["error"]
+    assert "min_el" in err and "numeric" in err
+
+
+def test_celestial_targets_400_on_non_integer_top_n(monkeypatch):
+    _patch_for_celestial(monkeypatch)
+    req = _CelestialReq(params={"top_n": "ten"})
+    resp = _CelestialResp()
+    front_app.CalibrationCelestialTargetsResource.on_get(
+        req,
+        resp,
+        telescope_id=1,
+    )
+    assert "400" in str(resp.status)
+
+
+def test_celestial_targets_400_on_partial_pointing(monkeypatch):
+    """current_az without current_el (or vice-versa) is a programming
+    error in the caller — reject loudly so the picker doesn't silently
+    fall back to magnitude sort and confuse the operator."""
+    _patch_for_celestial(monkeypatch)
+    req = _CelestialReq(params={"current_az": "180.0"})
+    resp = _CelestialResp()
+    front_app.CalibrationCelestialTargetsResource.on_get(
+        req,
+        resp,
+        telescope_id=1,
+    )
+    assert "400" in str(resp.status)
+    assert "together" in json.loads(resp.text)["error"]
+
+
+def test_celestial_targets_503_on_gps_failure(monkeypatch):
+    """When the Alpaca GPS call fails, the resource must surface a 503
+    rather than crash. Mirrors the FAA-targets behaviour."""
+    from device.config import Config
+
+    monkeypatch.setattr(Config, "port", 5555)
+
+    class FakeAlpaca:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr("device.alpaca_client.AlpacaClient", FakeAlpaca)
+
+    def _raise(_cli):
+        raise RuntimeError("mount disconnected")
+
+    monkeypatch.setattr(
+        "scripts.trajectory.observer.fetch_telescope_lonlat",
+        _raise,
+    )
+
+    req = _CelestialReq()
+    resp = _CelestialResp()
+    front_app.CalibrationCelestialTargetsResource.on_get(
+        req,
+        resp,
+        telescope_id=1,
+    )
+    assert "503" in str(resp.status)
+    err = json.loads(resp.text)["error"]
+    assert "GPS unavailable" in err
+
+
+def test_celestial_targets_response_schema(monkeypatch):
+    """Each entry has the keys the frontend renders. Schema check
+    catches accidental rename/removal."""
+    _patch_for_celestial(monkeypatch)
+    req = _CelestialReq()
+    resp = _CelestialResp()
+    front_app.CalibrationCelestialTargetsResource.on_get(
+        req,
+        resp,
+        telescope_id=1,
+    )
+    assert "200" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert payload["visible"], "expected at least one visible target"
+    expected_keys = {
+        "name",
+        "kind",
+        "bayer",
+        "vmag",
+        "ra_hours",
+        "dec_deg",
+        "az_deg",
+        "el_deg",
+        "sun_sep_deg",
+        "moon_sep_deg",
+        "distance_deg",
+        "notes",
+    }
+    for entry in payload["visible"]:
+        assert expected_keys.issubset(entry.keys()), entry
+        # Units sanity.
+        assert 0.0 <= entry["az_deg"] < 360.0
+        assert 20.0 <= entry["el_deg"] <= 90.0
+        assert -2.0 <= entry["vmag"] <= 4.0
+        assert entry["sun_sep_deg"] >= 30.0  # default sun-cone cut
