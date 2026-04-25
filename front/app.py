@@ -4094,8 +4094,11 @@ class VelocityControllerResource:
     def on_get(req, resp, telescope_id=1):
         context = get_context(telescope_id, req)
         render_template(
-            req, resp, "velocity_controller.html",
-            telescope_id=telescope_id, **context,
+            req,
+            resp,
+            "velocity_controller.html",
+            telescope_id=telescope_id,
+            **context,
         )
 
 
@@ -4118,12 +4121,16 @@ class VelocityControllerLiveResource:
                 if not (isinstance(coords, list) and len(coords) >= 2):
                     resp.status = falcon.HTTP_200
                     resp.content_type = "application/json"
-                    resp.text = json.dumps({"error": "unexpected", "raw": str(result)[:200]})
+                    resp.text = json.dumps(
+                        {"error": "unexpected", "raw": str(result)[:200]}
+                    )
                     return
             else:
                 resp.status = falcon.HTTP_200
                 resp.content_type = "application/json"
-                resp.text = json.dumps({"error": "unexpected", "raw": str(result)[:200]})
+                resp.text = json.dumps(
+                    {"error": "unexpected", "raw": str(result)[:200]}
+                )
                 return
             payload = {"alt_deg": float(coords[0]), "az_deg": float(coords[1])}
             # Read the latest trajectory setpoint from the most recent
@@ -4315,8 +4322,11 @@ class LiveTrackerResource:
             pass
         context = get_context(telescope_id, req)
         render_template(
-            req, resp, "live_tracker.html",
-            telescope_id=telescope_id, **context,
+            req,
+            resp,
+            "live_tracker.html",
+            telescope_id=telescope_id,
+            **context,
         )
 
 
@@ -4382,10 +4392,12 @@ class LiveTrackerTargetsResource:
         ]
         resp.status = falcon.HTTP_200
         resp.content_type = "application/json"
-        resp.text = json.dumps({
-            "live": catalog.list_live(),
-            "cached": cached,
-        })
+        resp.text = json.dumps(
+            {
+                "live": catalog.list_live(),
+                "cached": cached,
+            }
+        )
 
 
 class LiveTrackerStatusResource:
@@ -4516,8 +4528,11 @@ class LiveTrackerOffsetsResource:
             resp.text = json.dumps({"error": "request body must be a JSON object"})
             return
         allowed = {
-            "time_offset_s", "az_bias_deg", "el_bias_deg",
-            "along_deg", "cross_deg",
+            "time_offset_s",
+            "az_bias_deg",
+            "el_bias_deg",
+            "along_deg",
+            "cross_deg",
         }
         patch = {k: body[k] for k in allowed if k in body}
         # AtomicOffsets.set() calls float() + a NaN-aware clamp; both can
@@ -4658,8 +4673,11 @@ class CalibrateRotationResource:
     def on_get(req, resp, telescope_id=1):
         context = get_context(telescope_id, req)
         render_template(
-            req, resp, "calibrate_rotation.html",
-            telescope_id=telescope_id, **context,
+            req,
+            resp,
+            "calibrate_rotation.html",
+            telescope_id=telescope_id,
+            **context,
         )
 
 
@@ -4704,7 +4722,8 @@ class CalibrationPriorResource:
                 "observer_alt_m": prior.observer_alt_m,
                 "calibrated_at": (
                     prior.calibrated_at.isoformat()
-                    if prior.calibrated_at is not None else None
+                    if prior.calibrated_at is not None
+                    else None
                 ),
             }
         resp.status = falcon.HTTP_200
@@ -4750,7 +4769,9 @@ class CalibrationTargetsResource:
             return
         site = build_site(lat_deg=lat, lon_deg=lon, alt_m=alt_m)
         defaults = filter_visible(
-            list(DEFAULT_LANDMARKS), site, min_el_deg=0.3,
+            list(DEFAULT_LANDMARKS),
+            site,
+            min_el_deg=0.3,
         )
         dof = []
         if len(defaults) < 2:
@@ -4765,39 +4786,46 @@ class CalibrationTargetsResource:
             for lm, az, el, slant in entries:
                 h_ft, v_ft = faa_accuracy_ft(lm.accuracy_class)
                 sigma_az, sigma_el = pointing_uncertainty_deg(
-                    slant, h_ft, v_ft,
+                    slant,
+                    h_ft,
+                    v_ft,
                 )
-                out.append({
-                    "oas": lm.oas,
-                    "name": lm.name,
-                    "lat_deg": lm.lat_deg,
-                    "lon_deg": lm.lon_deg,
-                    "height_amsl_m": lm.height_amsl_m,
-                    "lit": bool(lm.lit),
-                    "accuracy_class": lm.accuracy_class,
-                    "obstacle_type": lm.obstacle_type,
-                    "city": lm.city,
-                    "true_az_deg": float(az),
-                    "true_el_deg": float(el),
-                    "slant_m": float(slant),
-                    "aiming_hint": aiming_hint(lm),
-                    "sigma_az_deg": _nan_to_none(sigma_az),
-                    "sigma_el_deg": _nan_to_none(sigma_el),
-                })
+                out.append(
+                    {
+                        "oas": lm.oas,
+                        "name": lm.name,
+                        "lat_deg": lm.lat_deg,
+                        "lon_deg": lm.lon_deg,
+                        "height_amsl_m": lm.height_amsl_m,
+                        "lit": bool(lm.lit),
+                        "accuracy_class": lm.accuracy_class,
+                        "obstacle_type": lm.obstacle_type,
+                        "city": lm.city,
+                        "true_az_deg": float(az),
+                        "true_el_deg": float(el),
+                        "slant_m": float(slant),
+                        "aiming_hint": aiming_hint(lm),
+                        "sigma_az_deg": _nan_to_none(sigma_az),
+                        "sigma_el_deg": _nan_to_none(sigma_el),
+                    }
+                )
             return out
 
         resp.status = falcon.HTTP_200
         resp.content_type = "application/json"
-        resp.text = json.dumps({
-            "defaults": _as_dict(defaults),
-            "dof_fallback": _as_dict(dof),
-            "observer": {"lat_deg": lat, "lon_deg": lon, "alt_m": alt_m},
-        })
+        resp.text = json.dumps(
+            {
+                "defaults": _as_dict(defaults),
+                "dof_fallback": _as_dict(dof),
+                "observer": {"lat_deg": lat, "lon_deg": lon, "alt_m": alt_m},
+            }
+        )
 
 
 def _nan_to_none(x):
     """JSON doesn't encode NaN; map to null for clean UI handling."""
     import math as _m
+
     return None if x is None or not _m.isfinite(x) else float(x)
 
 
@@ -4846,8 +4874,7 @@ class CalibrationStartResource:
         dry_run = bool(body.get("dry_run", False))
         target_oas = body.get("target_oas")
         if target_oas is not None and not (
-            isinstance(target_oas, list)
-            and all(isinstance(x, str) for x in target_oas)
+            isinstance(target_oas, list) and all(isinstance(x, str) for x in target_oas)
         ):
             resp.status = falcon.HTTP_400
             resp.content_type = "application/json"
@@ -4882,13 +4909,16 @@ class CalibrationStartResource:
             if _CALIBRATION_JSON_PATH.exists():
                 try:
                     prior_frame = MountFrame.from_calibration_json(
-                        _CALIBRATION_JSON_PATH, site=site,
+                        _CALIBRATION_JSON_PATH,
+                        site=site,
                     )
                 except Exception:
                     prior_frame = None
 
         default_hits = filter_visible(
-            list(DEFAULT_LANDMARKS), site, min_el_deg=0.3,
+            list(DEFAULT_LANDMARKS),
+            site,
+            min_el_deg=0.3,
         )
         pool = list(default_hits)
         if len(pool) < 2 or target_oas:
@@ -4913,11 +4943,13 @@ class CalibrationStartResource:
                 if missing:
                     resp.status = falcon.HTTP_400
                     resp.content_type = "application/json"
-                    resp.text = json.dumps({
-                        "error": f"landmarks not visible or not found: "
-                                 f"{sorted(missing)}",
-                        "dof_fetch_error": dof_err,
-                    })
+                    resp.text = json.dumps(
+                        {
+                            "error": f"landmarks not visible or not found: "
+                            f"{sorted(missing)}",
+                            "dof_fetch_error": dof_err,
+                        }
+                    )
                     return
                 targets = chosen
             else:
@@ -4928,14 +4960,17 @@ class CalibrationStartResource:
         if len(targets) < 2:
             resp.status = falcon.HTTP_400
             resp.content_type = "application/json"
-            resp.text = json.dumps({
-                "error": "need at least 2 visible landmarks to calibrate",
-            })
+            resp.text = json.dumps(
+                {
+                    "error": "need at least 2 visible landmarks to calibrate",
+                }
+            )
             return
 
         session = CalibrationSession(
             telescope_id=int(telescope_id),
-            targets=targets, site=site,
+            targets=targets,
+            site=site,
             out_path=_CALIBRATION_JSON_PATH,
             prior_frame=prior_frame,
             dry_run=dry_run,
@@ -4960,6 +4995,7 @@ class CalibrationStatusResource:
     @staticmethod
     def on_get(req, resp, telescope_id=1):
         from device.rotation_calibration import get_calibration_manager
+
         status = get_calibration_manager().status(int(telescope_id))
         resp.status = falcon.HTTP_200
         resp.content_type = "application/json"
@@ -4970,6 +5006,7 @@ def _calibration_post_command(req, resp, telescope_id, cmd_name, apply_fn):
     """Shared body for the thin command POST endpoints (sight / skip /
     commit / cancel). ``apply_fn(session)`` runs the session method."""
     from device.rotation_calibration import get_calibration_manager
+
     session = get_calibration_manager().get(int(telescope_id))
     if session is None or not session.is_alive():
         resp.status = falcon.HTTP_404
@@ -4986,9 +5023,7 @@ def _calibration_post_command(req, resp, telescope_id, cmd_name, apply_fn):
     resp.status = falcon.HTTP_200
     resp.content_type = "application/json"
     resp.text = json.dumps(
-        _calibration_status_dict(
-            get_calibration_manager().status(int(telescope_id))
-        )
+        _calibration_status_dict(get_calibration_manager().status(int(telescope_id)))
     )
 
 
@@ -5013,7 +5048,10 @@ class CalibrationNudgeResource:
             resp.text = json.dumps({"error": "d_az / d_el must be numeric"})
             return
         _calibration_post_command(
-            req, resp, telescope_id, "nudge",
+            req,
+            resp,
+            telescope_id,
+            "nudge",
             lambda s: s.nudge(d_az, d_el),
         )
 
@@ -5022,7 +5060,11 @@ class CalibrationSightResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
         _calibration_post_command(
-            req, resp, telescope_id, "sight", lambda s: s.sight(),
+            req,
+            resp,
+            telescope_id,
+            "sight",
+            lambda s: s.sight(),
         )
 
 
@@ -5030,7 +5072,11 @@ class CalibrationSkipResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
         _calibration_post_command(
-            req, resp, telescope_id, "skip", lambda s: s.skip(),
+            req,
+            resp,
+            telescope_id,
+            "skip",
+            lambda s: s.skip(),
         )
 
 
@@ -5038,7 +5084,11 @@ class CalibrationCommitResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
         _calibration_post_command(
-            req, resp, telescope_id, "commit", lambda s: s.commit(),
+            req,
+            resp,
+            telescope_id,
+            "commit",
+            lambda s: s.commit(),
         )
 
 
@@ -5046,7 +5096,11 @@ class CalibrationCancelResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
         _calibration_post_command(
-            req, resp, telescope_id, "cancel", lambda s: s.cancel(),
+            req,
+            resp,
+            telescope_id,
+            "cancel",
+            lambda s: s.cancel(),
         )
 
 

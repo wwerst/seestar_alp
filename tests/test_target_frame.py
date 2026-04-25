@@ -92,7 +92,9 @@ def test_pure_yaw_rotates_az():
     ecef = lla_to_ecef(lat, lon, site.alt_m)
     az_id, _el_id, _ = mf_id.ecef_to_mount_azel(ecef)
     az_y, _el_y, _ = mf_yaw.ecef_to_mount_azel(ecef)
-    assert az_id == pytest.approx(0.0, abs=0.1) or az_id == pytest.approx(360.0, abs=0.1)
+    assert az_id == pytest.approx(0.0, abs=0.1) or az_id == pytest.approx(
+        360.0, abs=0.1
+    )
     # az_y should differ from az_id by approximately −30° (modulo 360).
     delta = ((az_y - az_id + 180.0) % 360.0) - 180.0
     assert delta == pytest.approx(-30.0, abs=0.2)
@@ -165,7 +167,9 @@ def test_origin_offset_shifts_target_azel():
     east_ecef = site.enu_rotation[0]  # unit ECEF vector pointing east
     offset = 10.0 * east_ecef
     mf_shift = MountFrame.from_euler_deg(
-        yaw_deg=0.0, pitch_deg=0.0, roll_deg=0.0,
+        yaw_deg=0.0,
+        pitch_deg=0.0,
+        roll_deg=0.0,
         origin_offset_ecef_m=offset,
     )
     # Target ~1000 m due east of the *nominal* site.
@@ -211,6 +215,7 @@ def test_from_calibration_json_honors_embedded_observer(tmp_path):
 def test_from_calibration_json_explicit_site_wins_over_embedded(tmp_path):
     """Caller-supplied `site` overrides the embedded observer block."""
     from scripts.trajectory.observer import build_site
+
     cal = {
         "yaw_offset_deg": 0.0,
         "observer": {"lat_deg": 35.0, "lon_deg": -120.0, "alt_m": 500.0},

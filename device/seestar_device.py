@@ -499,7 +499,9 @@ class Seestar:
                     if "jsonrpc" in parsed_data:
                         # {"jsonrpc":"2.0","Timestamp":"9507.244805160","method":"scope_get_equ_coord","result":{"ra":17.093056,"dec":34.349722},"code":0,"id":83}
                         if parsed_data.get("method") != "scope_get_equ_coord":
-                            self.logger.info(f"[{self.device_name}] scope recv: {parsed_data}")
+                            self.logger.info(
+                                f"[{self.device_name}] scope recv: {parsed_data}"
+                            )
                         if parsed_data["method"] == "scope_get_equ_coord":
                             self.update_equ_coord(parsed_data)
                         if parsed_data["method"] == "get_view_state":
@@ -874,16 +876,22 @@ class Seestar:
         # rely on the SunSafetyMonitor as the runtime backstop.
         try:
             from astropy.time import Time as _AstropyTime
+
             alt_az = self.get_altaz_from_eq(in_ra, in_dec, _AstropyTime.now())
             alt_deg = float(alt_az[0])
             az_deg = float(alt_az[1])
             if abs(alt_deg) < 91.0:  # 9999.9 sentinel means the frame wasn't ready
                 from device.sun_safety import is_sun_safe as _is_sun_safe
+
                 sun_safe, sun_reason = _is_sun_safe(az_deg % 360.0, alt_deg)
                 if not sun_safe:
                     self.logger.warning(
                         "scope_goto refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): %s",
-                        in_ra, in_dec, az_deg, alt_deg, sun_reason,
+                        in_ra,
+                        in_dec,
+                        az_deg,
+                        alt_deg,
+                        sun_reason,
                     )
                     return False
         except Exception as exc:

@@ -55,7 +55,7 @@ V_CORR_MAX_DEGS = 2.0
 # this keeps a dead controller from driving the mount into a limit.
 TICK_CMD_DUR_S = 1
 STALE_TOLERANCE_TICKS = 4  # consecutive stale samples that force exit
-MAX_DURATION_S = 900.0      # 15 min hard cap
+MAX_DURATION_S = 900.0  # 15 min hard cap
 # Threshold below which the instantaneous track heading is considered
 # ill-defined (geostationary-like target). ψ freezes at the last good value
 # and along/cross offsets stop updating until |v| rises again.
@@ -78,6 +78,7 @@ class OffsetSnapshot:
       the instantaneous track heading (ψ). "Along +" points in the
       direction of motion; "Cross +" is 90° CCW of Along+.
     """
+
     time_offset_s: float = 0.0
     az_bias_deg: float = 0.0
     el_bias_deg: float = 0.0
@@ -93,12 +94,13 @@ class TickInfo:
     """Summary of one tick, passed to an optional tick_callback so callers
     (e.g. a web session wrapper) can expose live status without re-deriving
     quantities the loop already computed."""
+
     tick: int
     t_wall: float
-    heading_deg: float               # ψ (EWMA) in degrees, wrapped to [0, 360)
-    heading_locked: bool             # True when ψ was frozen (|v|<v_min)
-    d_az_deg: float                  # total az bias applied this tick
-    d_el_deg: float                  # total el bias applied this tick
+    heading_deg: float  # ψ (EWMA) in degrees, wrapped to [0, 360)
+    heading_locked: bool  # True when ψ was frozen (|v|<v_min)
+    d_az_deg: float  # total az bias applied this tick
+    d_el_deg: float  # total el bias applied this tick
     eff_ref_az_cum_deg: float
     eff_ref_el_deg: float
     cur_cum_az_deg: float
@@ -110,8 +112,8 @@ class TickInfo:
 
 @dataclass
 class TrackResult:
-    ok: bool                         # True if exited cleanly on end-of-provider or stop signal
-    exit_reason: str                 # "end_of_track", "stop_signal", "cable_wrap", "stale", "timeout", "mount_error"
+    ok: bool  # True if exited cleanly on end-of-provider or stop signal
+    exit_reason: str  # "end_of_track", "stop_signal", "cable_wrap", "stale", "timeout", "mount_error"
     ticks: int
     elapsed_s: float
     az_err_rms: float
@@ -138,7 +140,7 @@ class PreCheckResult:
     max_el_deg: float
     cable_wrap_violations: int
     el_limit_violations: int
-    v_saturation_ticks: int          # ticks where |v_ref + tau·a_ref| > v_max
+    v_saturation_ticks: int  # ticks where |v_ref + tau·a_ref| > v_max
     notes: list[str] = field(default_factory=list)
 
 
@@ -197,9 +199,7 @@ def pre_check(
 
     v_ff_az = v_az + tau_s * a_az
     v_ff_el = v_el + tau_s * a_el
-    sat = int(np.count_nonzero(
-        (np.abs(v_ff_az) > v_max) | (np.abs(v_ff_el) > v_max)
-    ))
+    sat = int(np.count_nonzero((np.abs(v_ff_az) > v_max) | (np.abs(v_ff_el) > v_max)))
 
     notes: list[str] = []
     if cable_violations:
@@ -278,16 +278,24 @@ def track(
 
     # Measure initial position so cumulative-az tracker is anchored.
     try:
-        alt0, az0_wrapped, _fw_t0 = measure_altaz_timed(cli, EarthLocation.from_geodetic(0, 0, 0))
+        alt0, az0_wrapped, _fw_t0 = measure_altaz_timed(
+            cli, EarthLocation.from_geodetic(0, 0, 0)
+        )
     except Exception as exc:
         _uninstall_sigint_handler(sigint_handler)
         return TrackResult(
-            ok=False, exit_reason="mount_error",
-            ticks=0, elapsed_s=0.0,
-            az_err_rms=0.0, az_err_peak=0.0,
-            el_err_rms=0.0, el_err_peak=0.0,
-            sat_az_ticks=0, sat_el_ticks=0,
-            final_cum_az_deg=0.0, final_el_deg=0.0,
+            ok=False,
+            exit_reason="mount_error",
+            ticks=0,
+            elapsed_s=0.0,
+            az_err_rms=0.0,
+            az_err_peak=0.0,
+            el_err_rms=0.0,
+            el_err_peak=0.0,
+            sat_az_ticks=0,
+            sat_el_ticks=0,
+            final_cum_az_deg=0.0,
+            final_el_deg=0.0,
             errors=[f"initial measure_altaz_timed failed: {exc}"],
         )
     if az_tracker is None:
@@ -302,8 +310,16 @@ def track(
         if stop_signal.is_set():
             _uninstall_sigint_handler(sigint_handler)
             return _build_result(
-                "stop_signal", 0, time.monotonic() - t0_wall,
-                [], [], 0, 0, cur_cum_az, cur_el, errors,
+                "stop_signal",
+                0,
+                time.monotonic() - t0_wall,
+                [],
+                [],
+                0,
+                0,
+                cur_cum_az,
+                cur_el,
+                errors,
             )
         if now + latency_s >= prov_t0:
             break
@@ -326,12 +342,18 @@ def track(
     except ValueError as exc:
         _uninstall_sigint_handler(sigint_handler)
         return TrackResult(
-            ok=False, exit_reason="mount_error",
-            ticks=0, elapsed_s=time.monotonic() - t0_wall,
-            az_err_rms=0.0, az_err_peak=0.0,
-            el_err_rms=0.0, el_err_peak=0.0,
-            sat_az_ticks=0, sat_el_ticks=0,
-            final_cum_az_deg=cur_cum_az, final_el_deg=cur_el,
+            ok=False,
+            exit_reason="mount_error",
+            ticks=0,
+            elapsed_s=time.monotonic() - t0_wall,
+            az_err_rms=0.0,
+            az_err_peak=0.0,
+            el_err_rms=0.0,
+            el_err_peak=0.0,
+            sat_az_ticks=0,
+            sat_el_ticks=0,
+            final_cum_az_deg=cur_cum_az,
+            final_el_deg=cur_el,
             errors=[f"anchor sample failed: {exc}"],
         )
     az_offset = cur_cum_az - ref_anchor.az_cum_deg
@@ -407,7 +429,8 @@ def track(
             # 1. Measure.
             try:
                 alt, az_wrapped, _fw_t = measure_altaz_timed(
-                    cli, EarthLocation.from_geodetic(0, 0, 0),
+                    cli,
+                    EarthLocation.from_geodetic(0, 0, 0),
                 )
             except Exception as exc:
                 errors.append(f"measure_altaz_timed failed: {exc}")
@@ -433,9 +456,7 @@ def track(
                 stale_streak += 1
                 if stale_streak >= stale_tolerance_ticks:
                     exit_reason = "stale"
-                    errors.append(
-                        f"{stale_streak} consecutive stale samples; exiting"
-                    )
+                    errors.append(f"{stale_streak} consecutive stale samples; exiting")
                     break
             else:
                 stale_streak = 0
@@ -505,7 +526,8 @@ def track(
             #     into the cone mid-run so we abort before the mount
             #     commits to the slew.
             sun_safe, sun_reason = _is_sun_safe(
-                ref.az_cum_deg % 360.0, float(ref.el_deg),
+                ref.az_cum_deg % 360.0,
+                float(ref.el_deg),
             )
             if not sun_safe:
                 exit_reason = "sun_avoidance"
@@ -516,9 +538,9 @@ def track(
             v_mag = float(np.hypot(v_cmd_az, v_cmd_el))
             speed = int(round(v_mag * SPEED_PER_DEG_PER_SEC))
             if v_mag > 1e-6:
-                angle = int(round(
-                    (np.degrees(np.arctan2(v_cmd_el, v_cmd_az)) + 360.0) % 360.0
-                ))
+                angle = int(
+                    round((np.degrees(np.arctan2(v_cmd_el, v_cmd_az)) + 360.0) % 360.0)
+                )
             else:
                 angle = 0
                 speed = 0
@@ -548,13 +570,20 @@ def track(
                     ref_v_el=ref.v_el_degs,
                     ref_a_az=ref.a_az_degs2,
                     ref_a_el=ref.a_el_degs2,
-                    v_ff_az=v_ff_az, v_ff_el=v_ff_el,
-                    v_corr_az=v_corr_az, v_corr_el=v_corr_el,
-                    v_cmd_az=v_cmd_az, v_cmd_el=v_cmd_el,
-                    cmd_speed=speed, cmd_angle=angle,
-                    cur_cum_az=cur_cum_az, cur_el=cur_el,
-                    err_az=err_az, err_el=err_el,
-                    stale=ref.stale, extrapolated=ref.extrapolated,
+                    v_ff_az=v_ff_az,
+                    v_ff_el=v_ff_el,
+                    v_corr_az=v_corr_az,
+                    v_corr_el=v_corr_el,
+                    v_cmd_az=v_cmd_az,
+                    v_cmd_el=v_cmd_el,
+                    cmd_speed=speed,
+                    cmd_angle=angle,
+                    cur_cum_az=cur_cum_az,
+                    cur_el=cur_el,
+                    err_az=err_az,
+                    err_el=err_el,
+                    stale=ref.stale,
+                    extrapolated=ref.extrapolated,
                     dry_run=dry_run,
                 )
 
@@ -614,9 +643,16 @@ def track(
         _uninstall_sigint_handler(sigint_handler)
 
     return _build_result(
-        exit_reason, ticks, time.monotonic() - t0_wall,
-        az_errs, el_errs, sat_az, sat_el,
-        cur_cum_az, cur_el, errors,
+        exit_reason,
+        ticks,
+        time.monotonic() - t0_wall,
+        az_errs,
+        el_errs,
+        sat_az,
+        sat_el,
+        cur_cum_az,
+        cur_el,
+        errors,
     )
 
 
@@ -632,29 +668,40 @@ def _clip_scalar(x: float, lo: float, hi: float) -> float:
 
 
 def _build_result(
-    exit_reason: str, ticks: int, elapsed_s: float,
-    az_errs: list[float], el_errs: list[float],
-    sat_az: int, sat_el: int,
-    final_cum_az: float, final_el: float,
+    exit_reason: str,
+    ticks: int,
+    elapsed_s: float,
+    az_errs: list[float],
+    el_errs: list[float],
+    sat_az: int,
+    sat_el: int,
+    final_cum_az: float,
+    final_el: float,
     errors: list[str],
 ) -> TrackResult:
     if az_errs:
         az_arr = np.asarray(az_errs, dtype=float)
         el_arr = np.asarray(el_errs, dtype=float)
-        az_rms = float(np.sqrt(np.mean(az_arr ** 2)))
-        el_rms = float(np.sqrt(np.mean(el_arr ** 2)))
+        az_rms = float(np.sqrt(np.mean(az_arr**2)))
+        el_rms = float(np.sqrt(np.mean(el_arr**2)))
         az_peak = float(np.max(np.abs(az_arr)))
         el_peak = float(np.max(np.abs(el_arr)))
     else:
         az_rms = el_rms = az_peak = el_peak = 0.0
     ok = exit_reason in ("end_of_track", "stop_signal")
     return TrackResult(
-        ok=ok, exit_reason=exit_reason,
-        ticks=ticks, elapsed_s=elapsed_s,
-        az_err_rms=az_rms, az_err_peak=az_peak,
-        el_err_rms=el_rms, el_err_peak=el_peak,
-        sat_az_ticks=sat_az, sat_el_ticks=sat_el,
-        final_cum_az_deg=final_cum_az, final_el_deg=final_el,
+        ok=ok,
+        exit_reason=exit_reason,
+        ticks=ticks,
+        elapsed_s=elapsed_s,
+        az_err_rms=az_rms,
+        az_err_peak=az_peak,
+        el_err_rms=el_rms,
+        el_err_peak=el_peak,
+        sat_az_ticks=sat_az,
+        sat_el_ticks=sat_el,
+        final_cum_az_deg=final_cum_az,
+        final_el_deg=final_el,
         errors=errors,
     )
 

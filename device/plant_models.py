@@ -37,21 +37,23 @@ def cmd_speed_to_degs(cmd_speed: int, angle: int) -> float:
 
 @dataclass
 class Segment:
-    ts: np.ndarray            # shape (N,), host-monotonic relative seconds
-                              # (matches cmd_times axis)
-    azs_unwrapped: np.ndarray # shape (N,), cumulative position (deg)
-    cmd_degs: np.ndarray      # shape (N,), commanded signed velocity deg/s
+    ts: np.ndarray  # shape (N,), host-monotonic relative seconds
+    # (matches cmd_times axis)
+    azs_unwrapped: np.ndarray  # shape (N,), cumulative position (deg)
+    cmd_degs: np.ndarray  # shape (N,), commanded signed velocity deg/s
     motor_active: np.ndarray  # shape (N,), 1.0 while any commanded burst active
-    speed: int                # firmware speed (informational)
-    angle: int                # firmware angle (informational)
+    speed: int  # firmware speed (informational)
+    angle: int  # firmware angle (informational)
     fw_ts: Optional[np.ndarray] = None  # shape (N,), firmware uptime (s).
-                                        # When present, use for dt between
-                                        # consecutive samples (jitter-free).
+    # When present, use for dt between
+    # consecutive samples (jitter-free).
 
 
 def samples_to_segment(
     samples: list,
-    speed: int, angle: int, cmd_times: list[tuple[float, int, int, int]],
+    speed: int,
+    angle: int,
+    cmd_times: list[tuple[float, int, int, int]],
 ) -> Segment:
     """Convert raw position samples into a Segment.
 
@@ -87,15 +89,14 @@ def samples_to_segment(
 
     use_fw = bool(fw_ts_raw) and all(ft is not None for ft in fw_ts_raw)
     fw_ts_arr = (
-        np.asarray([float(ft) for ft in fw_ts_raw], dtype=float)
-        if use_fw else None
+        np.asarray([float(ft) for ft in fw_ts_raw], dtype=float) if use_fw else None
     )
 
     cmd_degs = np.zeros(len(samples))
     for i, t in enumerate(ts_list):
         # Which cmd (if any) is active at t?
         active_cmd = None
-        for (t_c, s, a, d) in cmd_times:
+        for t_c, s, a, d in cmd_times:
             if t_c <= t <= t_c + d:
                 active_cmd = (s, a)
         if active_cmd is not None:
@@ -204,7 +205,8 @@ class FirstOrderLagModel:
             return total_sq / max(n, 1)
 
         result = minimize(
-            unroll_all, x0=[0.8, 1.0],
+            unroll_all,
+            x0=[0.8, 1.0],
             bounds=[(0.05, 5.0), (0.5, 1.5)],
             method="L-BFGS-B",
         )
@@ -239,8 +241,9 @@ class FirstOrderRateLimitedModel:
         self.k_dc: float = 1.0
         self.a_max: float = 10.0
 
-    def _step(self, v: float, v_cmd: float, dt: float,
-              tau: float, k_dc: float, a_max: float) -> float:
+    def _step(
+        self, v: float, v_cmd: float, dt: float, tau: float, k_dc: float, a_max: float
+    ) -> float:
         target = k_dc * v_cmd
         err = target - v
         if tau > 1e-3:
@@ -273,12 +276,15 @@ class FirstOrderRateLimitedModel:
             return total_sq / max(n, 1)
 
         result = minimize(
-            unroll_all, x0=[0.3, 1.0, 10.0],
+            unroll_all,
+            x0=[0.3, 1.0, 10.0],
             bounds=[(0.05, 5.0), (0.5, 1.5), (1.0, 50.0)],
             method="L-BFGS-B",
         )
         self.tau, self.k_dc, self.a_max = (
-            float(result.x[0]), float(result.x[1]), float(result.x[2]),
+            float(result.x[0]),
+            float(result.x[1]),
+            float(result.x[2]),
         )
 
     def predict_rate(self, v_now: float, v_cmd: float, dt: float) -> float:
@@ -295,7 +301,9 @@ class FirstOrderRateLimitedModel:
     def params_dict(self) -> dict:
         return {
             "kind": "first_order_rate_limited",
-            "tau_s": self.tau, "k_dc": self.k_dc, "a_max_degs2": self.a_max,
+            "tau_s": self.tau,
+            "k_dc": self.k_dc,
+            "a_max_degs2": self.a_max,
         }
 
 
@@ -332,12 +340,15 @@ class AsymmetricFirstOrderModel:
             return total_sq / max(n, 1)
 
         result = minimize(
-            unroll_all, x0=[0.5, 0.8, 1.0],
+            unroll_all,
+            x0=[0.5, 0.8, 1.0],
             bounds=[(0.05, 5.0), (0.05, 5.0), (0.5, 1.5)],
             method="L-BFGS-B",
         )
         self.tau_accel, self.tau_decel, self.k_dc = (
-            float(result.x[0]), float(result.x[1]), float(result.x[2]),
+            float(result.x[0]),
+            float(result.x[1]),
+            float(result.x[2]),
         )
 
     def predict_rate(self, v_now, v_cmd, dt):
@@ -354,7 +365,8 @@ class AsymmetricFirstOrderModel:
     def params_dict(self) -> dict:
         return {
             "kind": "asymmetric_first_order",
-            "tau_accel_s": self.tau_accel, "tau_decel_s": self.tau_decel,
+            "tau_accel_s": self.tau_accel,
+            "tau_decel_s": self.tau_decel,
             "k_dc": self.k_dc,
         }
 

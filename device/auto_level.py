@@ -222,7 +222,7 @@ def _fit_joint(
     # both cases correctly.
     dof = max(len(rhs) - 4, 1)
     residual_w = design_w @ params - rhs_w
-    sigma2 = float(np.sum(residual_w ** 2) / dof)
+    sigma2 = float(np.sum(residual_w**2) / dof)
     # Regularize against near-singular designs (e.g., < 4 distinct azimuths).
     try:
         cov = sigma2 * np.linalg.inv(design_w.T @ design_w)
@@ -232,7 +232,9 @@ def _fit_joint(
 
 
 def _propagate_uncertainty_ab_to_Aphi(
-    a: float, b: float, cov: np.ndarray,
+    a: float,
+    b: float,
+    cov: np.ndarray,
 ) -> tuple[float, float]:
     """Propagate (a, b) covariance to 1σ on A=hypot(a,b) and φ=atan2(b,a).
 
@@ -340,8 +342,7 @@ def fit_auto_level(
     tilt_deg = math.degrees(amplitude / mean_z)
     tilt_deg_std = math.degrees(sigma_A / mean_z) if math.isfinite(sigma_A) else None
     tilt_az_std_deg = (
-        math.degrees(sigma_phi_rad)
-        if math.isfinite(sigma_phi_rad) else None
+        math.degrees(sigma_phi_rad) if math.isfinite(sigma_phi_rad) else None
     )
 
     # Diagnostic per-axis fits (kept for comparison and back-compat).
@@ -377,15 +378,31 @@ def apply_sign_flip(fit: AutoLevelFit, flip: bool) -> AutoLevelFit:
     tilt_mount_az is already the uphill direction in the world frame
     (after compass-to-mount alignment); True rotates it by 180°.
     """
-    uphill = fit.tilt_mount_az_deg if not flip else _wrap_pm180(fit.tilt_mount_az_deg + 180.0)
+    uphill = (
+        fit.tilt_mount_az_deg
+        if not flip
+        else _wrap_pm180(fit.tilt_mount_az_deg + 180.0)
+    )
     return replace(fit, uphill_world_az_deg=float(uphill))
 
 
 _COMPASS_16 = [
-    "N", "NNE", "NE", "ENE",
-    "E", "ESE", "SE", "SSE",
-    "S", "SSW", "SW", "WSW",
-    "W", "WNW", "NW", "NNW",
+    "N",
+    "NNE",
+    "NE",
+    "ENE",
+    "E",
+    "ESE",
+    "SE",
+    "SSE",
+    "S",
+    "SSW",
+    "SW",
+    "WSW",
+    "W",
+    "WNW",
+    "NW",
+    "NNW",
 ]
 
 
@@ -501,7 +518,9 @@ def save_run(
     tmp.replace(p)
 
 
-def load_run(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]], list[AutoLevelSample]]:
+def load_run(
+    path: str | Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[AutoLevelSample]]:
     """Load a run log, returning (meta, positions, samples).
 
     `samples` is a list of AutoLevelSample aggregated from each position's
@@ -531,6 +550,7 @@ def load_run(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]], li
         ys = [r["y"] for r in reads]
         zs = [r["z"] for r in reads if r.get("z") is not None]
         angles = [r["angle"] for r in reads if r.get("angle") is not None]
+
         # Per-position stdev enables inverse-variance weighting on replay.
         def _std(vals: list[float]) -> float | None:
             if len(vals) < 2:
@@ -538,6 +558,7 @@ def load_run(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]], li
             m = sum(vals) / len(vals)
             var = sum((v - m) ** 2 for v in vals) / (len(vals) - 1)
             return math.sqrt(var)
+
         samples.append(
             AutoLevelSample(
                 azimuth_deg=pos["azimuth_deg"],
@@ -559,6 +580,7 @@ def positions_to_rows(positions: list[dict[str, Any]]) -> list[dict[str, float]]
         reads = pos.get("reads", [])
         if not reads:
             continue
+
         def _stats(key: str) -> tuple[float | None, float | None]:
             vals = [r[key] for r in reads if r.get(key) is not None]
             if not vals:
@@ -568,6 +590,7 @@ def positions_to_rows(positions: list[dict[str, Any]]) -> list[dict[str, float]]
                 var = sum((v - m) ** 2 for v in vals) / (len(vals) - 1)
                 return m, math.sqrt(var)
             return m, None
+
         row: dict[str, Any] = {
             "az": pos["azimuth_deg"],
             "n": len(reads),

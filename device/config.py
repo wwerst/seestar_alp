@@ -236,18 +236,14 @@ class _Config:
         # sun_avoidance Section
         # ---------------
         section = "sun_avoidance"
-        self.sun_avoidance_enabled: bool = self.get_toml(
-            section, "enabled", True
-        )
+        self.sun_avoidance_enabled: bool = self.get_toml(section, "enabled", True)
         self.sun_avoidance_min_sep_deg: float = self.get_toml(
             section, "min_separation_deg", 30.0
         )
         self.sun_avoidance_alt_threshold_deg: float = self.get_toml(
             section, "alt_threshold_deg", -10.0
         )
-        self.sun_avoidance_jog_speed: int = self.get_toml(
-            section, "jog_speed", 1440
-        )
+        self.sun_avoidance_jog_speed: int = self.get_toml(section, "jog_speed", 1440)
         self.sun_avoidance_jog_duration_s: int = self.get_toml(
             section, "jog_duration_s", 3
         )

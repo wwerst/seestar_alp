@@ -46,56 +46,56 @@ from astropy.time import Time
 # Firmware / calibration constants (empirically measured on a Seestar S50)
 # ---------------------------------------------------------------------------
 
-SPEED_PER_DEG_PER_SEC = 237   # rate °/s ≈ speed / 237 (verified ±1% speed 80..1440)
-MIN_DUR_S = 5                 # firmware floor; dur_sec < 5 not used by convention
-DUR_SEC_CAP = 10              # firmware ignores dur_sec > 10
-MAIN_SPEED = 1440             # firmware-clamped max speed
-MAIN_RATE_DEGS = 6.0          # ~6.09 °/s at speed=1440 (10 s burst avg)
-PLAN_MAX_RATE_DEGS = 5.0      # Per-axis planner cap (°/s). 1°/s below the firmware
-                              # clamp (~6°/s at speed=1440) so the feedback loop has
-                              # headroom to add correction velocity without saturating.
+SPEED_PER_DEG_PER_SEC = 237  # rate °/s ≈ speed / 237 (verified ±1% speed 80..1440)
+MIN_DUR_S = 5  # firmware floor; dur_sec < 5 not used by convention
+DUR_SEC_CAP = 10  # firmware ignores dur_sec > 10
+MAIN_SPEED = 1440  # firmware-clamped max speed
+MAIN_RATE_DEGS = 6.0  # ~6.09 °/s at speed=1440 (10 s burst avg)
+PLAN_MAX_RATE_DEGS = 5.0  # Per-axis planner cap (°/s). 1°/s below the firmware
+# clamp (~6°/s at speed=1440) so the feedback loop has
+# headroom to add correction velocity without saturating.
 
 
 # ---------------------------------------------------------------------------
 # Velocity-controller tuning constants
 # ---------------------------------------------------------------------------
 
-VC_LOOP_DT_S = 0.5              # target control-loop period; real dt is HTTP-bound
-VC_CMD_DUR_S = 5                # dur_sec TTL on every scope_speed_move.
-                                # Sized from observed update-to-update p99
-                                # (~2.0s across step_response, controller,
-                                # chirp data) with ~2.5x headroom. Shorter
-                                # than the 10s firmware cap so a controller
-                                # crash commits to at most v_max*5 = 30° of
-                                # uncommanded motion instead of 60°. Still
-                                # above the 5s MIN_DUR_S floor.
-VC_KP = 0.3                     # proportional gain (°/s of rate per ° of error)
-VC_KD = 0.4                     # derivative gain (°/s per (°/s measured rate))
+VC_LOOP_DT_S = 0.5  # target control-loop period; real dt is HTTP-bound
+VC_CMD_DUR_S = 5  # dur_sec TTL on every scope_speed_move.
+# Sized from observed update-to-update p99
+# (~2.0s across step_response, controller,
+# chirp data) with ~2.5x headroom. Shorter
+# than the 10s firmware cap so a controller
+# crash commits to at most v_max*5 = 30° of
+# uncommanded motion instead of 60°. Still
+# above the 5s MIN_DUR_S floor.
+VC_KP = 0.3  # proportional gain (°/s of rate per ° of error)
+VC_KD = 0.4  # derivative gain (°/s per (°/s measured rate))
 VC_MAX_RATE_DEGS = 6.0
-VC_MIN_SPEED = 40               # approach floor. Phase 1 deadband probe shows
-                                # motion at 100% of linear model (speed/237)
-                                # for every tested speed 20..200; the true
-                                # stiction floor is below 20. 40 keeps a safety
-                                # margin without being excessively conservative.
-VC_FINE_MIN_SPEED = 20          # fine-finish floor. Phase 1: speed=20 produces
-                                # +0.085 °/s (matches expected +0.084 within 1%).
+VC_MIN_SPEED = 40  # approach floor. Phase 1 deadband probe shows
+# motion at 100% of linear model (speed/237)
+# for every tested speed 20..200; the true
+# stiction floor is below 20. 40 keeps a safety
+# margin without being excessively conservative.
+VC_FINE_MIN_SPEED = 20  # fine-finish floor. Phase 1: speed=20 produces
+# +0.085 °/s (matches expected +0.084 within 1%).
 VC_FINE_THRESHOLD_FACTOR = 4.0  # use fine floor when |error| <= this × tol
 VC_MAIN_CLOSE_ENOUGH_DEG = 2.0
 VC_STUCK_MIN_S = 2.0
 VC_STUCK_MOVE_FRAC = 0.2
 VC_MAX_HALVINGS = 4
 VC_DEFAULT_TIMEOUT_S = 120
-VC_TAU_S = 0.348                # first-order τ for the plant model. Used by:
-                                # (1) move_azimuth_to_ff / move_elevation_to_ff
-                                #     / move_to_ff for velocity feedforward
-                                #     v_cmd = v_ref + τ·a_ref + FB;
-                                # (2) legacy move_azimuth_to_pd deadbeat
-                                #     predictor.
-                                # Phase 1 fit (fw-timestamped step_response data,
-                                # 20 bursts, trimmed to motor_active window):
-                                # tau=0.348s, k_dc=0.996, train pos-RMSE 0.70°.
-                                # Previous default was 0.8s; the high-τ value
-                                # came from un-trimmed per-burst fits.
+VC_TAU_S = 0.348  # first-order τ for the plant model. Used by:
+# (1) move_azimuth_to_ff / move_elevation_to_ff
+#     / move_to_ff for velocity feedforward
+#     v_cmd = v_ref + τ·a_ref + FB;
+# (2) legacy move_azimuth_to_pd deadbeat
+#     predictor.
+# Phase 1 fit (fw-timestamped step_response data,
+# 20 bursts, trimmed to motor_active window):
+# tau=0.348s, k_dc=0.996, train pos-RMSE 0.70°.
+# Previous default was 0.8s; the high-τ value
+# came from un-trimmed per-burst fits.
 VC_USE_PREDICTOR = True
 
 
@@ -113,6 +113,7 @@ FallbackGotoFn = Callable[[MountClient, float, float, EarthLocation], bool]
 # ---------------------------------------------------------------------------
 # Small utilities
 # ---------------------------------------------------------------------------
+
 
 def wrap_pm180(deg: float) -> float:
     """Wrap an angle in degrees into the half-open interval [-180, +180).
@@ -162,6 +163,7 @@ def speed_move(cli: MountClient, speed: int, angle: int, dur_sec: int) -> None:
     # Lazy import so this module stays importable without the sun_safety
     # module in minimal environments (scripts, unit tests of other parts).
     from device.sun_safety import SunSafetyLocked, sun_safety_is_locked_out
+
     if sun_safety_is_locked_out():
         raise SunSafetyLocked(
             "sun-safety emergency lockout active — speed_move refused"
@@ -173,7 +175,9 @@ def speed_move(cli: MountClient, speed: int, angle: int, dur_sec: int) -> None:
 
 
 def wait_for_mount_idle(
-    cli: MountClient, timeout_s: float, poll_s: float = 0.3,
+    cli: MountClient,
+    timeout_s: float,
+    poll_s: float = 0.3,
 ) -> tuple[bool, float]:
     """Poll mount state until move_type == "none" or timeout.
 
@@ -206,7 +210,8 @@ def measure_altaz(cli: MountClient, loc: EarthLocation) -> tuple[float, float]:
 
 
 def measure_altaz_timed(
-    cli: MountClient, loc: EarthLocation,
+    cli: MountClient,
+    loc: EarthLocation,
 ) -> tuple[float, float, Optional[float]]:
     """Read raw motor-encoder alt/az + firmware timestamp.
 
@@ -233,6 +238,7 @@ def measure_altaz_timed(
         if not isinstance(resp, dict) or "result" not in resp:
             return None, resp
         return resp, resp
+
     resp, raw = _call_once()
     if resp is None:
         time.sleep(0.1)
@@ -272,6 +278,7 @@ def set_tracking(cli: MountClient, enabled: bool) -> None:
 # ---------------------------------------------------------------------------
 # Main control function
 # ---------------------------------------------------------------------------
+
 
 def move_azimuth_to_velocity(
     cli: MountClient,
@@ -346,7 +353,10 @@ def move_azimuth_to_velocity(
         stats["commands_issued"] += 1
         if position_logger is not None:
             position_logger.mark_event(
-                event, speed=speed, angle=angle, dur_sec=VC_CMD_DUR_S,
+                event,
+                speed=speed,
+                angle=angle,
+                dur_sec=VC_CMD_DUR_S,
             )
 
     t0 = time.monotonic()
@@ -411,7 +421,8 @@ def move_azimuth_to_velocity(
                 window_moved = abs(wrap_pm180(measured_az - stuck_since_az))
                 expected = (last_speed / SPEED_PER_DEG_PER_SEC) * window
                 if window >= stuck_min_s and window_moved < max(
-                    0.3, stuck_move_frac * expected,
+                    0.3,
+                    stuck_move_frac * expected,
                 ):
                     if stats["rate_ceiling_halvings"] < max_halvings:
                         new_ceiling = max(
@@ -634,6 +645,7 @@ def move_azimuth_to_ff(
     use_cumulative = az_limits is not None and az_tracker is not None
     if use_cumulative:
         from device.plant_limits import pick_cum_target
+
         p0_plan = az_tracker.cum_az_deg
         p_target_plan = pick_cum_target(
             cum_cur_deg=p0_plan,
@@ -647,16 +659,25 @@ def move_azimuth_to_ff(
 
     if profile == "scurve":
         traj = scurve_profile(
-            p0=p0_plan, v0=0.0, p_target=p_target_plan,
-            v_max=v_max, a_max=a_max, j_max=j_max, tick_dt=tick_dt,
+            p0=p0_plan,
+            v0=0.0,
+            p_target=p_target_plan,
+            v_max=v_max,
+            a_max=a_max,
+            j_max=j_max,
+            tick_dt=tick_dt,
             t_offset=cold_start_lag_s,
             az_forbidden_deg=az_forbidden_deg,
             wrap_target=not use_cumulative,
         )
     else:
         traj = trapezoidal_profile(
-            p0=p0_plan, v0=0.0, p_target=p_target_plan,
-            v_max=v_max, a_max=a_max, tick_dt=tick_dt,
+            p0=p0_plan,
+            v0=0.0,
+            p_target=p_target_plan,
+            v_max=v_max,
+            a_max=a_max,
+            tick_dt=tick_dt,
             t_offset=cold_start_lag_s,
             az_forbidden_deg=az_forbidden_deg,
             wrap_target=not use_cumulative,
@@ -673,11 +694,17 @@ def move_azimuth_to_ff(
         position_logger.set_phase("ff_move")
         position_logger.mark_event(
             "ff_start",
-            target_az=target_az_deg, cur_az=cur_az_deg,
+            target_az=target_az_deg,
+            cur_az=cur_az_deg,
             traj_duration_s=traj.total_duration,
-            v_max=v_max, a_max=a_max, j_max=j_max, tick_dt=tick_dt,
-            cold_start_lag_s=cold_start_lag_s, profile=profile,
-            kp_pos=kp_pos, v_corr_max=v_corr_max,
+            v_max=v_max,
+            a_max=a_max,
+            j_max=j_max,
+            tick_dt=tick_dt,
+            cold_start_lag_s=cold_start_lag_s,
+            profile=profile,
+            kp_pos=kp_pos,
+            v_corr_max=v_corr_max,
             az_forbidden_deg=az_forbidden_deg,
         )
 
@@ -771,14 +798,20 @@ def move_azimuth_to_ff(
         if position_logger is not None:
             position_logger.mark_event(
                 "ff_tick",
-                t_rel=t_rel, fw_t=fw_t_now, t_plant=t_plant,
-                ref_pos=ref.pos, ref_vel=ref.vel, ref_acc=ref.acc,
+                t_rel=t_rel,
+                fw_t=fw_t_now,
+                t_plant=t_plant,
+                ref_pos=ref.pos,
+                ref_vel=ref.vel,
+                ref_acc=ref.acc,
                 meas_az=measured_az,
                 tracking_err_deg=abs(position_error),
                 position_error_deg=position_error,
                 v_ff_degs=v_ff,
-                v_corr_degs=v_corr, cmd_vel_degs=cmd_vel,
-                cmd_speed=speed_cmd, cmd_angle=angle_cmd,
+                v_corr_degs=v_corr,
+                cmd_vel_degs=cmd_vel,
+                cmd_speed=speed_cmd,
+                cmd_angle=angle_cmd,
             )
 
         tick_dts.append(now - prev_tick_t)
@@ -826,7 +859,7 @@ def move_azimuth_to_ff(
         stats["tick_dt_mean_s"] = sum(reals) / len(reals)
         stats["tick_dt_max_s"] = max(reals)
         stats["loop_dt_mean_s"] = stats["tick_dt_mean_s"]  # compat
-        stats["loop_dt_max_s"] = stats["tick_dt_max_s"]    # compat
+        stats["loop_dt_max_s"] = stats["tick_dt_max_s"]  # compat
     if tracking_errs:
         stats["max_tracking_err_deg"] = max(tracking_errs)
         stats["mean_tracking_err_deg"] = sum(tracking_errs) / len(tracking_errs)
@@ -854,9 +887,12 @@ def move_azimuth_to_ff(
         and stats["final_residual_deg"] is not None
         and abs(stats["final_residual_deg"]) > fallback_residual_deg
     ):
-        print(f"{tag} FF: final residual "
-              f"{stats['final_residual_deg']:+.3f}° exceeds "
-              f"{fallback_residual_deg}° — falling back to iscope", flush=True)
+        print(
+            f"{tag} FF: final residual "
+            f"{stats['final_residual_deg']:+.3f}° exceeds "
+            f"{fallback_residual_deg}° — falling back to iscope",
+            flush=True,
+        )
         stats["fallback_goto_used"] = True
         if position_logger is not None:
             position_logger.set_phase("ff_fallback_goto")
@@ -907,14 +943,25 @@ def move_azimuth_to_with_correction(
     get the expected convergence semantics.
     """
     return move_azimuth_to_ff(
-        cli, target_az_deg=target_az_deg, cur_az_deg=cur_az_deg, loc=loc,
-        target_alt_deg=target_alt_deg, tag=tag, position_logger=position_logger,
-        v_max=v_max, a_max=a_max, j_max=j_max,
-        tick_dt=tick_dt, settle_s=settle_s,
-        cold_start_lag_s=cold_start_lag_s, profile=profile,
+        cli,
+        target_az_deg=target_az_deg,
+        cur_az_deg=cur_az_deg,
+        loc=loc,
+        target_alt_deg=target_alt_deg,
+        tag=tag,
+        position_logger=position_logger,
+        v_max=v_max,
+        a_max=a_max,
+        j_max=j_max,
+        tick_dt=tick_dt,
+        settle_s=settle_s,
+        cold_start_lag_s=cold_start_lag_s,
+        profile=profile,
         az_forbidden_deg=az_forbidden_deg,
-        az_limits=az_limits, az_tracker=az_tracker,
-        kp_pos=kp_pos, v_corr_max=v_corr_max,
+        az_limits=az_limits,
+        az_tracker=az_tracker,
+        kp_pos=kp_pos,
+        v_corr_max=v_corr_max,
         arrive_tolerance_deg=arrive_tolerance_deg,
         settle_max_s=settle_max_s,
         fallback_residual_deg=fallback_residual_deg,
@@ -950,25 +997,36 @@ def unwind_azimuth(
     """
     cum_cur = az_tracker.cum_az_deg
     if abs(cum_cur) <= threshold_deg:
-        return (0.0, 0.0, {
-            "controller": "unwind_noop",
-            "cum_cur_deg": cum_cur,
-            "threshold_deg": threshold_deg,
-            "final_residual_deg": 0.0,
-            "fallback_goto_used": False,
-            "iterations": 0, "sign_flips": 0, "rate_ceiling_halvings": 0,
-            "commands_issued": 0, "loop_dt_mean_s": 0.0, "loop_dt_max_s": 0.0,
-            "stuck_bail": False, "wall_time_s": 0.0,
-        })
+        return (
+            0.0,
+            0.0,
+            {
+                "controller": "unwind_noop",
+                "cum_cur_deg": cum_cur,
+                "threshold_deg": threshold_deg,
+                "final_residual_deg": 0.0,
+                "fallback_goto_used": False,
+                "iterations": 0,
+                "sign_flips": 0,
+                "rate_ceiling_halvings": 0,
+                "commands_issued": 0,
+                "loop_dt_mean_s": 0.0,
+                "loop_dt_max_s": 0.0,
+                "stuck_bail": False,
+                "wall_time_s": 0.0,
+            },
+        )
     # Measure to anchor the tracker + get a wrapped-cur for picking the target.
     _, wrapped_cur, _ = measure_altaz_timed(cli, loc)
     az_tracker.update(wrapped_cur)
     # We want cumulative to end up at 0 (cable midpoint). The equivalent
     # wrapped target is:
     target_wrapped = wrap_pm180(wrapped_cur - az_tracker.cum_az_deg)
-    print(f"{tag} unwind: cum={az_tracker.cum_az_deg:+.3f}° -> wrapped "
-          f"target={target_wrapped:+.3f}° (drive back to cable center)",
-          flush=True)
+    print(
+        f"{tag} unwind: cum={az_tracker.cum_az_deg:+.3f}° -> wrapped "
+        f"target={target_wrapped:+.3f}° (drive back to cable center)",
+        flush=True,
+    )
     return move_azimuth_to_with_correction(
         cli,
         target_az_deg=target_wrapped,
@@ -1045,9 +1103,13 @@ def move_elevation_to_ff(
         "converged": False,
         "wall_time_s": 0.0,
         # Compat keys.
-        "iterations": 0, "sign_flips": 0, "rate_ceiling_halvings": 0,
-        "loop_dt_mean_s": 0.0, "loop_dt_max_s": 0.0,
-        "stuck_bail": False, "fallback_goto_used": False,
+        "iterations": 0,
+        "sign_flips": 0,
+        "rate_ceiling_halvings": 0,
+        "loop_dt_mean_s": 0.0,
+        "loop_dt_max_s": 0.0,
+        "stuck_bail": False,
+        "fallback_goto_used": False,
     }
 
     # Elevation doesn't wrap — use raw delta (wrap_target=False).
@@ -1059,14 +1121,23 @@ def move_elevation_to_ff(
 
     if profile == "scurve":
         traj = scurve_profile(
-            p0=cur_el_deg, v0=0.0, p_target=target_el_deg,
-            v_max=v_max, a_max=a_max, j_max=j_max, tick_dt=tick_dt,
+            p0=cur_el_deg,
+            v0=0.0,
+            p_target=target_el_deg,
+            v_max=v_max,
+            a_max=a_max,
+            j_max=j_max,
+            tick_dt=tick_dt,
             wrap_target=False,
         )
     else:
         traj = trapezoidal_profile(
-            p0=cur_el_deg, v0=0.0, p_target=target_el_deg,
-            v_max=v_max, a_max=a_max, tick_dt=tick_dt,
+            p0=cur_el_deg,
+            v0=0.0,
+            p_target=target_el_deg,
+            v_max=v_max,
+            a_max=a_max,
+            tick_dt=tick_dt,
             wrap_target=False,
         )
     stats["trajectory_duration_s"] = traj.total_duration
@@ -1075,9 +1146,12 @@ def move_elevation_to_ff(
         position_logger.set_phase("el_ff_move")
         position_logger.mark_event(
             "el_ff_start",
-            target_el=target_el_deg, cur_el=cur_el_deg,
+            target_el=target_el_deg,
+            cur_el=cur_el_deg,
             traj_duration_s=traj.total_duration,
-            v_max=v_max, a_max=a_max, profile=profile,
+            v_max=v_max,
+            a_max=a_max,
+            profile=profile,
             kp_pos=kp_pos,
         )
 
@@ -1141,13 +1215,19 @@ def move_elevation_to_ff(
         if position_logger is not None:
             position_logger.mark_event(
                 "el_ff_tick",
-                t_rel=t_rel, fw_t=fw_t_now, t_plant=t_plant,
-                ref_pos=ref.pos, ref_vel=ref.vel, ref_acc=ref.acc,
+                t_rel=t_rel,
+                fw_t=fw_t_now,
+                t_plant=t_plant,
+                ref_pos=ref.pos,
+                ref_vel=ref.vel,
+                ref_acc=ref.acc,
                 meas_el=measured_alt,
                 position_error_deg=position_error,
                 v_ff_degs=v_ff,
-                v_corr_degs=v_corr, cmd_vel_degs=cmd_vel,
-                cmd_speed=speed_cmd, cmd_angle=angle_cmd,
+                v_corr_degs=v_corr,
+                cmd_vel_degs=cmd_vel,
+                cmd_speed=speed_cmd,
+                cmd_angle=angle_cmd,
             )
 
         tick_dts.append(now - prev_tick_t)
@@ -1286,8 +1366,12 @@ def move_to_ff(
             p_target_az = force_cum_az_target
         else:
             from device.plant_limits import pick_cum_target
+
             p_target_az = pick_cum_target(
-                p0_az, cur_az_deg, target_az_deg, az_limits,
+                p0_az,
+                cur_az_deg,
+                target_az_deg,
+                az_limits,
             )
     else:
         p0_az = cur_az_deg
@@ -1298,28 +1382,40 @@ def move_to_ff(
     # matched total_duration, so the existing tick loop samples cleanly.
     if profile == "scurve":
         traj_az, traj_el = scurve_profile_2d(
-            p0_az=p0_az, p0_el=cur_el_deg,
-            p_target_az=p_target_az, p_target_el=target_el_deg,
-            v_max=v_max, a_max=a_max, j_max=j_max, tick_dt=tick_dt,
+            p0_az=p0_az,
+            p0_el=cur_el_deg,
+            p_target_az=p_target_az,
+            p_target_el=target_el_deg,
+            v_max=v_max,
+            a_max=a_max,
+            j_max=j_max,
+            tick_dt=tick_dt,
             wrap_az=not use_cum,
         )
     else:
         traj_az, traj_el = trapezoidal_profile_2d(
-            p0_az=p0_az, p0_el=cur_el_deg,
-            p_target_az=p_target_az, p_target_el=target_el_deg,
-            v_max=v_max, a_max=a_max, tick_dt=tick_dt,
+            p0_az=p0_az,
+            p0_el=cur_el_deg,
+            p_target_az=p_target_az,
+            p_target_el=target_el_deg,
+            v_max=v_max,
+            a_max=a_max,
+            tick_dt=tick_dt,
             wrap_az=not use_cum,
         )
 
     # 2-D coordinated plan produces matched durations for both axes; the
     # per-axis duration fields are kept for back-compat with existing log
     # consumers. path_len_deg distinguishes pure-axis vs diagonal moves.
-    _delta_az_plan = (traj_az.points[-1].pos - traj_az.points[0].pos
-                      if traj_az.points else 0.0)
-    _delta_el_plan = (traj_el.points[-1].pos - traj_el.points[0].pos
-                      if traj_el.points else 0.0)
-    _path_len_deg = math.sqrt(_delta_az_plan * _delta_az_plan
-                              + _delta_el_plan * _delta_el_plan)
+    _delta_az_plan = (
+        traj_az.points[-1].pos - traj_az.points[0].pos if traj_az.points else 0.0
+    )
+    _delta_el_plan = (
+        traj_el.points[-1].pos - traj_el.points[0].pos if traj_el.points else 0.0
+    )
+    _path_len_deg = math.sqrt(
+        _delta_az_plan * _delta_az_plan + _delta_el_plan * _delta_el_plan
+    )
 
     stats: dict[str, Any] = {
         "controller": "2d_ff_fb",
@@ -1337,9 +1433,13 @@ def move_to_ff(
         "wall_time_s": 0.0,
         # Compat keys.
         "final_residual_deg": None,
-        "iterations": 0, "sign_flips": 0, "rate_ceiling_halvings": 0,
-        "loop_dt_mean_s": 0.0, "loop_dt_max_s": 0.0,
-        "stuck_bail": False, "fallback_goto_used": False,
+        "iterations": 0,
+        "sign_flips": 0,
+        "rate_ceiling_halvings": 0,
+        "loop_dt_mean_s": 0.0,
+        "loop_dt_max_s": 0.0,
+        "stuck_bail": False,
+        "fallback_goto_used": False,
     }
 
     max_traj_dur = max(traj_az.total_duration, traj_el.total_duration)
@@ -1354,13 +1454,16 @@ def move_to_ff(
         position_logger.set_phase("2d_ff_move")
         position_logger.mark_event(
             "2d_ff_start",
-            target_az=target_az_deg, target_el=target_el_deg,
-            cur_az=cur_az_deg, cur_el=cur_el_deg,
+            target_az=target_az_deg,
+            target_el=target_el_deg,
+            cur_az=cur_az_deg,
+            cur_el=cur_el_deg,
             p_target_az_cum=p_target_az,
             traj_az_dur=traj_az.total_duration,
             traj_el_dur=traj_el.total_duration,
             path_len_deg=_path_len_deg,
-            profile=profile, kp_pos=kp_pos,
+            profile=profile,
+            kp_pos=kp_pos,
         )
 
     _, _, fw_t_start = measure_altaz_timed(cli, loc)
@@ -1437,15 +1540,26 @@ def move_to_ff(
         if position_logger is not None:
             position_logger.mark_event(
                 "2d_ff_tick",
-                t_rel=t_rel, fw_t=fw_t_now, t_plant=t_plant,
-                ref_az=ref_az.pos, ref_el=ref_el.pos,
-                ref_vel_az=ref_az.vel, ref_vel_el=ref_el.vel,
-                ref_acc_az=ref_az.acc, ref_acc_el=ref_el.acc,
-                meas_az=measured_az, meas_el=measured_alt,
-                err_az=err_az, err_el=err_el,
-                v_ff_az=v_ff_az, v_ff_el=v_ff_el,
-                v_cmd_az=v_cmd_az, v_cmd_el=v_cmd_el,
-                v_mag=v_mag, cmd_speed=speed_cmd, cmd_angle=angle_cmd,
+                t_rel=t_rel,
+                fw_t=fw_t_now,
+                t_plant=t_plant,
+                ref_az=ref_az.pos,
+                ref_el=ref_el.pos,
+                ref_vel_az=ref_az.vel,
+                ref_vel_el=ref_el.vel,
+                ref_acc_az=ref_az.acc,
+                ref_acc_el=ref_el.acc,
+                meas_az=measured_az,
+                meas_el=measured_alt,
+                err_az=err_az,
+                err_el=err_el,
+                v_ff_az=v_ff_az,
+                v_ff_el=v_ff_el,
+                v_cmd_az=v_cmd_az,
+                v_cmd_el=v_cmd_el,
+                v_mag=v_mag,
+                cmd_speed=speed_cmd,
+                cmd_angle=angle_cmd,
             )
 
         tick_dts.append(now - prev_tick_t)
@@ -1453,13 +1567,16 @@ def move_to_ff(
         tick_idx += 1
 
         # Convergence: both axes past trajectory AND within tolerance.
-        both_past = (t_plant >= traj_az.total_duration
-                     and t_plant >= traj_el.total_duration)
+        both_past = (
+            t_plant >= traj_az.total_duration and t_plant >= traj_el.total_duration
+        )
         if both_past:
             if t_settle_enter is None:
                 t_settle_enter = now
-            both_ok = (abs(err_az) <= arrive_tolerance_deg
-                       and abs(err_el) <= arrive_tolerance_deg)
+            both_ok = (
+                abs(err_az) <= arrive_tolerance_deg
+                and abs(err_el) <= arrive_tolerance_deg
+            )
             if both_ok:
                 converged_count += 1
             else:
@@ -1607,23 +1724,29 @@ def goto_origin(
         stop_cum_ref = az_limits.cw_hard_stop_cum_deg
         stop_wrapped_ref = az_limits.cw_hard_stop_wrapped_deg
 
-    print(f"{tag} before: az={az_before:+.3f}  el={alt_before:+.3f}  "
-          f"(d_ccw={d_ccw:.1f}°, d_cw={d_cw:.1f}° — picking {chosen.upper()})",
-          flush=True)
+    print(
+        f"{tag} before: az={az_before:+.3f}  el={alt_before:+.3f}  "
+        f"(d_ccw={d_ccw:.1f}°, d_cw={d_cw:.1f}° — picking {chosen.upper()})",
+        flush=True,
+    )
 
     if position_logger is not None:
         position_logger.mark_event(
             "goto_origin_start",
-            az_before=az_before, alt_before=alt_before,
-            d_ccw_wrapped_deg=d_ccw, d_cw_wrapped_deg=d_cw,
+            az_before=az_before,
+            alt_before=alt_before,
+            d_ccw_wrapped_deg=d_ccw,
+            d_cw_wrapped_deg=d_cw,
             chosen_direction=chosen,
         )
 
     # Stage 1: drive into the chosen hard stop with dithered bursts so
     # the firmware doesn't dedup consecutive identical speed_moves.
     rng = random.Random(0x60710)
+
     def _dither_dur() -> int:
         return rng.choice([6, 7, 8, 9, 10])
+
     def _issue() -> None:
         speed_move(cli, hard_stop_speed, burst_angle, _dither_dur())
 
@@ -1673,16 +1796,21 @@ def goto_origin(
     drift_from_ref = wrap_pm180(az_at_stop - stop_wrapped_ref)
     t_stage1_elapsed = time.monotonic() - t_stage1_start
 
-    print(f"{tag} stalled {chosen.upper()} at az={az_at_stop:+.3f}  "
-          f"(expected ~{stop_wrapped_ref:+.3f}, drift {drift_from_ref:+.3f}°)  "
-          f"motion={motion_total:.1f}°  bursts={bursts_issued}  "
-          f"t={t_stage1_elapsed:.1f}s", flush=True)
+    print(
+        f"{tag} stalled {chosen.upper()} at az={az_at_stop:+.3f}  "
+        f"(expected ~{stop_wrapped_ref:+.3f}, drift {drift_from_ref:+.3f}°)  "
+        f"motion={motion_total:.1f}°  bursts={bursts_issued}  "
+        f"t={t_stage1_elapsed:.1f}s",
+        flush=True,
+    )
 
     if position_logger is not None:
         position_logger.mark_event(
             "goto_origin_stalled",
-            az_at_stop=az_at_stop, drift_from_ref_deg=drift_from_ref,
-            motion_total_deg=motion_total, bursts_issued=bursts_issued,
+            az_at_stop=az_at_stop,
+            drift_from_ref_deg=drift_from_ref,
+            motion_total_deg=motion_total,
+            bursts_issued=bursts_issued,
             stage1_elapsed_s=t_stage1_elapsed,
         )
 
@@ -1691,19 +1819,31 @@ def goto_origin(
     tracker.reset(cum_az_deg=stop_cum_ref, wrapped_az_deg=az_at_stop)
     alt_at_stop, _, _ = measure_altaz_timed(cli, loc)
 
-    print(f"{tag} unwind: tracker cum={stop_cum_ref:+.1f} -> 0  "
-          f"(delta {-stop_cum_ref:+.1f}°)", flush=True)
+    print(
+        f"{tag} unwind: tracker cum={stop_cum_ref:+.1f} -> 0  "
+        f"(delta {-stop_cum_ref:+.1f}°)",
+        flush=True,
+    )
 
     meas_alt, meas_az, stats = move_to_ff(
         cli,
-        target_az_deg=0.0, target_el_deg=0.0,
-        cur_az_deg=az_at_stop, cur_el_deg=alt_at_stop,
+        target_az_deg=0.0,
+        target_el_deg=0.0,
+        cur_az_deg=az_at_stop,
+        cur_el_deg=alt_at_stop,
         loc=loc,
-        tag=tag, position_logger=position_logger,
-        v_max=v_max, a_max=a_max, j_max=j_max,
-        tick_dt=tick_dt, settle_s=settle_s, profile=profile,
-        az_limits=az_limits, az_tracker=tracker,
-        kp_pos=kp_pos, v_corr_max=v_corr_max,
+        tag=tag,
+        position_logger=position_logger,
+        v_max=v_max,
+        a_max=a_max,
+        j_max=j_max,
+        tick_dt=tick_dt,
+        settle_s=settle_s,
+        profile=profile,
+        az_limits=az_limits,
+        az_tracker=tracker,
+        kp_pos=kp_pos,
+        v_corr_max=v_corr_max,
         arrive_tolerance_deg=arrive_tolerance_deg,
         settle_max_s=settle_max_s,
         converged_ticks_required=converged_ticks_required,
@@ -1728,8 +1868,12 @@ def goto_origin(
 # position logger, and any CLI that wants to convert between frames).
 # ---------------------------------------------------------------------------
 
+
 def radec_to_altaz(
-    ra_h: float, dec_deg: float, loc: EarthLocation, t: Time,
+    ra_h: float,
+    dec_deg: float,
+    loc: EarthLocation,
+    t: Time,
 ) -> tuple[float, float]:
     c = SkyCoord(ra=ra_h * u.hourangle, dec=dec_deg * u.deg)
     altaz = c.transform_to(AltAz(obstime=t, location=loc))
@@ -1737,7 +1881,10 @@ def radec_to_altaz(
 
 
 def altaz_to_radec(
-    alt_deg: float, az_deg: float, loc: EarthLocation, t: Time,
+    alt_deg: float,
+    az_deg: float,
+    loc: EarthLocation,
+    t: Time,
 ) -> tuple[float, float]:
     altaz = SkyCoord(
         alt=alt_deg * u.deg,
@@ -1749,7 +1896,10 @@ def altaz_to_radec(
 
 
 def angular_distance_deg(
-    ra1_h: float, dec1_d: float, ra2_h: float, dec2_d: float,
+    ra1_h: float,
+    dec1_d: float,
+    ra2_h: float,
+    dec2_d: float,
 ) -> float:
     """Great-circle angular distance (degrees) between two RA/Dec points.
 
@@ -1760,9 +1910,8 @@ def angular_distance_deg(
     ra2 = math.radians(ra2_h * 15.0)
     d1 = math.radians(dec1_d)
     d2 = math.radians(dec2_d)
-    cos_d = (
-        math.sin(d1) * math.sin(d2)
-        + math.cos(d1) * math.cos(d2) * math.cos(ra1 - ra2)
+    cos_d = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(
+        ra1 - ra2
     )
     cos_d = max(-1.0, min(1.0, cos_d))
     return math.degrees(math.acos(cos_d))
@@ -1773,6 +1922,7 @@ def angular_distance_deg(
 # fallback path when the velocity loop times out or gets stuck.
 # ---------------------------------------------------------------------------
 
+
 def ensure_scenery_mode(cli: MountClient) -> None:
     """Enter scenery (terrestrial) view mode (no target)."""
     cli.method_sync("iscope_start_view", {"mode": "scenery"})
@@ -1780,7 +1930,10 @@ def ensure_scenery_mode(cli: MountClient) -> None:
 
 
 def issue_slew(
-    cli: MountClient, az_deg: float, alt_deg: float, loc: EarthLocation,
+    cli: MountClient,
+    az_deg: float,
+    alt_deg: float,
+    loc: EarthLocation,
 ) -> tuple[float, float]:
     """Send iscope_start_view (scenery + target). Returns the commanded RA/Dec
     so the caller can compute distance-to-target in Python.
@@ -1905,6 +2058,7 @@ def iscope_fallback_goto(
 # thread.
 # ---------------------------------------------------------------------------
 
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -1948,14 +2102,18 @@ class PositionLogger:
     def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("a", buffering=1)  # line-buffered
-        self._write({
-            "t": _now_iso(),
-            "kind": "header",
-            "poll_interval_s": self.poll_interval,
-        })
+        self._write(
+            {
+                "t": _now_iso(),
+                "kind": "header",
+                "poll_interval_s": self.poll_interval,
+            }
+        )
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._run, name="PositionLogger", daemon=True,
+            target=self._run,
+            name="PositionLogger",
+            daemon=True,
         )
         self._thread.start()
 
@@ -1970,7 +2128,9 @@ class PositionLogger:
             self._file = None
 
     def set_target(
-        self, az_deg: Optional[float], alt_deg: Optional[float],
+        self,
+        az_deg: Optional[float],
+        alt_deg: Optional[float],
     ) -> None:
         with self._lock:
             self._commanded_az = az_deg
@@ -1993,8 +2153,11 @@ class PositionLogger:
                 "commanded_alt_deg": self._commanded_alt,
             }
         rec = {
-            "t": _now_iso(), "kind": "event", "event": event,
-            **snapshot, **extra,
+            "t": _now_iso(),
+            "kind": "event",
+            "event": event,
+            **snapshot,
+            **extra,
         }
         self._write(rec)
 
@@ -2013,11 +2176,13 @@ class PositionLogger:
                 rec = self._sample()
                 self._write(rec)
             except Exception as e:
-                self._write({
-                    "t": _now_iso(),
-                    "kind": "error",
-                    "error": repr(e),
-                })
+                self._write(
+                    {
+                        "t": _now_iso(),
+                        "kind": "error",
+                        "error": repr(e),
+                    }
+                )
             if self._stop_event.wait(self.poll_interval):
                 break
 

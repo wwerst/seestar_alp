@@ -43,8 +43,10 @@ def test_atomic_offsets_defaults_are_zero():
 def test_atomic_offsets_clamps_to_bounds():
     off = AtomicOffsets()
     snap = off.set(
-        az_bias_deg=100.0, el_bias_deg=-100.0,
-        along_deg=100.0, cross_deg=-100.0,
+        az_bias_deg=100.0,
+        el_bias_deg=-100.0,
+        along_deg=100.0,
+        cross_deg=-100.0,
         time_offset_s=100.0,
     )
     assert snap.az_bias_deg == AZ_BIAS_BOUND_DEG
@@ -61,9 +63,15 @@ def test_atomic_offsets_rejects_nan():
     import math
 
     import pytest
+
     off = AtomicOffsets()
-    for field in ("az_bias_deg", "el_bias_deg", "along_deg", "cross_deg",
-                  "time_offset_s"):
+    for field in (
+        "az_bias_deg",
+        "el_bias_deg",
+        "along_deg",
+        "cross_deg",
+        "time_offset_s",
+    ):
         with pytest.raises(ValueError):
             off.set(**{field: float("nan")})
     # Unchanged after failed set.
@@ -87,7 +95,13 @@ def test_atomic_offsets_partial_updates_preserve_other_fields():
 
 def test_atomic_offsets_reset_scopes():
     off = AtomicOffsets()
-    off.set(az_bias_deg=1.0, el_bias_deg=1.0, along_deg=1.0, cross_deg=1.0, time_offset_s=2.0)
+    off.set(
+        az_bias_deg=1.0,
+        el_bias_deg=1.0,
+        along_deg=1.0,
+        cross_deg=1.0,
+        time_offset_s=2.0,
+    )
     after_azel = off.reset_azel()
     assert after_azel.az_bias_deg == 0.0 and after_azel.el_bias_deg == 0.0
     assert after_azel.along_deg == 1.0 and after_azel.cross_deg == 1.0
@@ -102,9 +116,11 @@ def test_atomic_offsets_reset_scopes():
 def test_atomic_offsets_thread_safety_smoke():
     """Many threads writing should not produce inconsistent snapshots."""
     off = AtomicOffsets()
+
     def writer():
         for _ in range(200):
             off.set(az_bias_deg=0.1, el_bias_deg=-0.1)
+
     threads = [threading.Thread(target=writer) for _ in range(8)]
     for t in threads:
         t.start()
@@ -119,33 +135,55 @@ def test_atomic_offsets_thread_safety_smoke():
 
 def _offset_latlon(lat_deg, lon_deg, dnorth_m, deast_m):
     import math
+
     dlat = dnorth_m / 111320.0
     dlon = deast_m / (111320.0 * math.cos(math.radians(lat_deg)))
     return lat_deg + dlat, lon_deg + dlon
 
 
-def _write_fixture(path: Path, t0_unix: float, duration_s: float = 5.0, dt: float = 0.5) -> None:
+def _write_fixture(
+    path: Path, t0_unix: float, duration_s: float = 5.0, dt: float = 0.5
+) -> None:
     site = build_site()
     n = int(round(duration_s / dt)) + 1
     t_grid = t0_unix + np.arange(n) * dt
     east = 100.0 * (t_grid - t_grid[0]) - 100.0 * duration_s / 2.0
     header = {
-        "kind": "header", "source": "test", "id": path.stem,
-        "callsign": "FIXTURE", "duration_s": duration_s,
-        "n_samples": n, "peak_el_deg": 5.0, "min_slant_m": 5000.0,
+        "kind": "header",
+        "source": "test",
+        "id": path.stem,
+        "callsign": "FIXTURE",
+        "duration_s": duration_s,
+        "n_samples": n,
+        "peak_el_deg": 5.0,
+        "min_slant_m": 5000.0,
         "sample_rate_hz": 1.0 / dt,
     }
     with path.open("w", encoding="utf-8") as f:
         f.write(json.dumps(header) + "\n")
         for i in range(n):
-            lat, lon = _offset_latlon(site.lat_deg, site.lon_deg, 5000.0, float(east[i]))
+            lat, lon = _offset_latlon(
+                site.lat_deg, site.lon_deg, 5000.0, float(east[i])
+            )
             ex, ey, ez = lla_to_ecef(lat, lon, site.alt_m + 3000.0)
-            f.write(json.dumps({
-                "kind": "sample", "t_unix": float(t_grid[i]),
-                "ecef_x": ex, "ecef_y": ey, "ecef_z": ez,
-                "lat": lat, "lon": lon, "alt_m": site.alt_m + 3000.0,
-                "az_deg": 0.0, "el_deg": 0.0, "slant_m": 0.0,
-            }) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "kind": "sample",
+                        "t_unix": float(t_grid[i]),
+                        "ecef_x": ex,
+                        "ecef_y": ey,
+                        "ecef_z": ez,
+                        "lat": lat,
+                        "lon": lon,
+                        "alt_m": site.alt_m + 3000.0,
+                        "az_deg": 0.0,
+                        "el_deg": 0.0,
+                        "slant_m": 0.0,
+                    }
+                )
+                + "\n"
+            )
 
 
 def test_target_catalog_lists_cached(tmp_path):
@@ -170,7 +208,9 @@ def test_target_catalog_make_provider_for_file(tmp_path):
     _write_fixture(p, t0_unix=time.time() + 1.0)
     catalog = TargetCatalog(root, live_enabled=False)
     provider = catalog.make_provider(
-        "file", p.stem, MountFrame.from_identity_enu(),
+        "file",
+        p.stem,
+        MountFrame.from_identity_enu(),
     )
     assert isinstance(provider, JsonlECEFProvider)
     t0, t1 = provider.valid_range()
@@ -179,6 +219,7 @@ def test_target_catalog_make_provider_for_file(tmp_path):
 
 def test_target_catalog_missing_id_raises(tmp_path):
     import pytest
+
     catalog = TargetCatalog(tmp_path, live_enabled=False)  # no trajectories subdir
     with pytest.raises(KeyError):
         catalog.make_provider("file", "nope", MountFrame.from_identity_enu())
@@ -186,6 +227,7 @@ def test_target_catalog_missing_id_raises(tmp_path):
 
 def test_target_catalog_live_missing_id_raises(tmp_path):
     import pytest
+
     catalog = TargetCatalog(tmp_path, live_enabled=False)
     with pytest.raises(KeyError):
         catalog.make_provider("live", "anything", MountFrame.from_identity_enu())
@@ -243,10 +285,15 @@ class _StationaryProvider:
 
     def sample(self, t):
         return ReferenceSample(
-            t_unix=float(t), az_cum_deg=0.0, el_deg=45.0,
-            v_az_degs=0.0, v_el_degs=0.0,
-            a_az_degs2=0.0, a_el_degs2=0.0,
-            stale=False, extrapolated=False,
+            t_unix=float(t),
+            az_cum_deg=0.0,
+            el_deg=45.0,
+            v_az_degs=0.0,
+            v_el_degs=0.0,
+            a_az_degs2=0.0,
+            a_el_degs2=0.0,
+            stale=False,
+            extrapolated=False,
         )
 
     def valid_range(self):
@@ -349,7 +396,9 @@ def test_live_adsb_provider_builds_from_buffer():
     for i in range(n):
         east_m = 100.0 * i
         lat = site.lat_deg + (5000.0 / 111320.0)
-        lon = site.lon_deg + (east_m / (111320.0 * math.cos(math.radians(site.lat_deg))))
+        lon = site.lon_deg + (
+            east_m / (111320.0 * math.cos(math.radians(site.lat_deg)))
+        )
         ecef = tuple(float(x) for x in lla_to_ecef(lat, lon, site.alt_m + 3000.0))
         buf.append(t0 + float(i), ecef)
 
@@ -364,6 +413,7 @@ def test_live_adsb_provider_builds_from_buffer():
 
 def test_live_adsb_provider_stale_without_samples():
     import device.live_tracker as lt
+
     buf = lt._LiveBuffer(icao24="none", callsign="")
     provider = lt.LiveADSBProvider(buf, MountFrame.from_identity_enu())
     s = provider.sample(time.time())
@@ -382,10 +432,12 @@ def test_auto_slew_refuses_when_target_inside_sun_cone(monkeypatch):
     # reading comes from the fake client.
     real_is_sun_safe = ss.is_sun_safe
     monkeypatch.setattr(
-        ss, "is_sun_safe",
+        ss,
+        "is_sun_safe",
         lambda *a, **kw: (False, "sun_avoidance: forced by test"),
     )
     try:
+
         class _FakeCli:
             def method_sync(self, method, params=None):
                 if method == "scope_get_horiz_coord":
@@ -399,7 +451,9 @@ def test_auto_slew_refuses_when_target_inside_sun_cone(monkeypatch):
 
         session = LiveTrackSession(
             telescope_id=77,
-            target_kind="file", target_id="fix", target_display_name="Fix",
+            target_kind="file",
+            target_id="fix",
+            target_display_name="Fix",
             provider=_StationaryProvider(t0=time.time() + 0.2),
             offsets=AtomicOffsets(),
             dry_run=True,
@@ -421,7 +475,9 @@ def test_stop_requested_during_preslew_records_exit_reason():
     exit_reason='stop_signal', phase='stopped'."""
     session = LiveTrackSession(
         telescope_id=200,
-        target_kind="file", target_id="fix", target_display_name="Fix",
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
         provider=_StationaryProvider(t0=time.time() + 1.0),
         offsets=AtomicOffsets(),
         dry_run=True,
@@ -448,7 +504,9 @@ def test_live_track_manager_double_start_refuses(tmp_path, monkeypatch):
     def make_session():
         return LiveTrackSession(
             telescope_id=101,
-            target_kind="file", target_id="fix", target_display_name="Fix",
+            target_kind="file",
+            target_id="fix",
+            target_display_name="Fix",
             provider=_StationaryProvider(t0=time.time() + 0.2),
             offsets=AtomicOffsets(),
             dry_run=True,

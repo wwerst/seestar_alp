@@ -90,9 +90,7 @@ def test_fit_tolerates_noise():
     amplitude = 0.2
     uphill = 42.0
     x0, y0 = 0.01, 0.02
-    samples = _synth_samples(
-        azs, amplitude, uphill, x0, y0, noise=0.01, seed=7
-    )
+    samples = _synth_samples(azs, amplitude, uphill, x0, y0, noise=0.01, seed=7)
 
     fit = fit_auto_level(samples)
 
@@ -105,8 +103,13 @@ def test_fit_tolerates_noise():
 def test_fit_level_tripod_gives_near_zero_amplitude():
     azs = planned_azimuths(12)
     samples = _synth_samples(
-        azs, amplitude=0.0, uphill_az_deg=0.0,
-        x_offset=0.02, y_offset=-0.03, noise=0.005, seed=3,
+        azs,
+        amplitude=0.0,
+        uphill_az_deg=0.0,
+        x_offset=0.02,
+        y_offset=-0.03,
+        noise=0.005,
+        seed=3,
     )
 
     fit = fit_auto_level(samples)
@@ -122,8 +125,12 @@ def test_tilt_deg_is_degrees_of_amplitude_over_mean_z():
     azs = planned_azimuths(12)
     amplitude = 0.1
     samples = _synth_samples(
-        azs, amplitude, uphill_az_deg=0.0,
-        x_offset=0.0, y_offset=0.0, sensor_z=1.0,
+        azs,
+        amplitude,
+        uphill_az_deg=0.0,
+        x_offset=0.0,
+        y_offset=0.0,
+        sensor_z=1.0,
     )
     fit = fit_auto_level(samples)
 
@@ -137,8 +144,12 @@ def test_tilt_deg_uses_mean_z_as_scale_normalizer():
     amplitude = 0.1
     gain = 1.05  # sensor reports 5% too high
     samples = _synth_samples(
-        azs, amplitude * gain, uphill_az_deg=0.0,
-        x_offset=0.0, y_offset=0.0, sensor_z=gain,
+        azs,
+        amplitude * gain,
+        uphill_az_deg=0.0,
+        x_offset=0.0,
+        y_offset=0.0,
+        sensor_z=gain,
     )
     fit = fit_auto_level(samples)
 
@@ -151,8 +162,12 @@ def test_tilt_deg_defaults_to_mean_z_one_when_z_missing():
     azs = planned_azimuths(12)
     amplitude = 0.1
     samples = _synth_samples(
-        azs, amplitude, uphill_az_deg=0.0,
-        x_offset=0.0, y_offset=0.0, sensor_z=None,
+        azs,
+        amplitude,
+        uphill_az_deg=0.0,
+        x_offset=0.0,
+        y_offset=0.0,
+        sensor_z=None,
     )
     fit = fit_auto_level(samples)
     assert fit.mean_z == pytest.approx(1.0)
@@ -165,8 +180,13 @@ def test_joint_fit_tighter_than_per_axis_on_noisy_data():
     amplitude = 0.15
     uphill = 80.0
     samples = _synth_samples(
-        azs, amplitude, uphill, x_offset=0.0, y_offset=0.0,
-        noise=0.005, seed=42,
+        azs,
+        amplitude,
+        uphill,
+        x_offset=0.0,
+        y_offset=0.0,
+        noise=0.005,
+        seed=42,
     )
     fit = fit_auto_level(samples)
 
@@ -185,11 +205,13 @@ def test_joint_fit_tighter_than_per_axis_on_noisy_data():
 
 def test_fit_requires_minimum_samples():
     with pytest.raises(ValueError):
-        fit_auto_level([
-            AutoLevelSample(0, 0, 0),
-            AutoLevelSample(90, 0, 0),
-            AutoLevelSample(180, 0, 0),
-        ])
+        fit_auto_level(
+            [
+                AutoLevelSample(0, 0, 0),
+                AutoLevelSample(90, 0, 0),
+                AutoLevelSample(180, 0, 0),
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +348,23 @@ def test_weighting_downweights_noisy_position():
     base_noise = 0.002
 
     samples_weighted = _synth_samples(
-        azs, true_A, uphill, 0.0, 0.0, noise=base_noise, seed=11,
+        azs,
+        true_A,
+        uphill,
+        0.0,
+        0.0,
+        noise=base_noise,
+        seed=11,
         populate_stds=True,
     )
     samples_unweighted = _synth_samples(
-        azs, true_A, uphill, 0.0, 0.0, noise=base_noise, seed=11,
+        azs,
+        true_A,
+        uphill,
+        0.0,
+        0.0,
+        noise=base_noise,
+        seed=11,
         populate_stds=False,
     )
 
@@ -451,8 +485,13 @@ def test_build_guidance_with_anchor_names_compass_side():
 def test_build_guidance_level_state():
     azs = planned_azimuths(12)
     samples = _synth_samples(
-        azs, amplitude=0.0, uphill_az_deg=0.0,
-        x_offset=0.01, y_offset=0.02, noise=0.0001, seed=1,
+        azs,
+        amplitude=0.0,
+        uphill_az_deg=0.0,
+        x_offset=0.01,
+        y_offset=0.02,
+        noise=0.0001,
+        seed=1,
     )
     fit = fit_auto_level(samples)
     guidance = build_guidance(fit, tolerance_deg=0.1)
@@ -485,9 +524,12 @@ def test_collect_samples_drives_loop_and_round_trips_fit():
 
     scope = FakeScope()
     samples = collect_samples(
-        scope.move_to_az, scope.read_sensor,
-        num_samples=12, altitude_deg=5.0,
-        settle_seconds=0.0, sleep=lambda _: None,
+        scope.move_to_az,
+        scope.read_sensor,
+        num_samples=12,
+        altitude_deg=5.0,
+        settle_seconds=0.0,
+        sleep=lambda _: None,
     )
     assert len(samples) == 12
 
@@ -510,20 +552,36 @@ def test_collect_samples_drives_loop_and_round_trips_fit():
 def _mk_run_positions():
     positions = []
     for i, az in enumerate(planned_azimuths(4)):
-        positions.append({
-            "index": i,
-            "azimuth_deg": az,
-            "target_alt_deg": 10.0,
-            "target_ra_h": 0.5 + 0.01 * i,
-            "target_dec_deg": 60.0,
-            "arrived_dist_deg": 0.3,
-            "slew_attempts": 1,
-            "nudged": True,
-            "reads": [
-                {"t_offset_s": 0.0, "x": 0.01, "y": 0.02, "z": 0.999, "angle": 1.2, "heading": 100.0 + i},
-                {"t_offset_s": 0.1, "x": 0.011, "y": 0.019, "z": 0.9995, "angle": 1.25, "heading": 100.0 + i},
-            ],
-        })
+        positions.append(
+            {
+                "index": i,
+                "azimuth_deg": az,
+                "target_alt_deg": 10.0,
+                "target_ra_h": 0.5 + 0.01 * i,
+                "target_dec_deg": 60.0,
+                "arrived_dist_deg": 0.3,
+                "slew_attempts": 1,
+                "nudged": True,
+                "reads": [
+                    {
+                        "t_offset_s": 0.0,
+                        "x": 0.01,
+                        "y": 0.02,
+                        "z": 0.999,
+                        "angle": 1.2,
+                        "heading": 100.0 + i,
+                    },
+                    {
+                        "t_offset_s": 0.1,
+                        "x": 0.011,
+                        "y": 0.019,
+                        "z": 0.9995,
+                        "angle": 1.25,
+                        "heading": 100.0 + i,
+                    },
+                ],
+            }
+        )
     return positions
 
 
@@ -532,7 +590,13 @@ def test_save_run_and_load_run_round_trip(tmp_path):
     meta = {
         "run_id": "test-run-1",
         "started_at": "2026-04-20T07:30:00.000Z",
-        "config": {"samples": 4, "alt_deg": 10.0, "reads_per_position": 2, "lat": 33.98, "long": -118.45},
+        "config": {
+            "samples": 4,
+            "alt_deg": 10.0,
+            "reads_per_position": 2,
+            "lat": 33.98,
+            "long": -118.45,
+        },
     }
     path = tmp_path / "run.json"
     save_run(path, meta, positions)
@@ -570,11 +634,22 @@ def test_save_run_writes_atomically_and_is_rereadable_after_rewrite(tmp_path):
 
     positions: list[dict] = []
     for i in range(3):
-        positions.append({
-            "index": i,
-            "azimuth_deg": i * 120.0,
-            "reads": [{"t_offset_s": 0.0, "x": i * 0.01, "y": 0.0, "z": 1.0, "angle": 0.0, "heading": 0.0}],
-        })
+        positions.append(
+            {
+                "index": i,
+                "azimuth_deg": i * 120.0,
+                "reads": [
+                    {
+                        "t_offset_s": 0.0,
+                        "x": i * 0.01,
+                        "y": 0.0,
+                        "z": 1.0,
+                        "angle": 0.0,
+                        "heading": 0.0,
+                    }
+                ],
+            }
+        )
         save_run(path, meta, positions)
         data = json.loads(path.read_text())
         assert len(data["positions"]) == i + 1

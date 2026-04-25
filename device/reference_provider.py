@@ -115,14 +115,18 @@ class JsonlECEFProvider:
         obj.path = Path("<in-memory>")
         obj.mount_frame = mount_frame
         obj.extrapolation_s = float(extrapolation_s)
-        obj._init_from_arrays(header, np.asarray(t_unix, dtype=float),
-                              np.asarray(ecef_xyz, dtype=float))
+        obj._init_from_arrays(
+            header, np.asarray(t_unix, dtype=float), np.asarray(ecef_xyz, dtype=float)
+        )
         return obj
 
     # ---------- internal: build splines from arrays ----------
 
     def _init_from_arrays(
-        self, header: dict, t: np.ndarray, ecef: np.ndarray,
+        self,
+        header: dict,
+        t: np.ndarray,
+        ecef: np.ndarray,
     ) -> None:
         if len(t) < 4:
             raise ValueError(
@@ -156,9 +160,7 @@ class JsonlECEFProvider:
         t_query = float(t_unix)
 
         if t_query < t0:
-            raise ValueError(
-                f"query t={t_query:.3f} is before buffer head {t0:.3f}"
-            )
+            raise ValueError(f"query t={t_query:.3f} is before buffer head {t0:.3f}")
 
         if t_query <= t1:
             # Interpolate in-buffer.
@@ -169,10 +171,15 @@ class JsonlECEFProvider:
             a_az = float(self._spline_az(t_query, 2))
             a_el = float(self._spline_el(t_query, 2))
             return ReferenceSample(
-                t_unix=t_query, az_cum_deg=az, el_deg=el,
-                v_az_degs=v_az, v_el_degs=v_el,
-                a_az_degs2=a_az, a_el_degs2=a_el,
-                stale=False, extrapolated=False,
+                t_unix=t_query,
+                az_cum_deg=az,
+                el_deg=el,
+                v_az_degs=v_az,
+                v_el_degs=v_el,
+                a_az_degs2=a_az,
+                a_el_degs2=a_el,
+                stale=False,
+                extrapolated=False,
             )
 
         # Past the tail. Extrapolate linearly with tail v, a up to the horizon.
@@ -189,16 +196,23 @@ class JsonlECEFProvider:
         v_az = self._tail_v_az + self._tail_a_az * dt
         v_el = self._tail_v_el + self._tail_a_el * dt
         return ReferenceSample(
-            t_unix=t_query, az_cum_deg=az, el_deg=el,
-            v_az_degs=v_az, v_el_degs=v_el,
-            a_az_degs2=self._tail_a_az, a_el_degs2=self._tail_a_el,
-            stale=stale, extrapolated=True,
+            t_unix=t_query,
+            az_cum_deg=az,
+            el_deg=el,
+            v_az_degs=v_az,
+            v_el_degs=v_el,
+            a_az_degs2=self._tail_a_az,
+            a_el_degs2=self._tail_a_el,
+            stale=stale,
+            extrapolated=True,
         )
 
     # ---------- convenience for pre-check ----------
 
     def iter_ticks(
-        self, tick_dt: float, start_t: float | None = None,
+        self,
+        tick_dt: float,
+        start_t: float | None = None,
     ) -> list[ReferenceSample]:
         """Sample the provider at a uniform tick grid over its valid range.
 
@@ -225,11 +239,13 @@ def _load_jsonl(path: Path) -> tuple[dict, np.ndarray, np.ndarray]:
             if rec.get("kind") == "header":
                 header = rec
             elif rec.get("kind") == "sample":
-                ecef_rows.append((
-                    float(rec["ecef_x"]),
-                    float(rec["ecef_y"]),
-                    float(rec["ecef_z"]),
-                ))
+                ecef_rows.append(
+                    (
+                        float(rec["ecef_x"]),
+                        float(rec["ecef_y"]),
+                        float(rec["ecef_z"]),
+                    )
+                )
                 t_rows.append(float(rec["t_unix"]))
     if header is None:
         raise ValueError(f"{path}: no header record")

@@ -59,7 +59,10 @@ def make_straight_aircraft(
     ecef_rows = []
     for i in range(n):
         lat, lon = _offset_latlon(
-            site.lat_deg, site.lon_deg, lateral_north_m, float(east[i]),
+            site.lat_deg,
+            site.lon_deg,
+            lateral_north_m,
+            float(east[i]),
         )
         alt = altitude_m + site.alt_m
         ex, ey, ez = lla_to_ecef(lat, lon, alt)
@@ -69,19 +72,21 @@ def make_straight_aircraft(
     ecef_arr = np.array(ecef_rows)
     az_arr, el_arr, slant_arr = ecef_array_to_topo(ecef_arr, site)
     for i in range(n):
-        samples.append({
-            "kind": "sample",
-            "t_unix": float(t_grid[i]),
-            "ecef_x": float(ecef_arr[i, 0]),
-            "ecef_y": float(ecef_arr[i, 1]),
-            "ecef_z": float(ecef_arr[i, 2]),
-            "lat": lat_list[i],
-            "lon": lon_list[i],
-            "alt_m": altitude_m + site.alt_m,
-            "az_deg": float(az_arr[i]),
-            "el_deg": float(el_arr[i]),
-            "slant_m": float(slant_arr[i]),
-        })
+        samples.append(
+            {
+                "kind": "sample",
+                "t_unix": float(t_grid[i]),
+                "ecef_x": float(ecef_arr[i, 0]),
+                "ecef_y": float(ecef_arr[i, 1]),
+                "ecef_z": float(ecef_arr[i, 2]),
+                "lat": lat_list[i],
+                "lon": lon_list[i],
+                "alt_m": altitude_m + site.alt_m,
+                "az_deg": float(az_arr[i]),
+                "el_deg": float(el_arr[i]),
+                "slant_m": float(slant_arr[i]),
+            }
+        )
         az_list.append(float(az_arr[i]))
         el_list.append(float(el_arr[i]))
         slant_list.append(float(slant_arr[i]))
@@ -156,7 +161,8 @@ def test_overhead_slant_matches_altitude():
 def test_straight_flight_peak_elevation():
     """5 km north of observer at 3 km altitude ⇒ peak el = atan2(3000, 5000)."""
     header, samples = make_straight_aircraft(
-        lateral_north_m=5000.0, altitude_m=3000.0,
+        lateral_north_m=5000.0,
+        altitude_m=3000.0,
     )
     peak_el = max(s["el_deg"] for s in samples)
     expected = math.degrees(math.atan2(3000.0, 5000.0))
@@ -171,11 +177,13 @@ def test_straight_flight_peak_elevation():
 
 def test_straight_flight_az_north_at_closest_approach():
     _hdr, samples = make_straight_aircraft(
-        lateral_north_m=5000.0, altitude_m=3000.0,
+        lateral_north_m=5000.0,
+        altitude_m=3000.0,
     )
     mid = samples[len(samples) // 2]
-    assert mid["az_deg"] == pytest.approx(0.0, abs=0.5) or \
-        mid["az_deg"] == pytest.approx(360.0, abs=0.5)
+    assert mid["az_deg"] == pytest.approx(0.0, abs=0.5) or mid[
+        "az_deg"
+    ] == pytest.approx(360.0, abs=0.5)
 
 
 def test_unwrap_az_series_handles_wrap():
@@ -192,8 +200,7 @@ def test_load_trajectory_parses_header_and_samples(tmp_traj_file):
     assert traj.header["callsign"] == "TEST123"
     assert len(traj.samples) == 121  # 120 s at 1 Hz inclusive
     s0 = traj.samples[0]
-    for key in ("t_unix", "ecef_x", "ecef_y", "ecef_z",
-                "az_deg", "el_deg", "slant_m"):
+    for key in ("t_unix", "ecef_x", "ecef_y", "ecef_z", "az_deg", "el_deg", "slant_m"):
         assert key in s0
 
 
@@ -210,10 +217,14 @@ def test_load_trajectory_rejects_empty(tmp_path):
 def test_replay_slow_track_tracks_well(tmp_traj_file):
     traj = replay.load_trajectory(tmp_traj_file)
     result = replay.simulate_replay(
-        traj, tick_dt=0.5, tau_s=0.348, use_ff=True, az_limits=None,
+        traj,
+        tick_dt=0.5,
+        tau_s=0.348,
+        use_ff=True,
+        az_limits=None,
     )
-    az_rms = float(np.sqrt(np.mean(result.az_err ** 2)))
-    el_rms = float(np.sqrt(np.mean(result.el_err ** 2)))
+    az_rms = float(np.sqrt(np.mean(result.az_err**2)))
+    el_rms = float(np.sqrt(np.mean(result.el_err**2)))
     az_peak = float(np.max(np.abs(result.az_err)))
     el_peak = float(np.max(np.abs(result.el_err)))
     assert az_rms < 0.3, f"az_rms={az_rms}"
@@ -230,8 +241,8 @@ def test_replay_no_ff_is_worse(tmp_traj_file):
     traj = replay.load_trajectory(tmp_traj_file)
     ff_result = replay.simulate_replay(traj, use_ff=True, az_limits=None)
     no_ff_result = replay.simulate_replay(traj, use_ff=False, az_limits=None)
-    ff_az_rms = float(np.sqrt(np.mean(ff_result.az_err ** 2)))
-    no_ff_az_rms = float(np.sqrt(np.mean(no_ff_result.az_err ** 2)))
+    ff_az_rms = float(np.sqrt(np.mean(ff_result.az_err**2)))
+    no_ff_az_rms = float(np.sqrt(np.mean(no_ff_result.az_err**2)))
     # FF should beat no-FF on az at least by a small margin; equality allowed
     # for trivially-slow segments but we picked a curving crossing so FF wins.
     assert ff_az_rms <= no_ff_az_rms + 1e-6
@@ -240,7 +251,8 @@ def test_replay_no_ff_is_worse(tmp_traj_file):
 def test_replay_flags_saturation_on_close_pass(tmp_path):
     """Close overhead pass exceeds plant v_max → saturation is flagged."""
     header, samples = make_straight_aircraft(
-        duration_s=60.0, dt=1.0,
+        duration_s=60.0,
+        dt=1.0,
         lateral_north_m=1000.0,  # 1 km north, 3 km up ⇒ peak el ~71.6°
         altitude_m=3000.0,
         speed_mps=200.0,
