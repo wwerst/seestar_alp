@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 
 import pytest
@@ -1261,6 +1262,46 @@ def test_calibrate_motion_start_409_on_cross_manager_refusal(monkeypatch):
     assert "409" in str(resp.status)
     payload = json.loads(resp.text)
     assert "cross-manager" in payload["error"]
+
+
+# ---------- calibrate_rotation increment values -----------------------
+
+
+def test_calibrate_rotation_step_buttons_use_one_tenth_increments():
+    """Step-size buttons on the calibrate page should expose the
+    sub-degree increments {0.005, 0.02, 0.1} (one-tenth of the prior
+    {0.05, 0.2, 1.0} set). Default-active button should be the
+    middle value (0.02).
+    """
+    template = front_app.fetch_template("calibrate_rotation.html")
+    html = template.render(
+        telescope_id=1,
+        **_minimal_context("calibrate_rotation", online=True),
+    )
+    # New increments present (with explicit data-step attribute so the
+    # JS picks them up via parseFloat).
+    assert 'data-step="0.005"' in html
+    assert 'data-step="0.02"' in html
+    assert 'data-step="0.1"' in html
+    # Old coarse increments should be gone (the visible labels too —
+    # otherwise the user sees "±0.2°" and is surprised by 1/10 motion).
+    assert 'data-step="0.05"' not in html
+    assert 'data-step="0.2"' not in html
+    assert 'data-step="1.0"' not in html
+    # Visible labels match.
+    assert "±0.005°" in html
+    assert "±0.02°" in html
+    assert "±0.1°" in html
+    # The default-active button is the middle (0.02°) so a fresh
+    # session lands on a sensible mid-range step. Match the button
+    # tag without depending on attribute order so unrelated edits
+    # (id, aria-*, etc.) don't break this test.
+    button_match = re.search(r"<button\b[^>]*\bdata-step=\"0\.02\"[^>]*>", html)
+    assert button_match is not None, "Button with data-step=0.02 not found"
+    button_tag = button_match.group(0)
+    assert re.search(r'\bclass="[^"]*\bactive\b[^"]*"', button_tag), (
+        f"data-step=0.02 button is not active: {button_tag}"
+    )
 
 
 # ---------- CalibrateRotationResource ---------------------------------
