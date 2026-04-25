@@ -916,3 +916,36 @@ def test_sparse_template_contexts_render_without_error(template_name, context):
     html = template.render(**context)
     assert isinstance(html, str)
     assert len(html) > 0
+
+
+# ---------- calibrate_rotation increment values -----------------------
+
+
+def test_calibrate_rotation_step_buttons_use_one_tenth_increments():
+    """Step-size buttons on the calibrate page should expose the
+    sub-degree increments {0.005, 0.02, 0.1} (one-tenth of the prior
+    {0.05, 0.2, 1.0} set). Default-active button should be the
+    middle value (0.02).
+    """
+    template = front_app.fetch_template("calibrate_rotation.html")
+    html = template.render(
+        telescope_id=1,
+        **_minimal_context("calibrate_rotation", online=True),
+    )
+    # New increments present (with explicit data-step attribute so the
+    # JS picks them up via parseFloat).
+    assert 'data-step="0.005"' in html
+    assert 'data-step="0.02"' in html
+    assert 'data-step="0.1"' in html
+    # Old coarse increments should be gone (the visible labels too —
+    # otherwise the user sees "±0.2°" and is surprised by 1/10 motion).
+    assert 'data-step="0.05"' not in html
+    assert 'data-step="0.2"' not in html
+    assert 'data-step="1.0"' not in html
+    # Visible labels match.
+    assert "±0.005°" in html
+    assert "±0.02°" in html
+    assert "±0.1°" in html
+    # The default-active button is the middle (0.02°) so a fresh
+    # session lands on a sensible mid-range step.
+    assert '<button class="cal-btn active" data-step="0.02">' in html
