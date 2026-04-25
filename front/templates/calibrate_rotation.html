@@ -131,6 +131,44 @@
 
     <!-- RIGHT: state-machine panels -->
     <div class="cal-controls-col">
+      <!-- MODE TOGGLE -->
+      <div class="cal-card" id="cal-mode-toggle">
+        <h4>Calibration mode</h4>
+        <div class="cal-btn-row">
+          <button id="cal-mode-day" class="cal-btn primary" data-mode="day">☀️ Daytime (FAA landmarks)</button>
+          <button id="cal-mode-night" class="cal-btn" data-mode="night">🌙 Nighttime (plate solve)</button>
+        </div>
+        <div id="cal-night-availability" style="font-size:11px; opacity:0.75; margin-top:6px;">checking solver…</div>
+      </div>
+
+      <!-- NIGHTTIME PANEL (hidden by default; show when mode=night) -->
+      <div class="cal-card" id="cal-panel-nighttime" style="display:none;">
+        <h4>Nighttime calibration (plate solve)</h4>
+        <div id="cal-night-summary" style="font-size:12px; margin-bottom:6px;">
+          Sightings: <b id="cal-night-count">0</b>/<span id="cal-night-min">3</span> ·
+          fit RMS: <span id="cal-night-rms">—</span>
+        </div>
+        <div class="cal-btn-row">
+          <button id="cal-night-capture" class="cal-btn primary">📷 Capture sighting</button>
+          <button id="cal-night-skip" class="cal-btn">Skip pending</button>
+          <button id="cal-night-cancel" class="cal-btn danger" style="margin-left:auto;">Cancel</button>
+        </div>
+        <div class="cal-err" id="cal-night-err" style="display:none;"></div>
+        <div id="cal-night-pending" style="font-size:11px; margin-top:6px; opacity:0.85;"></div>
+        <h4 style="margin-top:10px;">Sightings</h4>
+        <table class="cal-resid-table" id="cal-night-table">
+          <thead>
+            <tr>
+              <th>#</th><th>encoder az/el</th><th>RA/Dec</th><th>Δ az</th><th>Δ el</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="cal-night-tbody"></tbody>
+        </table>
+        <div class="cal-btn-row" style="margin-top:10px;">
+          <button id="cal-night-apply" class="cal-btn success" disabled>Apply calibration</button>
+        </div>
+      </div>
+
       <!-- SETUP -->
       <div class="cal-card" id="cal-panel-setup">
         <h4>Setup</h4>
@@ -873,11 +911,202 @@
   window.addEventListener('pagehide', stopMotionBeacon);
   window.addEventListener('beforeunload', stopMotionBeacon);
 
+  // ---- nighttime calibration (item 6) ----
+
+  const nightRoot = `/api/${telescopeId}/calibrate_nighttime`;
+  const nightEls = {
+    toggleDay: document.getElementById('cal-mode-day'),
+    toggleNight: document.getElementById('cal-mode-night'),
+    availability: document.getElementById('cal-night-availability'),
+    panel: document.getElementById('cal-panel-nighttime'),
+    panelSetup: document.getElementById('cal-panel-setup'),
+    capture: document.getElementById('cal-night-capture'),
+    skip: document.getElementById('cal-night-skip'),
+    cancel: document.getElementById('cal-night-cancel'),
+    apply: document.getElementById('cal-night-apply'),
+    count: document.getElementById('cal-night-count'),
+    min: document.getElementById('cal-night-min'),
+    rms: document.getElementById('cal-night-rms'),
+    pending: document.getElementById('cal-night-pending'),
+    err: document.getElementById('cal-night-err'),
+    tbody: document.getElementById('cal-night-tbody'),
+  };
+  let nightAvailable = false;
+
+  async function loadNightAvailability() {
+    try {
+      const r = await fetch(`${nightRoot}/availability`);
+      const j = await r.json();
+      nightAvailable = !!j.solver_available;
+      if (nightAvailable) {
+        nightEls.availability.textContent = `solver: ${j.solver_kind} (${j.solver_path || 'on PATH'})`;
+        nightEls.toggleNight.disabled = false;
+      } else {
+        nightEls.availability.textContent = 'plate solver not configured (see ' + (j.doc_link || 'docs') + ')';
+        nightEls.toggleNight.disabled = true;
+      }
+    } catch (e) {
+      nightEls.availability.textContent = 'availability check failed: ' + e;
+      nightEls.toggleNight.disabled = true;
+    }
+  }
+
+  function setMode(mode) {
+    if (mode === 'night' && !nightAvailable) return;
+    if (mode === 'night') {
+      nightEls.panel.style.display = '';
+      nightEls.panelSetup.style.display = 'none';
+      nightEls.toggleNight.classList.add('primary');
+      nightEls.toggleDay.classList.remove('primary');
+      ensureNightSession();
+    } else {
+      nightEls.panel.style.display = 'none';
+      nightEls.panelSetup.style.display = '';
+      nightEls.toggleDay.classList.add('primary');
+      nightEls.toggleNight.classList.remove('primary');
+    }
+  }
+  nightEls.toggleDay.addEventListener('click', () => setMode('day'));
+  nightEls.toggleNight.addEventListener('click', () => setMode('night'));
+
+  async function ensureNightSession() {
+    try {
+      const r = await fetch(`${nightRoot}/start`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({altitude_m: 2.0}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        nightEls.err.textContent = err.error || 'failed to start nighttime session';
+        nightEls.err.style.display = '';
+        return;
+      }
+      nightEls.err.style.display = 'none';
+    } catch (e) {
+      nightEls.err.textContent = 'failed to start nighttime session: ' + e;
+      nightEls.err.style.display = '';
+    }
+  }
+
+  nightEls.capture.addEventListener('click', async () => {
+    nightEls.capture.disabled = true;
+    nightEls.err.style.display = 'none';
+    // For MVP we let the operator paste an image path manually since
+    // capture + path discovery from the firmware is wired separately.
+    // A future iteration triggers the imager's capture command and
+    // hands the output filename here.
+    const path = window.prompt(
+      'Image path to plate-solve (full path to a captured FITS or JPEG):'
+    );
+    if (!path) {
+      nightEls.capture.disabled = false;
+      return;
+    }
+    try {
+      const r = await fetch(`${nightRoot}/capture`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({image_path: path.trim()}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        nightEls.err.textContent = err.error || 'capture rejected';
+        nightEls.err.style.display = '';
+      }
+    } catch (e) {
+      nightEls.err.textContent = 'capture error: ' + e;
+      nightEls.err.style.display = '';
+    } finally {
+      nightEls.capture.disabled = false;
+    }
+  });
+
+  nightEls.skip.addEventListener('click', async () => {
+    try {
+      await fetch(`${nightRoot}/skip`, {method:'POST'});
+    } catch (e) {}
+  });
+
+  nightEls.cancel.addEventListener('click', async () => {
+    try {
+      await fetch(`${nightRoot}/stop`, {method:'POST'});
+    } catch (e) {}
+    setMode('day');
+  });
+
+  nightEls.apply.addEventListener('click', async () => {
+    try {
+      const r = await fetch(`${nightRoot}/apply`, {method:'POST'});
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        nightEls.err.textContent = err.error || 'apply failed';
+        nightEls.err.style.display = '';
+        return;
+      }
+      showToast('Nighttime calibration applied.');
+    } catch (e) {
+      nightEls.err.textContent = 'apply error: ' + e;
+      nightEls.err.style.display = '';
+    }
+  });
+
+  async function refreshNightStatus() {
+    if (nightEls.panel.style.display === 'none') return;
+    try {
+      const r = await fetch(`${nightRoot}/state`);
+      if (!r.ok) return;
+      const s = await r.json();
+      nightEls.count.textContent = s.n_accepted || 0;
+      nightEls.min.textContent = s.min_required || 3;
+      if (s.fit && s.fit.residual_rms_deg != null) {
+        nightEls.rms.textContent = s.fit.residual_rms_deg.toFixed(3) + '°';
+      } else {
+        nightEls.rms.textContent = '—';
+      }
+      nightEls.apply.disabled = !s.fit || (s.n_accepted || 0) < (s.min_required || 3);
+      // Pending capture status.
+      if (s.pending) {
+        nightEls.pending.textContent =
+          `pending: ${s.pending.image_path} · ${s.pending.status} · ${s.pending.elapsed_s.toFixed(1)}s`;
+      } else if (s.last_failed) {
+        nightEls.pending.textContent =
+          `last failed: ${s.last_failed.image_path} — ${s.last_failed.error || s.last_failed.status}`;
+      } else {
+        nightEls.pending.textContent = '';
+      }
+      // Sightings table.
+      const rows = (s.sightings || []).map((sg, i) => {
+        const pl = (s.fit && s.fit.per_record && s.fit.per_record[i]) || {};
+        return `<tr>
+          <td>${i + 1}</td>
+          <td>${sg.encoder_az_deg.toFixed(2)}/${sg.encoder_el_deg.toFixed(2)}°</td>
+          <td>${sg.true_ra_deg.toFixed(2)}/${sg.true_dec_deg.toFixed(2)}°</td>
+          <td>${(pl.residual_az_deg ?? 0).toFixed(3)}</td>
+          <td>${(pl.residual_el_deg ?? 0).toFixed(3)}</td>
+          <td><button class="cal-btn cal-night-remove" data-idx="${i}">×</button></td>
+        </tr>`;
+      });
+      nightEls.tbody.innerHTML = rows.join('');
+      nightEls.tbody.querySelectorAll('.cal-night-remove').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          await fetch(`${nightRoot}/remove`, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({idx: parseInt(btn.dataset.idx, 10)}),
+          });
+        });
+      });
+    } catch (e) {}
+  }
+
   // Kick things off.
   loadSetup();
   startMotion();
+  loadNightAvailability();
   setInterval(refreshStatus, 1000);
   setInterval(refreshMotionStatus, 1000);
+  setInterval(refreshNightStatus, 1500);
   refreshStatus();
 })();
 </script>

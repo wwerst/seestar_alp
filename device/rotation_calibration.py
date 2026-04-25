@@ -405,6 +405,151 @@ def solve_rotation(
     )
 
 
+def _predict_mount_azel_from_topo(
+    yaw_deg: float,
+    pitch_deg: float,
+    roll_deg: float,
+    true_az_deg: float,
+    true_el_deg: float,
+) -> tuple[float, float]:
+    """Predict mount-frame (az, el) for a celestial direction given a
+    rotation hypothesis. The true (az, el) is the topocentric direction
+    to a sky target (e.g. plate-solved (RA, Dec) → AltAz). This function
+    rotates the unit vector through ``topo_to_mount`` (the same rotation
+    the daytime path uses via :class:`MountFrame`) and reads back the
+    mount-frame az/el.
+    """
+    az_r = math.radians(true_az_deg)
+    el_r = math.radians(true_el_deg)
+    # Topocentric ENU unit vector. `az` measured east-of-north so x=east,
+    # y=north, z=up.
+    cos_el = math.cos(el_r)
+    east = math.sin(az_r) * cos_el
+    north = math.cos(az_r) * cos_el
+    up = math.sin(el_r)
+    # Apply topo_to_mount (yaw → pitch → roll); inline so we don't import
+    # MountFrame and its observer-site dependency for what is otherwise
+    # a pure rotation. Matches `MountFrame.from_euler_deg` exactly.
+    cy, sy = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
+    cp, sp = math.cos(math.radians(pitch_deg)), math.sin(math.radians(pitch_deg))
+    cr, sr = math.cos(math.radians(roll_deg)), math.sin(math.radians(roll_deg))
+    # yaw about up
+    e1 = cy * east - sy * north
+    n1 = sy * east + cy * north
+    u1 = up
+    # pitch about east
+    e2 = e1
+    n2 = cp * n1 - sp * u1
+    u2 = sp * n1 + cp * u1
+    # roll about north
+    e3 = cr * e2 + sr * u2
+    n3 = n2
+    u3 = -sr * e2 + cr * u2
+    slant = math.sqrt(e3 * e3 + n3 * n3 + u3 * u3)
+    if slant == 0.0:
+        return (0.0, 90.0)
+    pred_az = (math.degrees(math.atan2(e3, n3)) + 360.0) % 360.0
+    pred_el = math.degrees(math.asin(u3 / slant))
+    return pred_az, pred_el
+
+
+def solve_rotation_from_pairs(
+    pairs: list[tuple[float, float, float, float]],
+    *,
+    yaw_seed_deg: float = 0.0,
+    pitch_seed_deg: float = 0.0,
+    roll_seed_deg: float = 0.0,
+    dof: str = "auto",
+) -> RotationSolution:
+    """Least-squares fit of yaw/pitch/roll to ``(encoder_az, encoder_el,
+    true_az, true_el)`` pairs.
+
+    Mirrors :func:`solve_rotation` but skips the landmark-ECEF round-trip
+    so the celestial nighttime path can plug in topocentric (az, el) it
+    already converted from plate-solved (RA, Dec). The math is identical:
+    rotate the true direction through the trial rotation, compare against
+    the encoder reading, fit by Levenberg-Marquardt.
+
+    The returned ``per_landmark`` list is repurposed for celestial
+    sightings — the dicts have a ``kind: "platesolve"`` key plus the
+    encoder + true az/el plus residuals. Records do **not** include
+    landmark-specific fields (``oas``, ``height_amsl_m``, ``slant_m``);
+    callers should treat the field set as a superset variant.
+    """
+    if len(pairs) < 1:
+        raise ValueError("need at least 1 sighting to solve")
+    if dof not in ("auto", "yaw", "full"):
+        raise ValueError(f"unknown dof mode: {dof!r}")
+
+    yaw_only = (dof == "yaw") or (dof == "auto" and len(pairs) == 1)
+
+    def _resid(yaw: float, pitch: float, roll: float) -> np.ndarray:
+        out = np.empty(2 * len(pairs), dtype=np.float64)
+        for i, (enc_az, enc_el, true_az, true_el) in enumerate(pairs):
+            pred_az, pred_el = _predict_mount_azel_from_topo(
+                yaw, pitch, roll, true_az, true_el
+            )
+            d_az = _wrap_pm180(_wrap_pm180(pred_az) - _wrap_pm180(enc_az))
+            d_el = pred_el - enc_el
+            out[2 * i] = d_az
+            out[2 * i + 1] = d_el
+        return out
+
+    if yaw_only:
+
+        def residuals(x: np.ndarray) -> np.ndarray:
+            return _resid(float(x[0]), pitch_seed_deg, roll_seed_deg)
+
+        x0 = np.array([yaw_seed_deg], dtype=np.float64)
+        result = least_squares(residuals, x0, method="lm")
+        yaw = float(result.x[0])
+        pitch, roll = pitch_seed_deg, roll_seed_deg
+    else:
+
+        def residuals(x: np.ndarray) -> np.ndarray:
+            return _resid(float(x[0]), float(x[1]), float(x[2]))
+
+        x0 = np.array(
+            [yaw_seed_deg, pitch_seed_deg, roll_seed_deg],
+            dtype=np.float64,
+        )
+        result = least_squares(residuals, x0, method="lm")
+        yaw, pitch, roll = [float(v) for v in result.x]
+
+    per_record: list[dict] = []
+    sq_sum = 0.0
+    n = 0
+    for enc_az, enc_el, true_az, true_el in pairs:
+        pred_az, pred_el = _predict_mount_azel_from_topo(
+            yaw, pitch, roll, true_az, true_el
+        )
+        r_az = _wrap_pm180(_wrap_pm180(pred_az) - _wrap_pm180(enc_az))
+        r_el = pred_el - enc_el
+        per_record.append(
+            {
+                "kind": "platesolve",
+                "encoder_az_deg": float(enc_az),
+                "encoder_el_deg": float(enc_el),
+                "true_az_deg": float(true_az),
+                "true_el_deg": float(true_el),
+                "predicted_az_deg": float(pred_az),
+                "predicted_el_deg": float(pred_el),
+                "residual_az_deg": float(r_az),
+                "residual_el_deg": float(r_el),
+            }
+        )
+        sq_sum += r_az * r_az + r_el * r_el
+        n += 2
+    rms = float(np.sqrt(sq_sum / n)) if n else 0.0
+    return RotationSolution(
+        yaw_deg=yaw,
+        pitch_deg=pitch,
+        roll_deg=roll,
+        residual_rms_deg=rms,
+        per_landmark=per_record,
+    )
+
+
 # ---------- JSON writer ----------------------------------------------
 
 

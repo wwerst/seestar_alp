@@ -5458,6 +5458,283 @@ class CalibrateMotionFreezeResource:
         )
 
 
+# ---- Nighttime calibration (plate-solve) -----------------------------
+#
+# These endpoints back the nighttime mode on the calibrate page. The UI
+# captures an image at the current encoder pointing, posts the path to
+# /capture, and polls /state for the plate-solve result. After ≥3
+# accepted sightings the operator can /apply to write
+# mount_calibration.json.
+
+
+def _nighttime_status_dict(status):
+    if status is None:
+        return {"active": False}
+    return {
+        "active": status.active,
+        "phase": status.phase,
+        "n_accepted": status.n_accepted,
+        "min_required": status.min_required,
+        "pending": status.pending,
+        "last_failed": status.last_failed,
+        "fit": status.fit,
+        "sightings": list(status.sightings),
+        "errors": list(status.errors),
+    }
+
+
+def _nighttime_session_or_404(req, resp, telescope_id):
+    from device.nighttime_calibration import get_nighttime_manager
+
+    session = get_nighttime_manager().get(int(telescope_id))
+    if session is None or not session.is_active():
+        resp.status = falcon.HTTP_404
+        resp.content_type = "application/json"
+        resp.text = json.dumps({"error": "no active nighttime session"})
+        return None
+    return session
+
+
+class CalibrateNighttimeAvailabilityResource:
+    """GET: report whether a plate solver is configured.
+
+    Drives the UI mode-toggle: the nighttime tab is disabled if no
+    solver is on PATH and no API key is set.
+    """
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        from device.plate_solver import (
+            get_default_plate_solver,
+        )
+
+        solver = get_default_plate_solver()
+        available = solver.is_available()
+        kind = solver.kind
+        path = getattr(solver, "binary_path", "") if available else ""
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            {
+                "solver_available": available,
+                "solver_kind": kind if available else "unavailable",
+                "solver_path": path,
+                "doc_link": "plans/nighttime_calibration.md",
+            }
+        )
+
+
+class CalibrateNighttimeStartResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        from device.alpaca_client import AlpacaClient
+        from device.nighttime_calibration import (
+            NighttimeCalibrationSession,
+            get_nighttime_manager,
+        )
+        from scripts.trajectory.observer import (
+            build_site,
+            fetch_telescope_lonlat,
+        )
+
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "request body must be a JSON object"})
+            return
+        try:
+            alt_m = float(body.get("altitude_m", 2.0))
+        except (TypeError, ValueError):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "altitude_m must be numeric"})
+            return
+        try:
+            cli = AlpacaClient("127.0.0.1", int(Config.port), int(telescope_id))
+            lat, lon = fetch_telescope_lonlat(cli)
+        except Exception as exc:
+            resp.status = falcon.HTTP_503
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": f"GPS unavailable: {exc}"})
+            return
+        site = build_site(lat_deg=lat, lon_deg=lon, alt_m=alt_m)
+        existing = get_nighttime_manager().get(int(telescope_id))
+        if existing is not None and existing.is_active():
+            resp.status = falcon.HTTP_200
+            resp.content_type = "application/json"
+            resp.text = json.dumps(_nighttime_status_dict(existing.status()))
+            return
+        session = NighttimeCalibrationSession(
+            telescope_id=int(telescope_id),
+            site=site,
+            out_path=_CALIBRATION_JSON_PATH,
+        )
+        try:
+            get_nighttime_manager().start(session)
+        except RuntimeError as exc:
+            resp.status = falcon.HTTP_409
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": str(exc)})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            _nighttime_status_dict(get_nighttime_manager().status(int(telescope_id)))
+        )
+
+
+class CalibrateNighttimeStateResource:
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        from device.nighttime_calibration import get_nighttime_manager
+
+        status = get_nighttime_manager().status(int(telescope_id))
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_nighttime_status_dict(status))
+
+
+class CalibrateNighttimeStopResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        from device.nighttime_calibration import get_nighttime_manager
+
+        status = get_nighttime_manager().stop(int(telescope_id))
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_nighttime_status_dict(status))
+
+
+class CalibrateNighttimeCaptureResource:
+    """POST: queue a plate-solve on a captured image. Body must include
+    ``image_path``. The handler reads the current encoder via the
+    calibrate-motion session if one is alive (so the encoder snapshot is
+    consistent with the captured frame); otherwise body must include
+    ``encoder_az_deg`` / ``encoder_el_deg``.
+    """
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict) or "image_path" not in body:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "body must include image_path"})
+            return
+        image_path = str(body["image_path"])
+        # Encoder snapshot: prefer body fields; fall back to motion session.
+        enc_az = body.get("encoder_az_deg")
+        enc_el = body.get("encoder_el_deg")
+        if enc_az is None or enc_el is None:
+            from device.calibrate_motion import get_calibrate_motion_manager
+
+            ms = get_calibrate_motion_manager().get(int(telescope_id))
+            if ms is not None and ms.is_alive():
+                st = ms.status()
+                enc_az = st.cur_cum_az_deg
+                enc_el = st.cur_el_deg
+        if enc_az is None or enc_el is None:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps(
+                {
+                    "error": "encoder position unavailable; supply "
+                    "encoder_az_deg/encoder_el_deg or start a motion session"
+                }
+            )
+            return
+        session = _nighttime_session_or_404(req, resp, telescope_id)
+        if session is None:
+            return
+        try:
+            session.capture_sighting(
+                image_path=image_path,
+                encoder_az_deg=float(enc_az),
+                encoder_el_deg=float(enc_el),
+            )
+        except (ValueError, RuntimeError) as exc:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": str(exc)})
+            return
+        resp.status = falcon.HTTP_202
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_nighttime_status_dict(session.status()))
+
+
+class CalibrateNighttimeSkipResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        session = _nighttime_session_or_404(req, resp, telescope_id)
+        if session is None:
+            return
+        session.skip_pending()
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_nighttime_status_dict(session.status()))
+
+
+class CalibrateNighttimeRemoveResource:
+    """POST: remove an accepted sighting and refit. Body: {idx: int}."""
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict) or "idx" not in body:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "body must include idx"})
+            return
+        try:
+            idx = int(body["idx"])
+        except (TypeError, ValueError):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "idx must be an integer"})
+            return
+        session = _nighttime_session_or_404(req, resp, telescope_id)
+        if session is None:
+            return
+        try:
+            session.remove_sighting(idx)
+        except IndexError as exc:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": str(exc)})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_nighttime_status_dict(session.status()))
+
+
+class CalibrateNighttimeApplyResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        session = _nighttime_session_or_404(req, resp, telescope_id)
+        if session is None:
+            return
+        try:
+            session.apply()
+        except (ValueError, OSError) as exc:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": str(exc)})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_nighttime_status_dict(session.status()))
+
+
 class StatsContentResource:
     _last_render_by_key = {}
     _lock = threading.Lock()
@@ -6747,6 +7024,39 @@ class FrontMain:
         app.add_route(
             "/api/{telescope_id:int}/calibrate_motion/freeze",
             CalibrateMotionFreezeResource(),
+        )
+        # ---- Nighttime calibration (plate-solve) ----
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_nighttime/availability",
+            CalibrateNighttimeAvailabilityResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_nighttime/start",
+            CalibrateNighttimeStartResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_nighttime/state",
+            CalibrateNighttimeStateResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_nighttime/stop",
+            CalibrateNighttimeStopResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_nighttime/capture",
+            CalibrateNighttimeCaptureResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_nighttime/skip",
+            CalibrateNighttimeSkipResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_nighttime/remove",
+            CalibrateNighttimeRemoveResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_nighttime/apply",
+            CalibrateNighttimeApplyResource(),
         )
         app.add_route("/config", ConfigResource())
         app.add_route("/pa_refine", BlindPolarAlignResource())

@@ -555,11 +555,11 @@ class CalibrateMotionManager:
     def start(self, session: CalibrateMotionSession) -> CalibrateMotionSession:
         tid = int(session.telescope_id)
         # Hold the shared per-telescope start-lock across the entire
-        # sequence (cross-check + registry write + session.start()) so
-        # that concurrent CalibrateMotionManager.start / LiveTrackManager.start
-        # calls on the same scope cannot both pass their respective
-        # cross-checks. Without this shared lock, each manager only
-        # locks its own registry → TOCTOU between the two.
+        # sequence (cross-checks + registry write + session.start()) so
+        # that concurrent CalibrationManager / LiveTrackManager /
+        # CalibrateMotionManager starts on the same scope cannot all pass
+        # their respective cross-checks. Mirrors the pattern in
+        # ``device.live_tracker.LiveTrackManager.start``.
         from device._scope_start_lock import get_scope_start_lock
 
         with get_scope_start_lock(tid):
