@@ -125,3 +125,77 @@ def test_azimuth_limits_contains_cum():
     assert lim.contains_cum(435.0)
     assert not lim.contains_cum(-440.0)
     assert not lim.contains_cum(500.0)
+
+
+def test_tracker_save_is_atomic_under_simulated_crash(tmp_path, monkeypatch):
+    """P1-3 audit: CumulativeAzTracker.save must NOT corrupt the
+    destination on SIGKILL/power-loss mid-write. Pre-existing valid
+    contents must survive an interrupted overwrite — otherwise the
+    next session loses cumulative-az and mis-reports cable-wrap state.
+    """
+    path = str(tmp_path / "state.json")
+    # Baseline write.
+    t = CumulativeAzTracker()
+    t.reset(cum_az_deg=125.0, wrapped_az_deg=-235.0)
+    t.save(path)
+    baseline = json.loads(open(path, "r", encoding="utf-8").read())
+    assert baseline["cum_az_deg"] == pytest.approx(125.0)
+
+    # Simulate crash mid-json.dump on a subsequent save.
+    import device._atomic_json as aj
+
+    def boom(*args, **kwargs):
+        f = args[1] if len(args) >= 2 else kwargs.get("fp")
+        if f is not None:
+            f.write('{"cum_az_deg": 999.0,\n')
+            f.flush()
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(aj.json, "dump", boom)
+    t2 = CumulativeAzTracker()
+    t2.reset(cum_az_deg=999.0, wrapped_az_deg=0.0)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        t2.save(path)
+
+    # Restore + verify contents intact.
+    monkeypatch.undo()
+    survived = json.loads(open(path, "r", encoding="utf-8").read())
+    assert survived == baseline
+
+
+def test_azimuth_limits_save_is_atomic_under_simulated_crash(tmp_path, monkeypatch):
+    """P1-3 audit: AzimuthLimits.save must atomically replace the
+    destination so an interrupted write cannot drop hard-stop bounds
+    that gate motion safety.
+    """
+    path = str(tmp_path / "limits.json")
+    lim = AzimuthLimits(
+        ccw_hard_stop_cum_deg=-450.0,
+        cw_hard_stop_cum_deg=450.0,
+        padding_deg=15.0,
+    )
+    lim.save(path)
+    baseline = json.loads(open(path, "r", encoding="utf-8").read())
+    assert baseline["ccw_hard_stop_cum_deg"] == pytest.approx(-450.0)
+
+    import device._atomic_json as aj
+
+    def boom(*args, **kwargs):
+        f = args[1] if len(args) >= 2 else kwargs.get("fp")
+        if f is not None:
+            f.write('{"ccw_hard_stop_cum_deg": 0.0,\n')
+            f.flush()
+        raise RuntimeError("crash")
+
+    monkeypatch.setattr(aj.json, "dump", boom)
+    lim_bad = AzimuthLimits(
+        ccw_hard_stop_cum_deg=-1.0,
+        cw_hard_stop_cum_deg=1.0,
+        padding_deg=0.0,
+    )
+    with pytest.raises(RuntimeError, match="crash"):
+        lim_bad.save(path)
+
+    monkeypatch.undo()
+    survived = json.loads(open(path, "r", encoding="utf-8").read())
+    assert survived == baseline

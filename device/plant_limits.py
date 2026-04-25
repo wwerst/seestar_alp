@@ -66,8 +66,12 @@ class AzimuthLimits:
         return self.usable_ccw_cum_deg <= cum_az <= self.usable_cw_cum_deg
 
     def save(self, path: str = _LIMITS_JSON) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(asdict(self), f, indent=2)
+        # Atomic write: hard-stop limits are loaded by MountFrame on
+        # session start and gate every motion command. Truncation on
+        # SIGKILL/power-loss must not silently drop them.
+        from device._atomic_json import write_atomic_json
+
+        write_atomic_json(path, asdict(self), indent=2)
 
     @classmethod
     def load(cls, path: str = _LIMITS_JSON) -> "AzimuthLimits | None":
@@ -132,9 +136,15 @@ class CumulativeAzTracker:
         }
 
     def save(self, path: str = _STATE_JSON) -> None:
-        """Write cum-az state to disk so the next session can pick it up."""
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        """Write cum-az state to disk so the next session can pick it up.
+
+        Atomic write: the next session's `load_or_fresh` reads this on
+        startup; a truncated file from SIGKILL/power-loss would silently
+        reset cumulative-az and mis-report cable-wrap state.
+        """
+        from device._atomic_json import write_atomic_json
+
+        write_atomic_json(path, self.to_dict(), indent=2)
 
     @classmethod
     def load_or_fresh(
