@@ -964,23 +964,34 @@ class CalibrationManager:
 
     def start(self, session: CalibrationSession) -> CalibrationSession:
         tid = session.telescope_id
-        # Refuse if the live tracker is driving the same mount. The
-        # import is lazy so tests that stub either module don't pull
-        # the other unnecessarily.
-        try:
-            from device.live_tracker import get_manager as _get_tracker_mgr
+        # Hold the shared per-telescope start-lock across the entire
+        # sequence (cross-check + registry write + session.start()) so
+        # that concurrent CalibrationManager.start / LiveTrackManager.start
+        # calls on the same scope cannot both pass their respective
+        # cross-checks. Without this shared lock, each manager only
+        # locks its own registry → TOCTOU between the two.
+        from device._scope_start_lock import get_scope_start_lock
 
-            tracker = _get_tracker_mgr().get(tid)
-            if tracker is not None and tracker.is_alive():
-                raise RuntimeError(f"telescope {tid} is live-tracking; stop first")
-        except ImportError:
-            pass
-        with self._lock:
-            existing = self._sessions.get(tid)
-            if existing is not None and existing.is_alive():
-                raise RuntimeError(f"telescope {tid} already calibrating; stop first")
-            self._sessions[tid] = session
-        session.start()
+        with get_scope_start_lock(int(tid)):
+            # Refuse if the live tracker is driving the same mount. The
+            # import is lazy so tests that stub either module don't pull
+            # the other unnecessarily.
+            try:
+                from device.live_tracker import get_manager as _get_tracker_mgr
+
+                tracker = _get_tracker_mgr().get(tid)
+                if tracker is not None and tracker.is_alive():
+                    raise RuntimeError(f"telescope {tid} is live-tracking; stop first")
+            except ImportError:
+                pass
+            with self._lock:
+                existing = self._sessions.get(tid)
+                if existing is not None and existing.is_alive():
+                    raise RuntimeError(
+                        f"telescope {tid} already calibrating; stop first"
+                    )
+                self._sessions[tid] = session
+            session.start()
         return session
 
     def stop(self, telescope_id: int) -> CalibrationStatus | None:

@@ -1260,31 +1260,40 @@ class LiveTrackManager:
 
     def start(self, session: LiveTrackSession) -> LiveTrackSession:
         tid = int(session.telescope_id)
-        # Refuse if a calibration session is driving the same mount.
-        # Lazy import keeps this module independent of
-        # `device.rotation_calibration` at import time.
-        try:
-            from device.rotation_calibration import get_calibration_manager
+        # Hold the shared per-telescope start-lock across the entire
+        # sequence (cross-check + registry write + session.start()) so
+        # that concurrent CalibrationManager.start / LiveTrackManager.start
+        # calls on the same scope cannot both pass their respective
+        # cross-checks. Without this shared lock, each manager only
+        # locks its own registry → TOCTOU between the two.
+        from device._scope_start_lock import get_scope_start_lock
 
-            if get_calibration_manager().is_running(tid):
-                raise RuntimeError(
-                    f"telescope {tid} is calibrating; stop the calibration first"
-                )
-        except ImportError:
-            pass
-        with self._lock:
-            existing = self._sessions.get(tid)
-            if existing is not None and existing.is_alive():
-                raise RuntimeError(f"telescope {tid} already tracking; stop first")
-            # Start the thread inside the lock so the is_alive() check,
-            # thread spawn, and registry write are atomic. Otherwise two
-            # concurrent /track POSTs can both pass the check (the first
-            # session is registered but its thread hasn't been .start()-ed
-            # yet, so is_alive() returns False), and each spawns its own
-            # tracking thread. The losing session gets overwritten in the
-            # registry but its thread keeps running — orphaned from stop().
-            session.start()
-            self._sessions[tid] = session
+        with get_scope_start_lock(tid):
+            # Refuse if a calibration session is driving the same mount.
+            # Lazy import keeps this module independent of
+            # `device.rotation_calibration` at import time.
+            try:
+                from device.rotation_calibration import get_calibration_manager
+
+                if get_calibration_manager().is_running(tid):
+                    raise RuntimeError(
+                        f"telescope {tid} is calibrating; stop the calibration first"
+                    )
+            except ImportError:
+                pass
+            with self._lock:
+                existing = self._sessions.get(tid)
+                if existing is not None and existing.is_alive():
+                    raise RuntimeError(f"telescope {tid} already tracking; stop first")
+                # Start the thread inside the lock so the is_alive() check,
+                # thread spawn, and registry write are atomic. Otherwise two
+                # concurrent /track POSTs can both pass the check (the first
+                # session is registered but its thread hasn't been .start()-ed
+                # yet, so is_alive() returns False), and each spawns its own
+                # tracking thread. The losing session gets overwritten in the
+                # registry but its thread keeps running — orphaned from stop().
+                session.start()
+                self._sessions[tid] = session
         return session
 
     def stop(self, telescope_id: int) -> SessionStatus | None:
