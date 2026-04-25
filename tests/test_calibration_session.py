@@ -36,11 +36,19 @@ def _site():
 
 def _targets(site):
     """The two visible defaults, as ``(lm, az, el, slant)`` tuples —
-    same shape the CLI and web backends pass to the session."""
+    same shape the CLI and web backends pass to the session.
+
+    Uses ``preserve_order=True`` to mirror the production caller in
+    ``front/app.py``: DEFAULT_LANDMARKS is hand-curated with Hyperion
+    first (closer, lit, primary calibration target). Without this
+    flag, ``filter_visible`` height-sorts and the taller LA broadcast
+    tower leads instead.
+    """
     return filter_visible(
         [HYPERION_06_000301, LA_BROADCAST_06_000177],
         site,
         min_el_deg=0.0,
+        preserve_order=True,
     )
 
 
@@ -155,9 +163,10 @@ def test_session_starts_and_slews_to_first_target(monkeypatch, tmp_path):
         _wait_for_phase(session, "nudging")
         st = session.status()
         assert st.target_idx == 0
-        # filter_visible ranks taller-first among lit landmarks, so the
-        # LA broadcast tower (173 m AMSL) leads Hyperion (103 m AMSL).
-        assert st.current_landmark["oas"] == "06-000177"
+        # With preserve_order=True (the production path), Hyperion
+        # leads — it is the closer, lit primary calibration target.
+        assert st.current_landmark["oas"] == "06-000301"
+        assert "Hyperion" in st.current_landmark["name"]
         # Commit 4: status surfaces aiming_hint + FAA σ_az / σ_el so the
         # UI doesn't have to re-derive them.
         assert "aiming_hint" in st.current_landmark
@@ -165,7 +174,7 @@ def test_session_starts_and_slews_to_first_target(monkeypatch, tmp_path):
         assert st.current_landmark["aiming_hint"]
         assert "sigma_az_deg" in st.current_landmark
         assert "sigma_el_deg" in st.current_landmark
-        # LA broadcast is 1B — both σ should be finite small floats.
+        # Hyperion is 1A — both σ should be finite small floats.
         assert 0 < st.current_landmark["sigma_az_deg"] < 0.5
         assert 0 < st.current_landmark["sigma_el_deg"] < 0.5
         # After the first slew, encoder should match the target (fake
@@ -284,11 +293,12 @@ def test_full_flow_sight_advance_commit(monkeypatch, tmp_path):
     try:
         _wait_for_phase(session, "nudging")
         session.sight()
-        # After sighting target 0, session auto-slews to target 1.
+        # After sighting target 0 (Hyperion), session auto-slews to
+        # target 1 (LA broadcast).
         time.sleep(0.4)
         st1 = session.status()
         assert st1.target_idx == 1
-        assert st1.current_landmark["oas"] == "06-000301"  # Hyperion second
+        assert st1.current_landmark["oas"] == "06-000177"  # LA broadcast second
         assert st1.solution is not None
         assert len(st1.solution["per_landmark"]) == 1
         session.sight()
