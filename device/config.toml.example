@@ -75,7 +75,8 @@ enabled = true
 min_separation_deg = 30.0
 alt_threshold_deg = -10.0
 jog_speed = 1440
-jog_duration_s = 3
+# 6s × 6°/s ≈ 36° single-shot exit against a 30° cone + 5° safety margin.
+jog_duration_s = 6
 
 [logging]
 log_level = 'INFO'   #'WARN' only if trouble    #'INFO' to output more logging      #'DEBUG' still more output

@@ -871,31 +871,65 @@ class Seestar:
 
         # Pre-flight sun-avoidance check. Convert (ra, dec) → sky
         # (az, alt) via the already-wired astropy frame, then refuse
-        # if inside the sun cone. Failures of the conversion itself
-        # (e.g. site_altaz_frame not yet initialised) fall through and
-        # rely on the SunSafetyMonitor as the runtime backstop.
+        # if inside the sun cone.
+        #
+        # Fail-safe: any unexpected exception refuses the slew — better
+        # a false refusal than a sun-pointing slew. The only genuine
+        # fall-through is the [9999.9, 9999.9] sentinel from
+        # get_altaz_from_eq (signals the astropy frame has not yet been
+        # initialised during boot); during that window the
+        # SunSafetyMonitor is the runtime backstop. Mirrors the
+        # fail-safe pattern used by the other pre-flight sites
+        # (streaming_controller.track, live_tracker._auto_slew,
+        # rotation_calibration._slew_to_target, and the runtime
+        # velocity_controller.speed_move wrapper).
         try:
             from astropy.time import Time as _AstropyTime
 
             alt_az = self.get_altaz_from_eq(in_ra, in_dec, _AstropyTime.now())
             alt_deg = float(alt_az[0])
             az_deg = float(alt_az[1])
-            if abs(alt_deg) < 91.0:  # 9999.9 sentinel means the frame wasn't ready
+        except Exception as exc:
+            self.logger.warning(
+                "scope_goto refused (ra=%s dec=%s): sun-safety pre-flight "
+                "failed to compute altaz: %s",
+                in_ra,
+                in_dec,
+                exc,
+            )
+            return False
+        if abs(alt_deg) >= 91.0:
+            # 9999.9 sentinel: astropy frame not yet initialised. The
+            # SunSafetyMonitor is the runtime backstop in this window.
+            self.logger.info(
+                "scope_goto sun pre-flight skipped (astropy frame not ready)"
+            )
+        else:
+            try:
                 from device.sun_safety import is_sun_safe as _is_sun_safe
 
                 sun_safe, sun_reason = _is_sun_safe(az_deg % 360.0, alt_deg)
-                if not sun_safe:
-                    self.logger.warning(
-                        "scope_goto refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): %s",
-                        in_ra,
-                        in_dec,
-                        az_deg,
-                        alt_deg,
-                        sun_reason,
-                    )
-                    return False
-        except Exception as exc:
-            self.logger.warning("sun-safety pre-flight check raised: %s", exc)
+            except Exception as exc:
+                self.logger.warning(
+                    "scope_goto refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): "
+                    "is_sun_safe raised: %s",
+                    in_ra,
+                    in_dec,
+                    az_deg,
+                    alt_deg,
+                    exc,
+                )
+                return False
+            if not sun_safe:
+                self.logger.warning(
+                    "scope_goto refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): %s",
+                    in_ra,
+                    in_dec,
+                    az_deg,
+                    alt_deg,
+                    sun_reason,
+                )
+                return False
 
         data: MessageParams = {"method": "scope_goto", "params": [in_ra, in_dec]}
         self.mark_op_state("goto_target", "stopped")

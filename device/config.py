@@ -244,8 +244,11 @@ class _Config:
             section, "alt_threshold_deg", -10.0
         )
         self.sun_avoidance_jog_speed: int = self.get_toml(section, "jog_speed", 1440)
+        # 6s × 6°/s ≈ 36° single-shot exit against a 30° cone + 5° safety
+        # margin. The previous 3s default produced an 18° step that did
+        # not guarantee cone exit when the mount started near sep≈0°.
         self.sun_avoidance_jog_duration_s: int = self.get_toml(
-            section, "jog_duration_s", 3
+            section, "jog_duration_s", 6
         )
 
     def load_from_form(self, req):

@@ -288,8 +288,13 @@ def test_safety_trip_default_message():
 # --- compute_jog_angle ----------------------------------------------------
 
 
-def _apply_jog(mount_az, mount_el, angle_deg, jog_speed=1440, jog_duration_s=3.0):
-    """Forward-simulate exactly what the monitor does: motion in (daz, del)."""
+def _apply_jog(mount_az, mount_el, angle_deg, jog_speed=1440, jog_duration_s=6.0):
+    """Forward-simulate exactly what the monitor does: motion in (daz, del).
+
+    Default ``jog_duration_s`` matches the operational default in
+    ``compute_jog_angle`` and ``SunSafetyMonitor`` (6 s × ~6°/s = 36°
+    step against a 30° cone with 5° margin).
+    """
     rate = jog_speed / 237.0
     step = rate * jog_duration_s
     rad = math.radians(angle_deg)
@@ -355,6 +360,74 @@ def test_jog_direction_is_opposite_from_sun_in_az_el_space():
     # direction-to-sun has atan2(-10, -10) = -135° → -135 + 360 = 225°.
     # away-from-sun direction: atan2(10, 10) = 45° ≈ the answer.
     assert abs(angle - 45) < 2
+
+
+def test_jog_clears_cone_with_default_params_starting_at_sun_center():
+    """P1-6: with the operational default 6s × ~6°/s ≈ 36° jog, the
+    function must drive the mount *out* of a 30° cone with 5° margin
+    even from the worst case sep ≈ 0° (mount aligned with sun)."""
+    sun_az, sun_alt = 100.0, 30.0
+    # Place the mount basically at the sun (sep ≈ 0.1°). Strictly zero
+    # would short-circuit the primary direction (norm < 1e-6) and force
+    # the +el/−el axial fallbacks; keep a tiny offset to exercise the
+    # primary path.
+    mount_az, mount_el = 100.1, 30.0
+    angle = compute_jog_angle(mount_az, mount_el, sun_az, sun_alt)
+    new_az, new_el = _apply_jog(mount_az, mount_el, angle)
+    new_sep = angular_separation(new_az, new_el, sun_az, sun_alt)
+    assert new_sep >= 35.0 - 1e-6, (
+        f"jog must clear cone+margin from sep≈0; got new_sep={new_sep:.2f} "
+        f"(angle={angle}, new_pos=({new_az:.2f}, {new_el:.2f}))"
+    )
+
+
+def test_jog_clears_cone_for_any_starting_point_inside_cone():
+    """P1-6: across a grid of start positions inside the 30° cone, the
+    default jog must always clear cone + 5° margin (or come within the
+    spherical distortion budget at high elevations)."""
+    sun_az, sun_alt = 180.0, 35.0
+    failures: list[str] = []
+    for daz in (-25, -15, -5, 0, 5, 15, 25):
+        for del_ in (-25, -15, -5, 0, 5, 15, 25):
+            mount_az = (sun_az + daz) % 360.0
+            mount_el = max(-85.0, min(85.0, sun_alt + del_))
+            sep_before = angular_separation(mount_az, mount_el, sun_az, sun_alt)
+            if sep_before > 30.0:
+                continue  # outside cone — not in scope of test
+            angle = compute_jog_angle(mount_az, mount_el, sun_az, sun_alt)
+            new_az, new_el = _apply_jog(mount_az, mount_el, angle)
+            new_sep = angular_separation(new_az, new_el, sun_az, sun_alt)
+            if new_sep < 35.0 - 1e-6:
+                failures.append(
+                    f"daz={daz} del={del_} sep_before={sep_before:.2f} "
+                    f"angle={angle} new_sep={new_sep:.2f}"
+                )
+    assert not failures, "jog failed cone+margin for:\n" + "\n".join(failures)
+
+
+def test_jog_falls_back_to_max_separation_when_jog_too_short():
+    """If jog_duration_s is too short to clear cone+margin from any
+    direction, the function still returns a non-refusal — it picks the
+    candidate with the largest predicted separation (best-effort)."""
+    sun_az, sun_alt = 180.0, 30.0
+    mount_az, mount_el = 180.5, 30.0  # nearly at sun, sep ≈ 0.5°
+    # 0.1 s jog at 1440 → step = 0.6° per axis; cannot reach cone+margin.
+    angle = compute_jog_angle(
+        mount_az,
+        mount_el,
+        sun_az,
+        sun_alt,
+        jog_duration_s=0.1,
+    )
+    # Function must not refuse — it returns SOME angle in [0, 360).
+    assert isinstance(angle, int)
+    assert 0 <= angle < 360
+    # And the chosen direction must increase separation (best of 5
+    # candidates beats the starting separation in this geometry).
+    new_az, new_el = _apply_jog(mount_az, mount_el, angle, jog_duration_s=0.1)
+    new_sep = angular_separation(new_az, new_el, sun_az, sun_alt)
+    sep_before = angular_separation(mount_az, mount_el, sun_az, sun_alt)
+    assert new_sep >= sep_before - 1e-6
 
 
 def test_jog_never_decreases_separation_over_random_inputs():

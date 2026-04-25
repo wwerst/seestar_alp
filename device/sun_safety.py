@@ -188,8 +188,9 @@ def compute_jog_angle(
     sun_alt_deg: float,
     *,
     jog_speed: int = 1440,
-    jog_duration_s: float = 3.0,
-    require_gain_deg: float = 5.0,
+    jog_duration_s: float = 6.0,
+    min_separation_deg: float = DEFAULT_MIN_SEPARATION_DEG,
+    safety_margin_deg: float = 5.0,
 ) -> int:
     """Pick the `speed_move` angle that drives the mount AWAY from the sun.
 
@@ -199,15 +200,18 @@ def compute_jog_angle(
     - 180° = pure -azimuth motion
     - 270° = pure -elevation motion
 
-    Algorithm (small-angle approximation, valid inside the 30° cone):
-    Take the direction-to-sun in local (daz, del) space and reverse it.
-    Then forward-simulate the 3 s jog at firmware speed 1440 (~6°/s per
-    axis) and require the predicted separation to exceed the current
-    separation by at least ``require_gain_deg``. If the check fails
-    (e.g. mount at zenith, sun right at mount), fall back to angle=90°
-    (+el) which is safe whenever the sun is below zenith; if the mount
-    itself sits high (el > 60°) we fall back to angle=270° (−el) to
-    avoid crossing zenith.
+    Algorithm — two-pass selection over candidate directions
+    [primary-reverse-of-sun, +el (90°), −el (270°), +az (0°), −az (180°)]:
+      1. First, return the highest-priority candidate whose forward-
+         simulated separation from the sun reaches
+         ``min_separation_deg + safety_margin_deg`` (absolute cone-exit
+         with cushion). With the operational defaults (jog_speed=1440 ≈
+         6°/s × 6 s = 36° step against a 30° cone + 5° margin), the
+         primary direction satisfies this from anywhere inside the cone.
+      2. If no candidate clears the cone (shorter jog or worse geometry,
+         e.g. very near a pole), return the candidate with the LARGEST
+         predicted separation. The function never refuses; the monitor
+         re-trips on the next tick if still inside the cone.
 
     Returns an integer angle in [0, 360).
     """
@@ -215,47 +219,45 @@ def compute_jog_angle(
     del_diff = sun_alt_deg - mount_el_deg
     norm = math.hypot(daz_diff, del_diff)
 
-    sep_now = angular_separation(mount_az_deg, mount_el_deg, sun_az_deg, sun_alt_deg)
     rate = jog_speed / _SPEED_PER_DEG_PER_SEC  # deg/s
     step = rate * jog_duration_s  # total motion in degrees
+    target_sep = min_separation_deg + safety_margin_deg
 
-    def _verify(angle_deg: int) -> bool:
-        """Forward-sim this angle; True if separation improves enough."""
+    def _new_sep(angle_deg: int) -> float:
+        """Forward-sim this angle; return predicted separation in degrees."""
         rad = math.radians(angle_deg)
         new_az = (mount_az_deg + step * math.cos(rad)) % 360.0
         new_el = max(-90.0, min(90.0, mount_el_deg + step * math.sin(rad)))
-        new_sep = angular_separation(new_az, new_el, sun_az_deg, sun_alt_deg)
-        return new_sep >= sep_now + require_gain_deg
+        return angular_separation(new_az, new_el, sun_az_deg, sun_alt_deg)
 
-    # Primary: reverse of direction-to-sun in (daz, del).
+    # Build candidate list in priority order. Primary first when the
+    # direction-to-sun is well-defined; otherwise fall straight to the
+    # axial fallbacks.
+    candidates: list[int] = []
     if norm > 1e-6:
-        candidate = int(
+        primary = int(
             round((math.degrees(math.atan2(-del_diff, -daz_diff)) + 360.0) % 360.0)
         )
-        if _verify(candidate):
-            return candidate
+        candidates.append(primary)
+    candidates.extend([90, 270, 0, 180])
 
-    # Fallback 1: pure +el (up) — safe unless sun is at zenith above mount.
-    if _verify(90):
-        return 90
-    # Fallback 2: pure -el (down) — mount is high enough that going up would
-    # overshoot zenith and re-approach sun on the other side.
-    if _verify(270):
-        return 270
-    # Fallback 3: pure +az or -az — choose whichever increases separation more.
-    new_sep_plus_az = angular_separation(
-        (mount_az_deg + step) % 360.0,
-        mount_el_deg,
-        sun_az_deg,
-        sun_alt_deg,
-    )
-    new_sep_minus_az = angular_separation(
-        (mount_az_deg - step) % 360.0,
-        mount_el_deg,
-        sun_az_deg,
-        sun_alt_deg,
-    )
-    return 0 if new_sep_plus_az >= new_sep_minus_az else 180
+    # Pass 1: first candidate that clears the cone with margin.
+    for c in candidates:
+        if _new_sep(c) >= target_sep:
+            return c
+
+    # Pass 2: best-effort — pick the candidate with the largest predicted
+    # separation. Always at least matches every other candidate, so this
+    # cannot decrease separation below the geometric maximum reachable
+    # within one jog.
+    best_angle = candidates[0]
+    best_sep = _new_sep(best_angle)
+    for c in candidates[1:]:
+        s = _new_sep(c)
+        if s > best_sep:
+            best_angle = c
+            best_sep = s
+    return best_angle
 
 
 # ---------- SunSafetyMonitor ---------------------------------------------
@@ -305,7 +307,7 @@ class SunSafetyMonitor:
         min_separation_deg: float = DEFAULT_MIN_SEPARATION_DEG,
         alt_threshold_deg: float = DEFAULT_ALT_THRESHOLD_DEG,
         jog_speed: int = 1440,
-        jog_duration_s: int = 3,
+        jog_duration_s: int = 6,
         tick_interval_active_s: float = 2.0,
         tick_interval_dormant_s: float = 60.0,
         enabled: bool = True,

@@ -238,6 +238,53 @@ def test_slew_to_ra_dec_proceeds_when_altaz_conversion_unavailable(
     assert sent[0]["method"] == "scope_goto"
 
 
+def test_slew_to_ra_dec_refuses_when_altaz_conversion_raises(seestar):
+    """Fail-safe: an exception in get_altaz_from_eq (e.g. astropy
+    transform raised, a bad coordinate object) must refuse the slew,
+    not fall through. The sentinel-based fall-through path is the
+    ONLY fail-through case."""
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("astropy transform exploded")
+
+    seestar.get_altaz_from_eq = _boom
+    seestar.mark_op_state = lambda *_a, **_kw: None
+    seestar.wait_end_op = lambda *_a, **_kw: True
+
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+
+    ok = seestar._slew_to_ra_dec([5.0, 30.0])
+    assert ok is False
+    assert sent == [], "scope_goto must not be sent when pre-flight altaz raises"
+
+
+def test_slew_to_ra_dec_refuses_when_is_sun_safe_raises(monkeypatch, seestar):
+    """Fail-safe: an exception from is_sun_safe (e.g. ephem raised on
+    a bad config) must refuse the slew, not fall through."""
+    from device import sun_safety as ss
+
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("ephem exploded")
+
+    monkeypatch.setattr(ss, "is_sun_safe", _boom)
+    seestar.mark_op_state = lambda *_a, **_kw: None
+    seestar.wait_end_op = lambda *_a, **_kw: True
+
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+
+    ok = seestar._slew_to_ra_dec([5.0, 30.0])
+    assert ok is False
+    assert sent == [], "scope_goto must not be sent when is_sun_safe raises"
+
+
 def test_goto_target_returns_false_if_already_in_goto(seestar):
     seestar.is_goto = lambda: True
     ok = seestar.goto_target(
