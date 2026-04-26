@@ -171,12 +171,8 @@ class CalibrationTargetSpec:
         return cls(
             kind=TargetKind.PLATESOLVE,
             label=str(label),
-            seed_az_deg=(
-                float(seed_az_deg) if seed_az_deg is not None else None
-            ),
-            seed_el_deg=(
-                float(seed_el_deg) if seed_el_deg is not None else None
-            ),
+            seed_az_deg=(float(seed_az_deg) if seed_az_deg is not None else None),
+            seed_el_deg=(float(seed_el_deg) if seed_el_deg is not None else None),
         )
 
     # ---------- truth resolution ----------
@@ -207,9 +203,7 @@ class CalibrationTargetSpec:
             return self._resolve_platesolve(plate_solve_result)
         raise ValueError(f"unknown TargetKind: {self.kind!r}")
 
-    def _resolve_faa(
-        self, site: ObserverSite
-    ) -> tuple[float, float, float | None]:
+    def _resolve_faa(self, site: ObserverSite) -> tuple[float, float, float | None]:
         if self.landmark is None:
             raise ValueError("FAA target spec missing landmark")
         # Lazy imports keep this module free of optional-dep + heavy
@@ -230,9 +224,7 @@ class CalibrationTargetSpec:
         self, site: ObserverSite, when_utc: datetime
     ) -> tuple[float, float, float | None]:
         if self.ra_hours is None or self.dec_deg is None:
-            raise ValueError(
-                f"celestial target {self.label!r} missing RA/Dec"
-            )
+            raise ValueError(f"celestial target {self.label!r} missing RA/Dec")
         if when_utc.tzinfo is None:
             when_utc = when_utc.replace(tzinfo=timezone.utc)
         # Planets drift quickly in (RA, Dec). When the spec carries a
@@ -275,9 +267,7 @@ class CalibrationTargetSpec:
         self, plate_solve_result: PlateSolveOutcome | None
     ) -> tuple[float, float, float | None]:
         if plate_solve_result is None:
-            raise ValueError(
-                "platesolve target requires a plate-solve result"
-            )
+            raise ValueError("platesolve target requires a plate-solve result")
         az = float(plate_solve_result.true_az_deg)
         el = float(plate_solve_result.true_el_deg)
         az_wrapped = ((az + 180.0) % 360.0) - 180.0
@@ -303,9 +293,7 @@ class CalibrationTargetSpec:
             from scripts.trajectory.faa_dof import faa_accuracy_ft
 
             h_ft, v_ft = faa_accuracy_ft(self.landmark.accuracy_class)
-            saz, sel = pointing_uncertainty_deg(
-                float(self.slant_m), h_ft, v_ft
-            )
+            saz, sel = pointing_uncertainty_deg(float(self.slant_m), h_ft, v_ft)
             saz_ok = saz if math.isfinite(saz) else None
             sel_ok = sel if math.isfinite(sel) else None
             return (saz_ok, sel_ok)

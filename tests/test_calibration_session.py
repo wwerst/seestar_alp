@@ -509,9 +509,7 @@ def _faa_specs(site):
     ]
 
 
-def test_from_landmarks_factory_produces_working_faa_session(
-    monkeypatch, tmp_path
-):
+def test_from_landmarks_factory_produces_working_faa_session(monkeypatch, tmp_path):
     """The legacy factory must round-trip the existing FAA-only
     targets list through the unified session unchanged."""
     site = _site()
@@ -537,12 +535,9 @@ def test_from_landmarks_factory_produces_working_faa_session(
         session.stop()
 
 
-def test_targets_and_target_specs_are_mutually_exclusive(
-    monkeypatch, tmp_path
-):
+def test_targets_and_target_specs_are_mutually_exclusive(monkeypatch, tmp_path):
     site = _site()
     _install_fakes(monkeypatch, _FakeCli())
-    from device.calibration_targets import CalibrationTargetSpec
 
     specs = _faa_specs(site)
     with pytest.raises(ValueError, match="not both"):
@@ -566,9 +561,7 @@ def test_session_requires_target_specs_or_targets(monkeypatch, tmp_path):
         )
 
 
-def test_mixed_faa_and_celestial_session_runs_through_sighting(
-    monkeypatch, tmp_path
-):
+def test_mixed_faa_and_celestial_session_runs_through_sighting(monkeypatch, tmp_path):
     """A mixed (FAA, celestial) session must drive both targets and
     fit a 3-DOF rotation. The celestial truth is mocked so the test is
     deterministic regardless of wall-clock."""
@@ -589,9 +582,7 @@ def test_mixed_faa_and_celestial_session_runs_through_sighting(
     def _fake_celestial(self, site_, when_utc):
         return fixed_celestial
 
-    monkeypatch.setattr(
-        CalibrationTargetSpec, "_resolve_celestial", _fake_celestial
-    )
+    monkeypatch.setattr(CalibrationTargetSpec, "_resolve_celestial", _fake_celestial)
     faa_specs = _faa_specs(site)
     celestial_spec = CalibrationTargetSpec.celestial(
         "Vega", ra_hours=18.6157, dec_deg=38.7837, vmag=0.03
@@ -648,9 +639,7 @@ def test_celestial_only_session_writes_unified_or_celestial_method(
     def _fake_celestial(self, site_, when_utc):
         return truth_by_label[self.label]
 
-    monkeypatch.setattr(
-        CalibrationTargetSpec, "_resolve_celestial", _fake_celestial
-    )
+    monkeypatch.setattr(CalibrationTargetSpec, "_resolve_celestial", _fake_celestial)
     specs = [
         CalibrationTargetSpec.celestial(
             "Vega", ra_hours=18.6157, dec_deg=38.7837, vmag=0.03
@@ -702,9 +691,7 @@ def test_platesolve_session_requires_solver(monkeypatch, tmp_path):
         CalibrationSession(
             telescope_id=31,
             target_specs=[
-                CalibrationTargetSpec.from_landmark(
-                    HYPERION_06_000301, slant_m=5523.0
-                ),
+                CalibrationTargetSpec.from_landmark(HYPERION_06_000301, slant_m=5523.0),
                 CalibrationTargetSpec.platesolve("free aim 1"),
             ],
             site=site,
@@ -727,9 +714,7 @@ def test_platesolve_failure_does_not_append_sighting(monkeypatch, tmp_path):
     def _capture():
         return Path("/tmp/fake-cap.fits")
 
-    spec_faa = CalibrationTargetSpec.from_landmark(
-        HYPERION_06_000301, slant_m=5523.0
-    )
+    spec_faa = CalibrationTargetSpec.from_landmark(HYPERION_06_000301, slant_m=5523.0)
     spec_lab = CalibrationTargetSpec.from_landmark(
         LA_BROADCAST_06_000177, slant_m=8500.0
     )
@@ -781,13 +766,9 @@ def test_status_response_includes_kind_metadata(monkeypatch, tmp_path):
     def _fake_celestial(self, site_, when_utc):
         return fixed
 
-    monkeypatch.setattr(
-        CalibrationTargetSpec, "_resolve_celestial", _fake_celestial
-    )
+    monkeypatch.setattr(CalibrationTargetSpec, "_resolve_celestial", _fake_celestial)
     specs = [
-        CalibrationTargetSpec.from_landmark(
-            HYPERION_06_000301, slant_m=5523.0
-        ),
+        CalibrationTargetSpec.from_landmark(HYPERION_06_000301, slant_m=5523.0),
         CalibrationTargetSpec.celestial(
             "Vega", ra_hours=18.6157, dec_deg=38.7837, vmag=0.03
         ),

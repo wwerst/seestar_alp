@@ -5072,9 +5072,7 @@ class CalibrationStartResource:
             if not isinstance(targets_payload, list) or len(targets_payload) < 1:
                 resp.status = falcon.HTTP_400
                 resp.content_type = "application/json"
-                resp.text = json.dumps(
-                    {"error": "'targets' must be a non-empty list"}
-                )
+                resp.text = json.dumps({"error": "'targets' must be a non-empty list"})
                 return
         if target_oas is not None and not (
             isinstance(target_oas, list) and all(isinstance(x, str) for x in target_oas)
@@ -5211,9 +5209,7 @@ class CalibrationStartResource:
                     if hit[0].oas not in seen:
                         faa_pool.append(hit)
                         seen.add(hit[0].oas)
-            specs, err = _build_unified_target_specs(
-                targets_payload, faa_pool=faa_pool
-            )
+            specs, err = _build_unified_target_specs(targets_payload, faa_pool=faa_pool)
             if err is not None:
                 resp.status = err.get("status", falcon.HTTP_400)
                 resp.content_type = "application/json"
@@ -5224,9 +5220,7 @@ class CalibrationStartResource:
         # Plate-solve gate: refuse if any spec is platesolve and no
         # solver is configured. Surfacing a 503 here avoids the
         # session crashing on first sight.
-        needs_solver = any(
-            ts.kind == TargetKind.PLATESOLVE for ts in target_specs
-        )
+        needs_solver = any(ts.kind == TargetKind.PLATESOLVE for ts in target_specs)
         if needs_solver:
             plate_solver = get_default_plate_solver()
             if isinstance(plate_solver, UnavailablePlateSolver):
@@ -5317,23 +5311,16 @@ def _build_unified_target_specs(targets_payload, *, faa_pool):
                     "error": f"targets[{i}] (faa) requires 'oas'",
                     "status": falcon.HTTP_400,
                 }
-            hit = next(
-                (h for h in faa_pool if h[0].oas == oas), None
-            )
+            hit = next((h for h in faa_pool if h[0].oas == oas), None)
             if hit is None:
                 return [], {
                     "error": (
-                        f"targets[{i}] (faa) oas {oas!r} not visible "
-                        "or not found"
+                        f"targets[{i}] (faa) oas {oas!r} not visible or not found"
                     ),
                     "status": falcon.HTTP_400,
                 }
             lm, _az, _el, slant = hit
-            specs.append(
-                CalibrationTargetSpec.from_landmark(
-                    lm, slant_m=float(slant)
-                )
-            )
+            specs.append(CalibrationTargetSpec.from_landmark(lm, slant_m=float(slant)))
         elif kind == TargetKind.CELESTIAL:
             name = entry.get("name")
             ra_hours = entry.get("ra_hours")
@@ -5346,8 +5333,7 @@ def _build_unified_target_specs(targets_payload, *, faa_pool):
             ):
                 return [], {
                     "error": (
-                        f"targets[{i}] (celestial) requires "
-                        "name, ra_hours, dec_deg"
+                        f"targets[{i}] (celestial) requires name, ra_hours, dec_deg"
                     ),
                     "status": falcon.HTTP_400,
                 }
@@ -5357,8 +5343,7 @@ def _build_unified_target_specs(targets_payload, *, faa_pool):
             except (TypeError, ValueError):
                 return [], {
                     "error": (
-                        f"targets[{i}] (celestial) ra_hours / "
-                        "dec_deg must be numeric"
+                        f"targets[{i}] (celestial) ra_hours / dec_deg must be numeric"
                     ),
                     "status": falcon.HTTP_400,
                 }
@@ -5377,20 +5362,14 @@ def _build_unified_target_specs(targets_payload, *, faa_pool):
             label = entry.get("label")
             if not isinstance(label, str) or not label:
                 return [], {
-                    "error": (
-                        f"targets[{i}] (platesolve) requires 'label'"
-                    ),
+                    "error": (f"targets[{i}] (platesolve) requires 'label'"),
                     "status": falcon.HTTP_400,
                 }
             seed_az = entry.get("seed_az_deg")
             seed_el = entry.get("seed_el_deg")
             try:
-                seed_az_v = (
-                    float(seed_az) if seed_az is not None else None
-                )
-                seed_el_v = (
-                    float(seed_el) if seed_el is not None else None
-                )
+                seed_az_v = float(seed_az) if seed_az is not None else None
+                seed_el_v = float(seed_el) if seed_el is not None else None
             except (TypeError, ValueError):
                 return [], {
                     "error": (
@@ -5433,18 +5412,14 @@ def _calibration_capture_image_fn(telescope_id: int):
         except Exception as exc:
             raise RuntimeError(f"image capture failed: {exc}") from exc
         if not isinstance(result, dict):
-            raise RuntimeError(
-                f"image capture returned unexpected payload: {result!r}"
-            )
+            raise RuntimeError(f"image capture returned unexpected payload: {result!r}")
         path = (
             result.get("result", {}).get("image_path")
             if isinstance(result.get("result"), dict)
             else None
         )
         if not path:
-            raise RuntimeError(
-                "image capture: firmware did not return image_path"
-            )
+            raise RuntimeError("image capture: firmware did not return image_path")
         return Path(str(path))
 
     return _capture

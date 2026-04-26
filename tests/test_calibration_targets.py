@@ -38,9 +38,7 @@ def _site():
 
 
 def test_from_landmark_builds_faa_spec():
-    spec = CalibrationTargetSpec.from_landmark(
-        HYPERION_06_000301, slant_m=5523.0
-    )
+    spec = CalibrationTargetSpec.from_landmark(HYPERION_06_000301, slant_m=5523.0)
     assert spec.kind is TargetKind.FAA
     assert spec.landmark is HYPERION_06_000301
     assert spec.slant_m == pytest.approx(5523.0)
@@ -107,9 +105,7 @@ def test_resolve_faa_is_time_independent():
 
 
 def test_resolve_faa_without_landmark_raises():
-    spec = CalibrationTargetSpec(
-        kind=TargetKind.FAA, label="bogus", landmark=None
-    )
+    spec = CalibrationTargetSpec(kind=TargetKind.FAA, label="bogus", landmark=None)
     with pytest.raises(ValueError, match="missing landmark"):
         spec.resolve_true_altaz(_site(), datetime.now(timezone.utc))
 
@@ -118,20 +114,20 @@ def test_resolve_faa_without_landmark_raises():
 
 
 def test_resolve_celestial_vega_from_la():
-    """Vega from Los Angeles, 2026-04-26 06:00 UTC (≈ pre-dawn local).
-    At that time Vega is in the northeast, mid-altitude — verify the
-    az/el are in the expected octant. Cross-check with astropy: at
-    LA on 2026-04-26 06:00 UTC, Vega is ~az 50°, el ~70°."""
+    """Vega from Los Angeles, 2026-04-26 11:00 UTC (≈ 4 AM PT, pre-dawn
+    local). At that time Vega is high in the northeast — verify the az/el
+    are in the expected octant. Cross-check with astropy: at LA on
+    2026-04-26 11:00 UTC, Vega is at az ≈ 66.6°, el ≈ 74.4°."""
     site = build_site(**LA)
     spec = CalibrationTargetSpec.celestial(
         "Vega", ra_hours=18.6157, dec_deg=38.7837, vmag=0.03
     )
-    when = datetime(2026, 4, 26, 6, 0, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 4, 26, 11, 0, 0, tzinfo=timezone.utc)
     az_wrapped, el, slant = spec.resolve_true_altaz(site, when)
     # Az is wrapped to [-180, 180); add 360 to get [0, 360).
     az = az_wrapped + 360.0 if az_wrapped < 0 else az_wrapped
-    assert 30.0 < az < 80.0
-    assert 60.0 < el < 80.0
+    assert 60.0 < az < 75.0
+    assert 70.0 < el < 80.0
     assert slant is None  # no slant for celestial
 
 
@@ -165,9 +161,7 @@ def test_resolve_celestial_drifts_in_time():
 
 
 def test_resolve_celestial_without_radec_raises():
-    spec = CalibrationTargetSpec(
-        kind=TargetKind.CELESTIAL, label="ghost"
-    )
+    spec = CalibrationTargetSpec(kind=TargetKind.CELESTIAL, label="ghost")
     with pytest.raises(ValueError, match="missing RA/Dec"):
         spec.resolve_true_altaz(_site(), datetime.now(timezone.utc))
 
@@ -189,9 +183,7 @@ def test_resolve_celestial_naive_datetime_treated_as_utc():
 
 def test_resolve_platesolve_uses_outcome_directly():
     spec = CalibrationTargetSpec.platesolve("free aim 1")
-    outcome = PlateSolveOutcome(
-        true_az_deg=72.5, true_el_deg=45.0, sigma_deg=0.005
-    )
+    outcome = PlateSolveOutcome(true_az_deg=72.5, true_el_deg=45.0, sigma_deg=0.005)
     az_wrapped, el, slant = spec.resolve_true_altaz(
         _site(), datetime.now(timezone.utc), plate_solve_result=outcome
     )
@@ -204,9 +196,7 @@ def test_resolve_platesolve_uses_outcome_directly():
 def test_resolve_platesolve_wraps_az_into_pm180():
     """Outcomes with az > 180 should be wrapped to [-180, 180)."""
     spec = CalibrationTargetSpec.platesolve("east horizon")
-    outcome = PlateSolveOutcome(
-        true_az_deg=359.0, true_el_deg=10.0, sigma_deg=None
-    )
+    outcome = PlateSolveOutcome(true_az_deg=359.0, true_el_deg=10.0, sigma_deg=None)
     az_wrapped, _, _ = spec.resolve_true_altaz(
         _site(), datetime.now(timezone.utc), plate_solve_result=outcome
     )
@@ -225,9 +215,7 @@ def test_resolve_platesolve_without_outcome_raises():
 def test_sigma_faa_carries_through_pointing_uncertainty():
     """For an FAA spec with a known accuracy class (1A) + slant,
     ``sigma_az_el_deg`` matches ``pointing_uncertainty_deg``."""
-    spec = CalibrationTargetSpec.from_landmark(
-        HYPERION_06_000301, slant_m=5523.0
-    )
+    spec = CalibrationTargetSpec.from_landmark(HYPERION_06_000301, slant_m=5523.0)
     saz, sel = spec.sigma_az_el_deg()
     # Hyperion is 1A (±50ft horiz, ±3ft vert); should yield sub-degree
     # σ given the 5.5 km slant.
@@ -264,9 +252,7 @@ def test_sigma_faa_without_slant_returns_none():
 
 
 def test_to_dict_faa_carries_landmark_fields():
-    spec = CalibrationTargetSpec.from_landmark(
-        HYPERION_06_000301, slant_m=5523.0
-    )
+    spec = CalibrationTargetSpec.from_landmark(HYPERION_06_000301, slant_m=5523.0)
     d = spec.to_dict()
     assert d["kind"] == "faa"
     assert d["oas"] == "06-000301"

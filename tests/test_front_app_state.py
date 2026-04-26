@@ -1528,9 +1528,7 @@ def test_calibration_start_with_unified_targets_payload(monkeypatch, tmp_path):
     assert kinds == ["faa", "celestial"]
 
 
-def test_calibration_start_legacy_target_oas_payload_still_works(
-    monkeypatch, tmp_path
-):
+def test_calibration_start_legacy_target_oas_payload_still_works(monkeypatch, tmp_path):
     """The existing ``target_oas`` shape must keep working — the
     resource translates it into FAA-kind specs."""
     _patch_unified_start_env(monkeypatch, tmp_path)
@@ -1548,9 +1546,7 @@ def test_calibration_start_legacy_target_oas_payload_still_works(
     assert payload["targets"][0]["kind"] == "faa"
 
 
-def test_calibration_start_rejects_both_targets_and_target_oas(
-    monkeypatch, tmp_path
-):
+def test_calibration_start_rejects_both_targets_and_target_oas(monkeypatch, tmp_path):
     _patch_unified_start_env(monkeypatch, tmp_path)
     body = {
         "altitude_m": 2.0,
@@ -1589,9 +1585,7 @@ def test_calibration_start_rejects_unknown_kind(monkeypatch, tmp_path):
     assert "unknown kind" in json.loads(resp.text)["error"]
 
 
-def test_calibration_start_rejects_celestial_missing_radec(
-    monkeypatch, tmp_path
-):
+def test_calibration_start_rejects_celestial_missing_radec(monkeypatch, tmp_path):
     _patch_unified_start_env(monkeypatch, tmp_path)
     body = {
         "altitude_m": 2.0,
@@ -1621,9 +1615,7 @@ def test_calibration_start_rejects_unknown_faa_oas(monkeypatch, tmp_path):
     assert "ZZ-999999" in json.loads(resp.text)["error"]
 
 
-def test_calibration_start_platesolve_without_solver_returns_503(
-    monkeypatch, tmp_path
-):
+def test_calibration_start_platesolve_without_solver_returns_503(monkeypatch, tmp_path):
     """If the targets array has a platesolve entry but no plate solver
     is configured, the start request must 503 rather than crash on
     first sight."""
@@ -1659,9 +1651,7 @@ def test_celestial_targets_returns_visible_pool(monkeypatch):
     from device.config import Config
 
     monkeypatch.setattr(Config, "port", 5555)
-    monkeypatch.setattr(
-        "device.alpaca_client.AlpacaClient", lambda *a, **k: None
-    )
+    monkeypatch.setattr("device.alpaca_client.AlpacaClient", lambda *a, **k: None)
     monkeypatch.setattr(
         "scripts.trajectory.observer.fetch_telescope_lonlat",
         lambda _cli: (34.0522, -118.2437),
@@ -1677,9 +1667,7 @@ def test_celestial_targets_returns_visible_pool(monkeypatch):
 
     req = _Req()
     resp = _Resp()
-    front_app.CalibrationCelestialTargetsResource.on_get(
-        req, resp, telescope_id=1
-    )
+    front_app.CalibrationCelestialTargetsResource.on_get(req, resp, telescope_id=1)
     assert resp.status == "200 OK"
     payload = json.loads(resp.text)
     assert "targets" in payload
@@ -1698,9 +1686,7 @@ def test_celestial_targets_partial_pointing_400(monkeypatch):
     from device.config import Config
 
     monkeypatch.setattr(Config, "port", 5555)
-    monkeypatch.setattr(
-        "device.alpaca_client.AlpacaClient", lambda *a, **k: None
-    )
+    monkeypatch.setattr("device.alpaca_client.AlpacaClient", lambda *a, **k: None)
     monkeypatch.setattr(
         "scripts.trajectory.observer.fetch_telescope_lonlat",
         lambda _cli: (34.0522, -118.2437),
@@ -1716,7 +1702,5 @@ def test_celestial_targets_partial_pointing_400(monkeypatch):
 
     req = _Req()
     resp = _Resp()
-    front_app.CalibrationCelestialTargetsResource.on_get(
-        req, resp, telescope_id=1
-    )
+    front_app.CalibrationCelestialTargetsResource.on_get(req, resp, telescope_id=1)
     assert resp.status == "400 Bad Request"

@@ -137,14 +137,19 @@ class Sighting:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Sighting):
             return NotImplemented
-        return all(
-            getattr(self, k) == getattr(other, k) for k in self.__slots__
-        )
+        return all(getattr(self, k) == getattr(other, k) for k in self.__slots__)
 
     def __hash__(self) -> int:
         return hash(
-            (self.target, self.encoder_az_deg, self.encoder_el_deg,
-             self.true_az_deg, self.true_el_deg, self.slant_m, self.t_unix)
+            (
+                self.target,
+                self.encoder_az_deg,
+                self.encoder_el_deg,
+                self.true_az_deg,
+                self.true_el_deg,
+                self.slant_m,
+                self.t_unix,
+            )
         )
 
     @property
@@ -470,11 +475,19 @@ def solve_rotation(
         sighting time."""
         if s.target.kind == TargetKind.FAA and s.target.landmark is not None:
             pred_az, pred_el, _ = predict_mount_azel(
-                yaw, pitch, roll, site, s.target.landmark,
+                yaw,
+                pitch,
+                roll,
+                site,
+                s.target.landmark,
             )
             return pred_az, pred_el
         return _predict_mount_azel_from_topo(
-            yaw, pitch, roll, s.true_az_deg, s.true_el_deg,
+            yaw,
+            pitch,
+            roll,
+            s.true_az_deg,
+            s.true_el_deg,
         )
 
     def _resid(yaw: float, pitch: float, roll: float) -> np.ndarray:
@@ -941,9 +954,7 @@ class CalibrationSession:
         if target_specs is None and targets is None:
             raise ValueError("need either target_specs or targets")
         if target_specs is not None and targets is not None:
-            raise ValueError(
-                "pass target_specs or targets, not both"
-            )
+            raise ValueError("pass target_specs or targets, not both")
         if target_specs is None:
             target_specs = [
                 CalibrationTargetSpec.from_landmark(lm, slant_m=float(slant))
@@ -952,9 +963,10 @@ class CalibrationSession:
         if not target_specs:
             raise ValueError("need at least 1 target")
         # Sanity-check plate-solve targets have a solver wired up.
-        if any(
-            ts.kind == TargetKind.PLATESOLVE for ts in target_specs
-        ) and plate_solver is None:
+        if (
+            any(ts.kind == TargetKind.PLATESOLVE for ts in target_specs)
+            and plate_solver is None
+        ):
             raise ValueError(
                 "plate_solver required when target_specs contain PLATESOLVE"
             )
@@ -1142,6 +1154,7 @@ class CalibrationSession:
             if slant is not None:
                 out["slant_m"] = float(slant)
             from scripts.trajectory.faa_dof import aiming_hint as _aim
+
             out["aiming_hint"] = _aim(ts.landmark)
         elif ts.kind == TargetKind.CELESTIAL:
             try:
@@ -1399,20 +1412,14 @@ class CalibrationSession:
             true_az = outcome.true_az_deg
             true_el = outcome.true_el_deg
             slant = None
-            sigma = (
-                outcome.sigma_deg
-                if outcome.sigma_deg is not None
-                else None
-            )
+            sigma = outcome.sigma_deg if outcome.sigma_deg is not None else None
             sigma_az = sigma_el = sigma
         else:
             try:
                 az, el, slant = ts.resolve_true_altaz(self.site, _now_utc())
             except Exception as exc:
                 with self._lock:
-                    self._errors.append(
-                        f"resolve {ts.label} truth: {exc}"
-                    )
+                    self._errors.append(f"resolve {ts.label} truth: {exc}")
                 return
             true_az = float(az)
             true_el = float(el)
@@ -1428,9 +1435,7 @@ class CalibrationSession:
             encoder_el_deg=enc_el,
             true_az_deg=true_az_wrapped,
             true_el_deg=float(true_el),
-            slant_m=(
-                float(slant) if slant is not None else None
-            ),
+            slant_m=(float(slant) if slant is not None else None),
             t_unix=time.time(),
             sigma_az_deg=sigma_az,
             sigma_el_deg=sigma_el,
@@ -1474,26 +1479,20 @@ class CalibrationSession:
         """
         if self._plate_solver is None:
             raise _PlateSolveSightingFailure(
-                "plate solver not configured; cannot sight a "
-                "platesolve target"
+                "plate solver not configured; cannot sight a platesolve target"
             )
         if self._capture_image_fn is None:
             raise _PlateSolveSightingFailure(
-                "no capture_image_fn configured; cannot sight a "
-                "platesolve target"
+                "no capture_image_fn configured; cannot sight a platesolve target"
             )
         try:
             image_path = self._capture_image_fn()
         except Exception as exc:
-            raise _PlateSolveSightingFailure(
-                f"image capture failed: {exc}"
-            ) from exc
+            raise _PlateSolveSightingFailure(f"image capture failed: {exc}") from exc
         try:
             solve_result = self._plate_solver.solve(Path(image_path))
         except Exception as exc:
-            raise _PlateSolveSightingFailure(
-                f"solver error: {exc}"
-            ) from exc
+            raise _PlateSolveSightingFailure(f"solver error: {exc}") from exc
         # Convert (RA, Dec) → topocentric (az, el) using the same path
         # the standalone NighttimeCalibrationSession uses.
         from device.nighttime_calibration import radec_to_topocentric_azel
@@ -1601,14 +1600,10 @@ class CalibrationSession:
             true_el = pred_el
         else:
             try:
-                true_az, true_el, _ = ts.resolve_true_altaz(
-                    self.site, _now_utc()
-                )
+                true_az, true_el, _ = ts.resolve_true_altaz(self.site, _now_utc())
             except Exception as exc:
                 with self._lock:
-                    self._errors.append(
-                        f"resolve {ts.label}: {exc}"
-                    )
+                    self._errors.append(f"resolve {ts.label}: {exc}")
                     self._phase = "error"
                 self._stop_evt.set()
                 return
@@ -1616,9 +1611,7 @@ class CalibrationSession:
                 # FAA: predict mount-frame az/el via prior_frame from
                 # the landmark's ECEF (legacy behaviour preserves the
                 # refraction-after-rotation convention).
-                pred_az, pred_el, _ = prior_frame.ecef_to_mount_azel(
-                    ts.landmark.ecef()
-                )
+                pred_az, pred_el, _ = prior_frame.ecef_to_mount_azel(ts.landmark.ecef())
             else:
                 # CELESTIAL — rotate the topocentric apparent (az, el)
                 # through ``prior_frame.topo_to_mount`` to get
@@ -1640,9 +1633,7 @@ class CalibrationSession:
         )
         if not sun_safe:
             with self._lock:
-                self._errors.append(
-                    f"{sun_reason} (target {ts.label})"
-                )
+                self._errors.append(f"{sun_reason} (target {ts.label})")
                 self._phase = "error"
             self._stop_evt.set()
             return
