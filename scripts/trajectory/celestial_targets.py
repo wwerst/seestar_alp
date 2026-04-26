@@ -365,7 +365,7 @@ BRIGHT_STARS: tuple[CelestialTarget, ...] = (
         dec_deg=54.9254,
         vmag=2.04,  # Mizar A
         bayer="zeta UMa",
-        notes='Naked-eye double 11.8\' from Alcor (mag 4.0).',
+        notes="Naked-eye double 11.8' from Alcor (mag 4.0).",
     ),
     CelestialTarget(
         name="Albireo",
@@ -417,9 +417,7 @@ def _planet_body(name: str) -> ephem.PlanetMoon:
     ``Moon`` (which have their own safety-cone treatment).
     """
     if name not in PLANETS:
-        raise ValueError(
-            f"unknown planet {name!r}; expected one of {PLANETS}"
-        )
+        raise ValueError(f"unknown planet {name!r}; expected one of {PLANETS}")
     return getattr(ephem, name)()
 
 
@@ -546,7 +544,10 @@ def moon_separation_deg(
     moon_az = math.degrees(float(moon.az)) % 360.0
     moon_alt = math.degrees(float(moon.alt))
     return angular_distance_deg(
-        target_az_deg, target_el_deg, moon_az, moon_alt,
+        target_az_deg,
+        target_el_deg,
+        moon_az,
+        moon_alt,
     )
 
 

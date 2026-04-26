@@ -613,6 +613,19 @@ def _none_or_finite(x: float | None) -> float | None:
     return float(x) if math.isfinite(float(x)) else None
 
 
+def _az_compass(x: float | None) -> float | None:
+    """Normalise an az value to [0, 360) for display consistency with
+    the FAA / celestial picker endpoints. Internally we keep az wrapped
+    to [-180, 180) for fit-friendly arithmetic; this helper is only used
+    at the display boundary (status payloads, calibration record exports)."""
+    if x is None:
+        return None
+    xv = float(x)
+    if not math.isfinite(xv):
+        return None
+    return xv % 360.0
+
+
 def _predict_mount_azel_from_topo(
     yaw_deg: float,
     pitch_deg: float,
@@ -972,15 +985,13 @@ class CalibrationSession:
             )
         self.telescope_id = int(telescope_id)
         self.target_specs: list[CalibrationTargetSpec] = list(target_specs)
-        # Pre-resolved truth + sigma cache for FAA targets so the status
-        # response can render the active-target banner before sighting
-        # (matches the legacy ``targets`` tuple shape). Celestial /
-        # plate-solve entries are resolved on demand.
-        self._target_meta: list[dict] = self._resolve_target_meta()
         # Backwards-compat alias kept so internal consumers that relied
         # on ``self.targets`` (and tests / call sites) keep working.
-        # Each entry mirrors the legacy 4-tuple shape for FAA targets;
-        # for non-FAA targets, ``true_az/el/slant`` are None / NaN.
+        # Each entry is a 4-tuple ``(landmark, true_az, true_el, slant)``;
+        # FAA entries carry the ``Landmark`` and slant but leave the
+        # truth (az, el) as NaN — callers that need truth read it from
+        # ``self.target_specs[i].resolve_true_altaz(...)`` (or via the
+        # status payload). Non-FAA entries are all-None / NaN.
         self.targets = self._legacy_targets_view()
         self.site = site
         self.out_path = Path(out_path)
@@ -1039,34 +1050,16 @@ class CalibrationSession:
             dry_run=dry_run,
         )
 
-    def _resolve_target_meta(self) -> list[dict]:
-        """Pre-resolve display metadata for each target. Called once
-        at construction; FAA targets resolve their truth + slant + σ
-        from the spec; celestial / plate-solve targets fill placeholder
-        fields the sighting cycle will overwrite."""
-        meta: list[dict] = []
-        for ts in self.target_specs:
-            entry: dict[str, Any] = {
-                "kind": ts.kind.value,
-                "label": ts.label,
-                "spec": ts,
-            }
-            if ts.kind == TargetKind.FAA and ts.landmark is not None:
-                # FAA truth is time-independent, so resolve eagerly.
-                # ``site`` is needed; called before self.site is set,
-                # so accept None ``slant_m`` and recompute lazily in
-                # ``status()``.
-                pass
-            meta.append(entry)
-        return meta
-
     def _legacy_targets_view(
         self,
     ) -> list[tuple[Landmark | None, float, float, float]]:
         """Compatibility shim for code that still expects the legacy
-        4-tuple shape. FAA entries get the original landmark + truth;
-        non-FAA entries get a placeholder so existing index iteration
-        doesn't crash. New callers should use ``self.target_specs``."""
+        4-tuple shape ``(landmark, true_az, true_el, slant)``. FAA
+        entries carry the original landmark + slant; ``true_az`` /
+        ``true_el`` are NaN here (callers that need truth resolve it
+        on-demand via ``CalibrationTargetSpec.resolve_true_altaz`` or
+        the status payload). Non-FAA entries are all-None / NaN. New
+        callers should use ``self.target_specs`` directly."""
         out: list[tuple[Landmark | None, float, float, float]] = []
         for ts in self.target_specs:
             if ts.kind == TargetKind.FAA and ts.landmark is not None:
@@ -1134,22 +1127,28 @@ class CalibrationSession:
         (``oas``, ``name``, ``slant_m``, ``aiming_hint``) so the existing
         UI banner keeps rendering; celestial / plate-solve add their own
         kind-specific fields. Every record carries ``kind`` so the UI
-        can pick the right glyph and tooltip."""
+        can pick the right glyph and tooltip.
+
+        ``true_az_deg`` is normalised to [0, 360) here so the status
+        banner matches the picker endpoints (`/calibration/targets` and
+        `/calibration/celestial_targets`), which both report compass az
+        in [0, 360). Internally, ``CalibrationTargetSpec.resolve_true_altaz``
+        returns az wrapped to [-180, 180) for fit-friendly arithmetic;
+        the wrap-to-360 happens at the display boundary only."""
         if not (0 <= idx < len(self.target_specs)):
             return None
         ts = self.target_specs[idx]
         out: dict[str, Any] = ts.to_dict()
         # Truth / sigma resolve. For FAA targets we resolve from the
-        # cached spec; celestial uses a fresh now-UTC; plate-solve
-        # surfaces the seed (or NaN) until a sighting fills in the
-        # WCS-derived truth.
+        # spec; celestial uses a fresh now-UTC; plate-solve surfaces the
+        # seed (or NaN) until a sighting fills in the WCS-derived truth.
         if ts.kind == TargetKind.FAA and ts.landmark is not None:
             try:
                 az, el, slant = ts.resolve_true_altaz(self.site, _now_utc())
             except Exception:
                 az = el = float("nan")
                 slant = None
-            out["true_az_deg"] = _none_or_finite(az)
+            out["true_az_deg"] = _az_compass(az)
             out["true_el_deg"] = _none_or_finite(el)
             if slant is not None:
                 out["slant_m"] = float(slant)
@@ -1159,7 +1158,7 @@ class CalibrationSession:
         elif ts.kind == TargetKind.CELESTIAL:
             try:
                 az, el, _ = ts.resolve_true_altaz(self.site, _now_utc())
-                out["true_az_deg"] = float(az)
+                out["true_az_deg"] = _az_compass(float(az))
                 out["true_el_deg"] = float(el)
             except Exception:
                 out["true_az_deg"] = None
@@ -1170,7 +1169,9 @@ class CalibrationSession:
             )
         elif ts.kind == TargetKind.PLATESOLVE:
             out["true_az_deg"] = (
-                float(ts.seed_az_deg) if ts.seed_az_deg is not None else None
+                _az_compass(float(ts.seed_az_deg))
+                if ts.seed_az_deg is not None
+                else None
             )
             out["true_el_deg"] = (
                 float(ts.seed_el_deg) if ts.seed_el_deg is not None else None
@@ -1584,10 +1585,21 @@ class CalibrationSession:
         ts = self.target_specs[idx]
         prior_frame = self._prior_frame or MountFrame.from_identity_enu(self.site)
         # Plate-solve free-aim mode: no slew, no sun check (the operator
-        # is already pointing somewhere they jogged to). Skip ahead.
+        # is already pointing somewhere they jogged to). Seed
+        # ``_target_az/_target_el`` from the current encoder so the
+        # nudge pad has a baseline to apply deltas to (otherwise
+        # ``_on_nudge`` short-circuits when the baseline is missing).
         if ts.kind == TargetKind.PLATESOLVE and (
             ts.seed_az_deg is None or ts.seed_el_deg is None
         ):
+            cur_el, cur_az = self._read_encoder_nonfatal(cli)
+            if cur_az is not None and cur_el is not None:
+                cur_az_wrapped = ((float(cur_az) + 180.0) % 360.0) - 180.0
+                with self._lock:
+                    self._target_az = cur_az_wrapped
+                    self._target_el = float(cur_el)
+                    self._encoder_az = cur_az_wrapped
+                    self._encoder_el = float(cur_el)
             return
         # Resolve seed (mount-frame) + truth (sky-frame). For FAA /
         # CELESTIAL we resolve the truth from the spec; for seeded

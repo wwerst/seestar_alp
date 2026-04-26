@@ -1568,7 +1568,24 @@ def test_calibration_start_rejects_empty_targets_list(monkeypatch, tmp_path):
     resp = _StartResp()
     front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
     assert resp.status == "400 Bad Request"
-    assert "non-empty" in json.loads(resp.text)["error"]
+    assert "at least 2" in json.loads(resp.text)["error"]
+
+
+def test_calibration_start_rejects_single_target_list(monkeypatch, tmp_path):
+    """Sessions with fewer than 2 sightings can never commit
+    (`_on_commit` requires ≥2). Reject the request up-front instead of
+    starting a session that's stuck."""
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [{"kind": "faa", "oas": "06-000301"}],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "at least 2" in json.loads(resp.text)["error"]
 
 
 def test_calibration_start_rejects_unknown_kind(monkeypatch, tmp_path):
@@ -1576,7 +1593,10 @@ def test_calibration_start_rejects_unknown_kind(monkeypatch, tmp_path):
     body = {
         "altitude_m": 2.0,
         "dry_run": True,
-        "targets": [{"kind": "ad-hoc", "label": "?"}],
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {"kind": "ad-hoc", "label": "?"},
+        ],
     }
     req = _StartReq(media=body)
     resp = _StartResp()
@@ -1591,6 +1611,7 @@ def test_calibration_start_rejects_celestial_missing_radec(monkeypatch, tmp_path
         "altitude_m": 2.0,
         "dry_run": True,
         "targets": [
+            {"kind": "faa", "oas": "06-000301"},
             {"kind": "celestial", "name": "Vega"},  # missing ra/dec
         ],
     }
@@ -1601,12 +1622,40 @@ def test_calibration_start_rejects_celestial_missing_radec(monkeypatch, tmp_path
     assert "celestial" in json.loads(resp.text)["error"]
 
 
+def test_calibration_start_rejects_celestial_non_numeric_vmag(monkeypatch, tmp_path):
+    """A non-numeric ``vmag`` must produce a 400, not a 500 from a
+    bare ``float()`` call."""
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {
+                "kind": "celestial",
+                "name": "Vega",
+                "ra_hours": 18.6157,
+                "dec_deg": 38.7837,
+                "vmag": "bright",
+            },
+        ],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "vmag" in json.loads(resp.text)["error"]
+
+
 def test_calibration_start_rejects_unknown_faa_oas(monkeypatch, tmp_path):
     _patch_unified_start_env(monkeypatch, tmp_path)
     body = {
         "altitude_m": 2.0,
         "dry_run": True,
-        "targets": [{"kind": "faa", "oas": "ZZ-999999"}],
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {"kind": "faa", "oas": "ZZ-999999"},
+        ],
     }
     req = _StartReq(media=body)
     resp = _StartResp()

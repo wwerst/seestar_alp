@@ -5069,10 +5069,18 @@ class CalibrationStartResource:
             )
             return
         if targets_payload is not None:
-            if not isinstance(targets_payload, list) or len(targets_payload) < 1:
+            # Need ≥2 sightings to fit a 3-DOF mount frame; the session
+            # itself will refuse to commit with fewer (`_on_commit`).
+            # Reject up-front so the client gets a clear 400 instead of
+            # starting a session that can never be committed.
+            if not isinstance(targets_payload, list) or len(targets_payload) < 2:
                 resp.status = falcon.HTTP_400
                 resp.content_type = "application/json"
-                resp.text = json.dumps({"error": "'targets' must be a non-empty list"})
+                resp.text = json.dumps(
+                    {
+                        "error": "'targets' must be a non-empty list with at least 2 items"
+                    }
+                )
                 return
         if target_oas is not None and not (
             isinstance(target_oas, list) and all(isinstance(x, str) for x in target_oas)
@@ -5348,13 +5356,20 @@ def _build_unified_target_specs(targets_payload, *, faa_pool):
                     "status": falcon.HTTP_400,
                 }
             vmag = entry.get("vmag")
+            try:
+                vmag_v = float(vmag) if vmag is not None else None
+            except (TypeError, ValueError):
+                return [], {
+                    "error": (f"targets[{i}] (celestial) vmag must be numeric"),
+                    "status": falcon.HTTP_400,
+                }
             bayer = entry.get("bayer")
             specs.append(
                 CalibrationTargetSpec.celestial(
                     name=name,
                     ra_hours=ra_h,
                     dec_deg=dec_d,
-                    vmag=(float(vmag) if vmag is not None else None),
+                    vmag=vmag_v,
                     bayer=(str(bayer) if bayer else None),
                 )
             )

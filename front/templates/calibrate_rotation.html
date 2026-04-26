@@ -487,29 +487,36 @@
     const n = state.selectedTargets.size;
     els.selectedCount.textContent = `(${n})`;
     if (n === 0) {
-      els.selectedList.innerHTML = '(none yet — pick from the lists below)';
+      els.selectedList.textContent = '(none yet — pick from the lists below)';
     } else {
-      const lis = [];
+      // Build via DOM nodes + textContent so user-controlled label / oas /
+      // name strings cannot inject markup (FAA names come from the DOF
+      // catalog and celestial labels come from the catalog, but treat them
+      // all as untrusted on principle).
+      els.selectedList.textContent = '';
       state.selectedTargets.forEach((spec, key) => {
         const glyph = ({faa: '📍', celestial: '★', platesolve: '🎯'})[spec.kind] || '·';
         const label = spec.kind === 'faa'
           ? `${spec.oas} ${spec.name || ''}`
           : (spec.name || spec.label || key);
-        lis.push(
-          `<div>${glyph} ${label}` +
-          ` <button class="cal-btn" data-remove-key="${key}" style="font-size:10px;padding:0 6px;">×</button></div>`
-        );
-      });
-      els.selectedList.innerHTML = lis.join('');
-      els.selectedList.querySelectorAll('button[data-remove-key]').forEach(btn => {
+        const row = document.createElement('div');
+        row.appendChild(document.createTextNode(`${glyph} ${label} `));
+        const btn = document.createElement('button');
+        btn.className = 'cal-btn';
+        btn.dataset.removeKey = key;
+        btn.style.fontSize = '10px';
+        btn.style.padding = '0 6px';
+        btn.textContent = '×';
         btn.addEventListener('click', () => {
-          state.selectedTargets.delete(btn.dataset.removeKey);
+          state.selectedTargets.delete(key);
           renderTargets();
           renderCelestial();
           renderPlatesolve();
           renderSelectedSummary();
           updateStartGate();
         });
+        row.appendChild(btn);
+        els.selectedList.appendChild(row);
       });
     }
   }
@@ -1004,7 +1011,7 @@
       els.activePlatesolve.style.display = (isPS && solving) ? '' : 'none';
       if (isPS && lm.last_platesolve_error) {
         els.activePlatesolve.style.display = '';
-        els.activePlatesolve.innerHTML = `⚠ ${lm.last_platesolve_error}`;
+        els.activePlatesolve.textContent = `⚠ ${lm.last_platesolve_error}`;
       }
       els.sightBtn.disabled = solving;
     } else {
