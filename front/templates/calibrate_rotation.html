@@ -181,9 +181,35 @@
           <input type="number" id="cal-alt-manual" step="0.1" value="2.0" disabled>
           <span>m AMSL</span>
         </div>
-        <h4 style="margin-top:10px;">Targets</h4>
+        <!--
+          Unified target picker: any combination of FAA landmarks,
+          celestial bright stars/planets, and plate-solve free-aim
+          points feeds the same selection set. A single Start button
+          watches its size; the session ingests all three through one
+          /calibration/start payload.
+        -->
+        <h4 style="margin-top:10px;">Selected targets <span id="cal-selected-count" style="opacity:0.6;">(0)</span></h4>
+        <div id="cal-selected-list" style="font-size:11px; opacity:0.85; margin-bottom:8px;">
+          (none yet — pick from the lists below)
+        </div>
+
+        <h4 style="margin-top:10px;">📍 FAA landmarks</h4>
         <div id="cal-target-list">loading…</div>
+
+        <h4 style="margin-top:10px;">★ Celestial (bright stars + planets)</h4>
+        <div id="cal-celestial-list" style="font-size:11px; opacity:0.7;">checking visibility…</div>
+
+        <h4 style="margin-top:10px;">🎯 Plate-solve aim points</h4>
+        <div id="cal-platesolve-help" style="font-size:11px; opacity:0.7; margin-bottom:6px;">
+          Add free-aim slots; you'll jog the mount to each, then Sight to capture + solve.
+        </div>
+        <div id="cal-platesolve-list" style="font-size:12px;"></div>
         <div class="cal-btn-row">
+          <button id="cal-platesolve-add" class="cal-btn">+ Add plate-solve target</button>
+          <span id="cal-platesolve-availability" style="opacity:0.6; margin-left:auto; font-size:11px;"></span>
+        </div>
+
+        <div class="cal-btn-row" style="margin-top:10px;">
           <button id="cal-start-btn" class="cal-btn primary" disabled>Start calibration</button>
           <label style="margin-left:auto;"><input type="checkbox" id="cal-clear-prior"> clear prior</label>
         </div>
@@ -192,11 +218,14 @@
 
       <!-- ACTIVE -->
       <div class="cal-card" id="cal-panel-active" style="display:none;">
-        <h4>Active landmark</h4>
+        <h4>Active target</h4>
         <div class="cal-banner" id="cal-active-banner">
-          <div><span class="oas" id="cal-active-oas">—</span> · <span id="cal-active-name">—</span></div>
+          <div><span id="cal-active-kind-glyph">📍</span> <span class="oas" id="cal-active-oas">—</span> · <span id="cal-active-name">—</span></div>
           <div id="cal-active-geom" style="font-size:11px; opacity:0.8;">—</div>
           <div class="aim" id="cal-active-aim">—</div>
+          <div id="cal-active-platesolve" style="display:none; margin-top:6px; font-size:11px; color: #1e40af;">
+            <span class="cal-spinner">⏳</span> Solving…
+          </div>
         </div>
 
         <h4 style="margin-top:10px;">Step size</h4>
@@ -290,16 +319,24 @@
     altRadios: document.querySelectorAll('input[name=cal-alt-src]'),
     altManual: document.getElementById('cal-alt-manual'),
     targetList: document.getElementById('cal-target-list'),
+    celestialList: document.getElementById('cal-celestial-list'),
+    platesolveList: document.getElementById('cal-platesolve-list'),
+    platesolveAdd: document.getElementById('cal-platesolve-add'),
+    platesolveAvail: document.getElementById('cal-platesolve-availability'),
+    selectedList: document.getElementById('cal-selected-list'),
+    selectedCount: document.getElementById('cal-selected-count'),
     startBtn: document.getElementById('cal-start-btn'),
     clearPrior: document.getElementById('cal-clear-prior'),
     setupErr: document.getElementById('cal-setup-err'),
     panelSetup: document.getElementById('cal-panel-setup'),
     panelActive: document.getElementById('cal-panel-active'),
     panelReview: document.getElementById('cal-panel-review'),
+    activeKindGlyph: document.getElementById('cal-active-kind-glyph'),
     activeOas: document.getElementById('cal-active-oas'),
     activeName: document.getElementById('cal-active-name'),
     activeGeom: document.getElementById('cal-active-geom'),
     activeAim: document.getElementById('cal-active-aim'),
+    activePlatesolve: document.getElementById('cal-active-platesolve'),
     stepRow: document.getElementById('cal-step-row'),
     nudgePad: document.getElementById('cal-nudge-pad'),
     sightBtn: document.getElementById('cal-sight-btn'),
@@ -339,10 +376,20 @@
   let state = {
     priorInfo: null,
     targets: [],           // [{oas, ..., aiming_hint, sigma_az_deg, sigma_el_deg}]
-    selectedOas: new Set(),
+    celestial: [],         // [{name, kind: "star"|"planet"|"double", ra_hours, dec_deg, vmag, az_deg, el_deg, ...}]
+    platesolveTargets: [], // [{label, seed_az_deg, seed_el_deg}]
+    // Unified selection. Key format:
+    //   "faa:06-000301"
+    //   "celestial:Vega"
+    //   "platesolve:<label>"
+    // Value: the JSON dict the server's /calibration/start expects
+    // for ``targets[]``.
+    selectedTargets: new Map(),
     stepDeg: _initialStepDeg(),
     sessionActive: false,
     phase: 'idle',
+    nightAvailable: false,  // mirrors the plate-solver availability check
+    platesolveCounter: 1,
   };
 
   // Motion-primitive client state. Tracks whether the page-lifecycle
@@ -390,6 +437,8 @@
       els.altManual.value = state.priorInfo.prior.observer_alt_m.toFixed(2);
     }
     await refreshTargets();
+    refreshCelestial().catch(() => {});
+    renderPlatesolve();
   }
 
   function renderPrior() {
@@ -432,45 +481,253 @@
     return parseFloat(els.altManual.value) || 2.0;
   }
 
+  function targetKey(kind, ident) { return `${kind}:${ident}`; }
+
+  function renderSelectedSummary() {
+    const n = state.selectedTargets.size;
+    els.selectedCount.textContent = `(${n})`;
+    if (n === 0) {
+      els.selectedList.innerHTML = '(none yet — pick from the lists below)';
+    } else {
+      const lis = [];
+      state.selectedTargets.forEach((spec, key) => {
+        const glyph = ({faa: '📍', celestial: '★', platesolve: '🎯'})[spec.kind] || '·';
+        const label = spec.kind === 'faa'
+          ? `${spec.oas} ${spec.name || ''}`
+          : (spec.name || spec.label || key);
+        lis.push(
+          `<div>${glyph} ${label}` +
+          ` <button class="cal-btn" data-remove-key="${key}" style="font-size:10px;padding:0 6px;">×</button></div>`
+        );
+      });
+      els.selectedList.innerHTML = lis.join('');
+      els.selectedList.querySelectorAll('button[data-remove-key]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          state.selectedTargets.delete(btn.dataset.removeKey);
+          renderTargets();
+          renderCelestial();
+          renderPlatesolve();
+          renderSelectedSummary();
+          updateStartGate();
+        });
+      });
+    }
+  }
+
+  function updateStartGate() {
+    els.startBtn.disabled = state.selectedTargets.size < 2;
+  }
+
   function renderTargets() {
     const list = els.targetList;
     list.innerHTML = '';
-    // Pre-select the first two (defaults).
-    state.selectedOas = new Set(state.targets.slice(0, 2).map(t => t.oas));
+    // Pre-select the first two FAA defaults on first render only —
+    // once the user has touched the selection, leave their picks alone.
+    if (state.selectedTargets.size === 0 && state.targets.length >= 2) {
+      state.targets.slice(0, 2).forEach(t => {
+        state.selectedTargets.set(targetKey('faa', t.oas), {
+          kind: 'faa', oas: t.oas, name: t.name,
+        });
+      });
+    }
     state.targets.forEach(t => {
+      const key = targetKey('faa', t.oas);
       const row = document.createElement('div');
-      row.className = 'cal-target' + (state.selectedOas.has(t.oas) ? ' selected' : '');
+      row.className = 'cal-target' + (state.selectedTargets.has(key) ? ' selected' : '');
       row.innerHTML =
-        `<div><span class="oas">${t.oas}</span> · ${t.name}` +
+        `<div>📍 <span class="oas">${t.oas}</span> · ${t.name}` +
           `<span class="${t.lit ? 'lit-badge' : 'unlit-badge'}">${t.lit ? 'LIT' : 'unlit'}</span></div>` +
         `<div class="geom">az ${t.true_az_deg.toFixed(2)}° · el ${t.true_el_deg.toFixed(2)}° · slant ${(t.slant_m/1000).toFixed(2)} km · ` +
           `FAA σ ${fmtSigma(t.sigma_az_deg)} az / ${fmtSigma(t.sigma_el_deg)} el · ${t.accuracy_class}</div>` +
         `<div class="aim">Aim: ${t.aiming_hint}</div>`;
       row.addEventListener('click', () => {
-        if (state.selectedOas.has(t.oas)) state.selectedOas.delete(t.oas);
-        else state.selectedOas.add(t.oas);
+        if (state.selectedTargets.has(key)) state.selectedTargets.delete(key);
+        else state.selectedTargets.set(key, {kind: 'faa', oas: t.oas, name: t.name});
         renderTargets();
+        renderSelectedSummary();
+        updateStartGate();
       });
       list.appendChild(row);
     });
-    els.startBtn.disabled = state.selectedOas.size < 2;
+    renderSelectedSummary();
+    updateStartGate();
+  }
+
+  async function refreshCelestial() {
+    const altM = getAltitudeManualValue();
+    try {
+      const r = await fetch(`${apiRoot}/celestial_targets?altitude_m=${encodeURIComponent(altM)}`);
+      if (!r.ok) {
+        els.celestialList.textContent = 'celestial unavailable: ' + (await r.json().catch(()=>({})).error || r.statusText);
+        return;
+      }
+      const body = await r.json();
+      state.celestial = body.targets || [];
+      renderCelestial();
+    } catch (e) {
+      els.celestialList.textContent = 'celestial error: ' + e;
+    }
+  }
+
+  function renderCelestial() {
+    const list = els.celestialList;
+    if (!state.celestial.length) {
+      list.textContent = 'no bright stars / planets above horizon';
+      return;
+    }
+    list.innerHTML = '';
+    state.celestial.forEach(t => {
+      const key = targetKey('celestial', t.name);
+      const row = document.createElement('div');
+      row.className = 'cal-target' + (state.selectedTargets.has(key) ? ' selected' : '');
+      const planetTag = t.kind === 'planet' ? ' <span class="lit-badge">planet</span>' : '';
+      const doubleTag = t.kind === 'double' ? ' <span class="unlit-badge">double</span>' : '';
+      row.innerHTML =
+        `<div>★ <span class="oas">${t.name}</span>${planetTag}${doubleTag}` +
+          ` · vmag ${t.vmag != null ? t.vmag.toFixed(2) : '?'}` +
+          (t.bayer ? ` · ${t.bayer}` : '') + `</div>` +
+        `<div class="geom">az ${t.az_deg.toFixed(2)}° · el ${t.el_deg.toFixed(2)}° · ` +
+          `RA ${t.ra_hours != null ? t.ra_hours.toFixed(3) + 'h' : '?'} · ` +
+          `Dec ${t.dec_deg != null ? t.dec_deg.toFixed(2) + '°' : '?'}</div>` +
+        (t.notes ? `<div class="aim">${t.notes}</div>` : '');
+      row.addEventListener('click', () => {
+        if (state.selectedTargets.has(key)) state.selectedTargets.delete(key);
+        else state.selectedTargets.set(key, {
+          kind: 'celestial',
+          name: t.name,
+          ra_hours: t.ra_hours,
+          dec_deg: t.dec_deg,
+          vmag: t.vmag,
+          bayer: t.bayer || undefined,
+        });
+        renderCelestial();
+        renderSelectedSummary();
+        updateStartGate();
+      });
+      list.appendChild(row);
+    });
+  }
+
+  function renderPlatesolve() {
+    const list = els.platesolveList;
+    list.innerHTML = '';
+    if (state.platesolveTargets.length === 0) {
+      list.innerHTML = '<div style="opacity:0.6;">(no plate-solve targets)</div>';
+    } else {
+      state.platesolveTargets.forEach((p, i) => {
+        const key = targetKey('platesolve', p.label);
+        const selected = state.selectedTargets.has(key);
+        const row = document.createElement('div');
+        row.className = 'cal-target' + (selected ? ' selected' : '');
+        const seed = (p.seed_az_deg != null && p.seed_el_deg != null)
+          ? `seed az ${p.seed_az_deg.toFixed(2)}° el ${p.seed_el_deg.toFixed(2)}°`
+          : 'free aim (no seed)';
+        row.innerHTML =
+          `<div>🎯 <span class="oas">${p.label}</span></div>` +
+          `<div class="geom">${seed}</div>`;
+        row.addEventListener('click', (ev) => {
+          if (ev.target.tagName === 'BUTTON') return;
+          if (selected) state.selectedTargets.delete(key);
+          else state.selectedTargets.set(key, {
+            kind: 'platesolve',
+            label: p.label,
+            seed_az_deg: p.seed_az_deg ?? undefined,
+            seed_el_deg: p.seed_el_deg ?? undefined,
+          });
+          renderPlatesolve();
+          renderSelectedSummary();
+          updateStartGate();
+        });
+        const del = document.createElement('button');
+        del.className = 'cal-btn';
+        del.textContent = 'remove';
+        del.style.fontSize = '11px';
+        del.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          state.platesolveTargets.splice(i, 1);
+          state.selectedTargets.delete(key);
+          renderPlatesolve();
+          renderSelectedSummary();
+          updateStartGate();
+        });
+        row.appendChild(del);
+        list.appendChild(row);
+      });
+    }
+    if (els.platesolveAdd) {
+      els.platesolveAdd.disabled = !state.nightAvailable;
+    }
+    if (els.platesolveAvail) {
+      els.platesolveAvail.textContent =
+        state.nightAvailable ? '' : '(plate solver not configured)';
+    }
+  }
+
+  function addPlatesolveTarget() {
+    if (!state.nightAvailable) return;
+    const label = `free aim ${state.platesolveCounter++}`;
+    const seedRaw = window.prompt(
+      'Optional seed az,el (deg, comma-separated). Leave blank for free aim.',
+      ''
+    );
+    let seed_az = null, seed_el = null;
+    if (seedRaw && seedRaw.trim()) {
+      const parts = seedRaw.split(',').map(s => parseFloat(s.trim()));
+      if (parts.length === 2 && parts.every(v => isFinite(v))) {
+        seed_az = parts[0];
+        seed_el = parts[1];
+      } else {
+        alert('Could not parse seed; using free aim.');
+      }
+    }
+    const entry = {label, seed_az_deg: seed_az, seed_el_deg: seed_el};
+    state.platesolveTargets.push(entry);
+    state.selectedTargets.set(targetKey('platesolve', label), {
+      kind: 'platesolve',
+      label,
+      seed_az_deg: seed_az ?? undefined,
+      seed_el_deg: seed_el ?? undefined,
+    });
+    renderPlatesolve();
+    renderSelectedSummary();
+    updateStartGate();
   }
 
   els.altRadios.forEach(r => r.addEventListener('change', () => {
     els.altManual.disabled = r.value !== 'manual';
     refreshTargets();
+    refreshCelestial();
   }));
-  els.altManual.addEventListener('change', refreshTargets);
+  els.altManual.addEventListener('change', () => {
+    refreshTargets();
+    refreshCelestial();
+  });
+
+  if (els.platesolveAdd) {
+    els.platesolveAdd.addEventListener('click', addPlatesolveTarget);
+  }
 
   // ---- start session ----
 
   els.startBtn.addEventListener('click', async () => {
     els.startBtn.disabled = true;
     els.setupErr.style.display = 'none';
+    // Build the unified targets[] payload from the selection Map.
+    // Each entry already matches the server's expected shape; we
+    // strip undefined fields so the request body is minimal and the
+    // 400-on-unknown-field validation stays predictable.
+    const targets = [];
+    state.selectedTargets.forEach(spec => {
+      const out = {};
+      Object.keys(spec).forEach(k => {
+        if (spec[k] !== undefined && spec[k] !== null) out[k] = spec[k];
+      });
+      targets.push(out);
+    });
     const body = {
       altitude_m: getAltitudeManualValue(),
       clear_prior: els.clearPrior.checked,
-      target_oas: Array.from(state.selectedOas),
+      targets,
     };
     try {
       const r = await fetch(`${apiRoot}/start`, {
@@ -482,13 +739,13 @@
         const err = await r.json().catch(() => ({error: r.statusText}));
         els.setupErr.textContent = 'start failed: ' + (err.error || r.statusText);
         els.setupErr.style.display = '';
-        els.startBtn.disabled = state.selectedOas.size < 2;
+        updateStartGate();
         return;
       }
     } catch (e) {
       els.setupErr.textContent = 'start failed: ' + e;
       els.setupErr.style.display = '';
-      els.startBtn.disabled = state.selectedOas.size < 2;
+      updateStartGate();
       return;
     }
     state.sessionActive = true;
@@ -659,15 +916,23 @@
   function residualRow(lm, meta, showTolerance) {
     const d_az = lm.residual_az_deg;
     const d_el = lm.residual_el_deg;
-    const saz = meta ? meta.sigma_az_deg : null;
-    const sel = meta ? meta.sigma_el_deg : null;
+    // Prefer the per-record sigma the session already plumbs through;
+    // fall back to the picker meta dict when the record doesn't carry
+    // one (legacy FAA paths).
+    const saz = (lm.sigma_az_deg != null) ? lm.sigma_az_deg
+             : (meta ? meta.sigma_az_deg : null);
+    const sel = (lm.sigma_el_deg != null) ? lm.sigma_el_deg
+             : (meta ? meta.sigma_el_deg : null);
     const okAz = withinTol(d_az, saz);
     const okEl = withinTol(d_el, sel);
     const ok   = (okAz !== false) && (okEl !== false);
     const cls  = (showTolerance && ok === false) ? 'out-of-tol' : '';
     const okText = ok == null ? '?' : (ok ? '✓' : '✗');
+    const kind = lm.kind || 'faa';
+    const glyph = ({faa: '📍', celestial: '★', platesolve: '🎯'})[kind] || '·';
+    const idLabel = (kind === 'faa' && lm.oas) ? lm.oas : (lm.label || lm.name || '?');
     return `<tr class="${cls}">
-      <td>${lm.oas}</td><td>${fmt(d_az, 3)}</td><td>${fmt(d_el, 3)}</td>
+      <td>${glyph} ${idLabel}</td><td>${fmt(d_az, 3)}</td><td>${fmt(d_el, 3)}</td>
       <td>${fmtSigma(saz)}</td><td>${fmtSigma(sel)}</td>
       <td>${okText}</td>
     </tr>`;
@@ -693,27 +958,69 @@
     els.kpiRMS.textContent   = s.solution && s.solution.residual_rms_deg != null
                                 ? s.solution.residual_rms_deg.toFixed(3) + '°' : '—';
 
-    if (s.current_landmark) {
-      els.activeOas.textContent = s.current_landmark.oas;
-      els.activeName.textContent = s.current_landmark.name;
-      els.activeGeom.textContent =
-        `true az ${s.current_landmark.true_az_deg.toFixed(2)}° · el ${s.current_landmark.true_el_deg.toFixed(2)}° · ` +
-        `slant ${(s.current_landmark.slant_m/1000).toFixed(2)} km · ` +
-        `FAA σ ${fmtSigma(s.current_landmark.sigma_az_deg)} / ${fmtSigma(s.current_landmark.sigma_el_deg)} · ` +
-        `${s.current_landmark.accuracy_class}`;
-      els.activeAim.textContent = 'Aim: ' + s.current_landmark.aiming_hint;
-      els.aimLabel.textContent  = s.current_landmark.aiming_hint;
-      els.aimLabel.style.display = '';
+    const lm = s.current_landmark;
+    if (lm) {
+      const kind = lm.kind || 'faa';
+      const glyph = ({faa: '📍', celestial: '★', platesolve: '🎯'})[kind] || '·';
+      els.activeKindGlyph.textContent = glyph;
+      // Banner labels: FAA shows OAS; celestial/platesolve show label.
+      if (kind === 'faa') {
+        els.activeOas.textContent = lm.oas || '';
+        els.activeName.textContent = lm.name || '';
+        const slantKm = lm.slant_m ? (lm.slant_m / 1000).toFixed(2) + ' km' : '?';
+        els.activeGeom.textContent =
+          `true az ${(lm.true_az_deg ?? 0).toFixed(2)}° · el ${(lm.true_el_deg ?? 0).toFixed(2)}° · ` +
+          `slant ${slantKm} · ` +
+          `σ ${fmtSigma(lm.sigma_az_deg)} / ${fmtSigma(lm.sigma_el_deg)}` +
+          (lm.accuracy_class ? ` · ${lm.accuracy_class}` : '');
+      } else if (kind === 'celestial') {
+        els.activeOas.textContent = '';
+        els.activeName.textContent = lm.label || lm.name || '';
+        els.activeGeom.textContent =
+          `true az ${(lm.true_az_deg ?? 0).toFixed(2)}° · el ${(lm.true_el_deg ?? 0).toFixed(2)}° · ` +
+          (lm.ra_hours != null ? `RA ${lm.ra_hours.toFixed(3)}h · ` : '') +
+          (lm.dec_deg != null ? `Dec ${lm.dec_deg.toFixed(2)}° · ` : '') +
+          `σ ${fmtSigma(lm.sigma_az_deg)} / ${fmtSigma(lm.sigma_el_deg)}`;
+      } else {
+        // platesolve
+        els.activeOas.textContent = '';
+        els.activeName.textContent = lm.label || '';
+        const seedTxt = (lm.seed_az_deg != null && lm.seed_el_deg != null)
+          ? ` · seed az ${lm.seed_az_deg.toFixed(2)}° el ${lm.seed_el_deg.toFixed(2)}°`
+          : ' · free aim (no seed)';
+        els.activeGeom.textContent =
+          `σ ${fmtSigma(lm.sigma_az_deg)} / ${fmtSigma(lm.sigma_el_deg)}` + seedTxt;
+      }
+      els.activeAim.textContent = lm.aiming_hint ? 'Aim: ' + lm.aiming_hint : '';
+      if (lm.aiming_hint) {
+        els.aimLabel.textContent = lm.aiming_hint;
+        els.aimLabel.style.display = '';
+      } else {
+        els.aimLabel.style.display = 'none';
+      }
+      // Plate-solve phase indicator.
+      const isPS = (kind === 'platesolve');
+      const solving = (state.phase === 'plate_solving');
+      els.activePlatesolve.style.display = (isPS && solving) ? '' : 'none';
+      if (isPS && lm.last_platesolve_error) {
+        els.activePlatesolve.style.display = '';
+        els.activePlatesolve.innerHTML = `⚠ ${lm.last_platesolve_error}`;
+      }
+      els.sightBtn.disabled = solving;
     } else {
       els.aimLabel.style.display = 'none';
+      els.activePlatesolve.style.display = 'none';
+      els.sightBtn.disabled = false;
     }
 
-    // Running residuals in the active panel.
+    // Running residuals in the active panel. Index by both `oas` (FAA)
+    // and `label` (celestial/plate-solve) so the lookup hits no matter
+    // which kind populated the row.
     if (s.solution && s.solution.per_landmark) {
-      const metaByOas = {};
-      state.targets.forEach(t => { metaByOas[t.oas] = t; });
+      const metaByKey = {};
+      state.targets.forEach(t => { if (t.oas) metaByKey[t.oas] = t; });
       els.residBody.innerHTML = s.solution.per_landmark
-        .map(lm => residualRow(lm, metaByOas[lm.oas], true))
+        .map(lm => residualRow(lm, metaByKey[lm.oas] || null, true))
         .join('');
     } else {
       els.residBody.innerHTML = '';
@@ -748,9 +1055,9 @@
       `yaw <b>${fmt(sol.yaw_deg, 3)}</b> · pitch <b>${fmt(sol.pitch_deg, 3)}</b> · roll <b>${fmt(sol.roll_deg, 3)}</b><br>` +
       `residual RMS <b>${sol.residual_rms_deg.toFixed(3)}°</b>`;
     const metaByOas = {};
-    state.targets.forEach(t => { metaByOas[t.oas] = t; });
+    state.targets.forEach(t => { if (t.oas) metaByOas[t.oas] = t; });
     els.reviewBody.innerHTML = sol.per_landmark
-      .map(lm => residualRow(lm, metaByOas[lm.oas], true))
+      .map(lm => residualRow(lm, metaByOas[lm.oas] || null, true))
       .join('');
   }
 
@@ -938,6 +1245,10 @@
       const r = await fetch(`${nightRoot}/availability`);
       const j = await r.json();
       nightAvailable = !!j.solver_available;
+      // Mirror availability into the unified-picker state so the
+      // plate-solve "Add" button is gated the same way the legacy
+      // nighttime tab is.
+      state.nightAvailable = nightAvailable;
       if (nightAvailable) {
         nightEls.availability.textContent = `solver: ${j.solver_kind} (${j.solver_path || 'on PATH'})`;
         nightEls.toggleNight.disabled = false;
@@ -945,9 +1256,12 @@
         nightEls.availability.textContent = 'plate solver not configured (see ' + (j.doc_link || 'docs') + ')';
         nightEls.toggleNight.disabled = true;
       }
+      renderPlatesolve();
     } catch (e) {
       nightEls.availability.textContent = 'availability check failed: ' + e;
       nightEls.toggleNight.disabled = true;
+      state.nightAvailable = false;
+      renderPlatesolve();
     }
   }
 
