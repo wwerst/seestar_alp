@@ -41,6 +41,11 @@ import numpy as np
 from astropy.coordinates import EarthLocation
 from scipy.optimize import least_squares
 
+from device.calibration_targets import (
+    CalibrationTargetSpec,
+    PlateSolveOutcome,
+    TargetKind,
+)
 from device.target_frame import MountFrame
 from scripts.trajectory.faa_dof import Landmark
 from scripts.trajectory.observer import ObserverSite, haversine_m
@@ -49,17 +54,113 @@ from scripts.trajectory.observer import ObserverSite, haversine_m
 # ---------- data model ----------------------------------------------
 
 
-@dataclass(frozen=True)
 class Sighting:
-    """One landmark → encoder (az, el) record."""
+    """One target → encoder (az, el) record.
 
-    landmark: Landmark
-    encoder_az_deg: float
-    encoder_el_deg: float
-    true_az_deg: float  # topocentric az of landmark (metadata)
-    true_el_deg: float  # topocentric el of landmark (metadata)
-    slant_m: float
-    t_unix: float
+    Carries a :class:`CalibrationTargetSpec` (FAA / celestial /
+    platesolve) plus the operator-aligned encoder reading and the
+    truth resolved at sighting time. ``slant_m`` is populated only for
+    FAA targets; ``sigma_*`` carry per-sighting 1σ display metadata.
+
+    Accepts either ``target=`` (new tagged-union API) or
+    ``landmark=`` (legacy FAA-only API). The latter wraps the landmark
+    into an FAA-kind spec so existing callers + tests keep working
+    without code changes.
+    """
+
+    __slots__ = (
+        "target",
+        "encoder_az_deg",
+        "encoder_el_deg",
+        "true_az_deg",
+        "true_el_deg",
+        "slant_m",
+        "t_unix",
+        "sigma_az_deg",
+        "sigma_el_deg",
+    )
+
+    def __init__(
+        self,
+        *,
+        encoder_az_deg: float,
+        encoder_el_deg: float,
+        true_az_deg: float,
+        true_el_deg: float,
+        slant_m: float | None,
+        t_unix: float,
+        target: CalibrationTargetSpec | None = None,
+        landmark: Landmark | None = None,
+        sigma_az_deg: float | None = None,
+        sigma_el_deg: float | None = None,
+    ) -> None:
+        if target is not None and landmark is not None:
+            raise ValueError("Sighting accepts target= OR landmark=, not both")
+        if target is None and landmark is None:
+            raise ValueError("Sighting requires target= or landmark=")
+        if target is None:
+            target = CalibrationTargetSpec.from_landmark(
+                landmark,
+                slant_m=float(slant_m) if slant_m is not None else None,
+            )
+        # Use object.__setattr__ to support __slots__ without dataclass.
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "encoder_az_deg", float(encoder_az_deg))
+        object.__setattr__(self, "encoder_el_deg", float(encoder_el_deg))
+        object.__setattr__(self, "true_az_deg", float(true_az_deg))
+        object.__setattr__(self, "true_el_deg", float(true_el_deg))
+        object.__setattr__(
+            self,
+            "slant_m",
+            float(slant_m) if slant_m is not None else None,
+        )
+        object.__setattr__(self, "t_unix", float(t_unix))
+        object.__setattr__(
+            self,
+            "sigma_az_deg",
+            float(sigma_az_deg) if sigma_az_deg is not None else None,
+        )
+        object.__setattr__(
+            self,
+            "sigma_el_deg",
+            float(sigma_el_deg) if sigma_el_deg is not None else None,
+        )
+
+    def __repr__(self) -> str:  # pragma: no cover — debug-only
+        return (
+            f"Sighting(target={self.target!r}, "
+            f"encoder=({self.encoder_az_deg:.3f}, {self.encoder_el_deg:.3f}), "
+            f"true=({self.true_az_deg:.3f}, {self.true_el_deg:.3f}), "
+            f"slant_m={self.slant_m}, t_unix={self.t_unix})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Sighting):
+            return NotImplemented
+        return all(
+            getattr(self, k) == getattr(other, k) for k in self.__slots__
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (self.target, self.encoder_az_deg, self.encoder_el_deg,
+             self.true_az_deg, self.true_el_deg, self.slant_m, self.t_unix)
+        )
+
+    @property
+    def landmark(self) -> Landmark | None:
+        """Return the FAA landmark for FAA targets, ``None`` otherwise.
+
+        Compatibility shim for callers and tests that predate the
+        tagged-union spec. New code should use ``self.target`` directly.
+        """
+        if self.target.kind == TargetKind.FAA:
+            return self.target.landmark
+        return None
+
+    @property
+    def kind(self) -> TargetKind:
+        return self.target.kind
 
 
 @dataclass
@@ -296,6 +397,33 @@ def predict_mount_azel(
     return az, el, slant
 
 
+def _topo_to_mount_azel(
+    az_deg: float,
+    el_deg: float,
+    topo_to_mount: np.ndarray,
+) -> tuple[float, float]:
+    """Rotate a topocentric (az, el) direction through a mount-frame
+    rotation matrix. Used by the unified slew dispatch for celestial /
+    plate-solve targets where we already have ENU truth and just need
+    to express it in the mount frame.
+    """
+    az_r = math.radians(az_deg)
+    el_r = math.radians(el_deg)
+    cos_el = math.cos(el_r)
+    east = math.sin(az_r) * cos_el
+    north = math.cos(az_r) * cos_el
+    up = math.sin(el_r)
+    enu = np.array([east, north, up], dtype=np.float64)
+    mount = topo_to_mount @ enu
+    e, n, u = float(mount[0]), float(mount[1]), float(mount[2])
+    slant = math.sqrt(e * e + n * n + u * u)
+    if slant == 0.0:
+        return (0.0, 90.0)
+    az = (math.degrees(math.atan2(e, n)) + 360.0) % 360.0
+    el = math.degrees(math.asin(u / slant))
+    return az, el
+
+
 # ---------- solver ---------------------------------------------------
 
 
@@ -331,16 +459,28 @@ def solve_rotation(
 
     yaw_only = (dof == "yaw") or (dof == "auto" and len(sightings) == 1)
 
+    def _predict(
+        s: Sighting, yaw: float, pitch: float, roll: float
+    ) -> tuple[float, float]:
+        """Predict mount-frame ``(az, el)`` for one sighting under the
+        trial rotation. FAA targets predict from the landmark's ECEF
+        + the local observer (preserving the legacy refraction-after-
+        rotation behaviour); celestial/plate-solve sightings predict
+        from the (already-apparent) topocentric truth recorded at
+        sighting time."""
+        if s.target.kind == TargetKind.FAA and s.target.landmark is not None:
+            pred_az, pred_el, _ = predict_mount_azel(
+                yaw, pitch, roll, site, s.target.landmark,
+            )
+            return pred_az, pred_el
+        return _predict_mount_azel_from_topo(
+            yaw, pitch, roll, s.true_az_deg, s.true_el_deg,
+        )
+
     def _resid(yaw: float, pitch: float, roll: float) -> np.ndarray:
         out = np.empty(2 * len(sightings), dtype=np.float64)
         for i, s in enumerate(sightings):
-            pred_az, pred_el, _ = predict_mount_azel(
-                yaw,
-                pitch,
-                roll,
-                site,
-                s.landmark,
-            )
+            pred_az, pred_el = _predict(s, yaw, pitch, roll)
             d_az = _wrap_pm180(_wrap_pm180(pred_az) - _wrap_pm180(s.encoder_az_deg))
             d_el = pred_el - s.encoder_el_deg
             out[2 * i] = d_az
@@ -372,26 +512,17 @@ def solve_rotation(
     sq_sum = 0.0
     n = 0
     for s in sightings:
-        pred_az, pred_el, _ = predict_mount_azel(yaw, pitch, roll, site, s.landmark)
+        pred_az, pred_el = _predict(s, yaw, pitch, roll)
         r_az = _wrap_pm180(_wrap_pm180(pred_az) - _wrap_pm180(s.encoder_az_deg))
         r_el = pred_el - s.encoder_el_deg
         per_landmark.append(
-            {
-                "oas": s.landmark.oas,
-                "name": s.landmark.name,
-                "lat_deg": s.landmark.lat_deg,
-                "lon_deg": s.landmark.lon_deg,
-                "height_amsl_m": s.landmark.height_amsl_m,
-                "encoder_az_deg": s.encoder_az_deg,
-                "encoder_el_deg": s.encoder_el_deg,
-                "true_az_deg": s.true_az_deg,
-                "true_el_deg": s.true_el_deg,
-                "slant_m": s.slant_m,
-                "predicted_az_deg": float(pred_az),
-                "predicted_el_deg": float(pred_el),
-                "residual_az_deg": float(r_az),
-                "residual_el_deg": float(r_el),
-            }
+            sighting_to_record(
+                s,
+                predicted_az_deg=float(pred_az),
+                predicted_el_deg=float(pred_el),
+                residual_az_deg=float(r_az),
+                residual_el_deg=float(r_el),
+            )
         )
         sq_sum += r_az * r_az + r_el * r_el
         n += 2
@@ -403,6 +534,70 @@ def solve_rotation(
         residual_rms_deg=rms,
         per_landmark=per_landmark,
     )
+
+
+def sighting_to_record(
+    s: Sighting,
+    *,
+    predicted_az_deg: float,
+    predicted_el_deg: float,
+    residual_az_deg: float,
+    residual_el_deg: float,
+) -> dict:
+    """Build the per-landmark record dict written to the calibration
+    JSON and surfaced through the status response.
+
+    FAA records preserve the legacy schema (``oas``, ``name``,
+    ``lat_deg``, …) so existing consumers don't break. Celestial /
+    plate-solve records carry their own kind-specific fields. Every
+    record carries ``kind``, the encoder + truth + predicted + residual
+    floats, and the per-target ``sigma_*`` for tooltip display.
+    """
+    common = {
+        "kind": s.target.kind.value,
+        "label": s.target.label,
+        "encoder_az_deg": float(s.encoder_az_deg),
+        "encoder_el_deg": float(s.encoder_el_deg),
+        "true_az_deg": float(s.true_az_deg),
+        "true_el_deg": float(s.true_el_deg),
+        "predicted_az_deg": float(predicted_az_deg),
+        "predicted_el_deg": float(predicted_el_deg),
+        "residual_az_deg": float(residual_az_deg),
+        "residual_el_deg": float(residual_el_deg),
+        "sigma_az_deg": _none_or_finite(s.sigma_az_deg),
+        "sigma_el_deg": _none_or_finite(s.sigma_el_deg),
+    }
+    if s.target.kind == TargetKind.FAA and s.target.landmark is not None:
+        lm = s.target.landmark
+        common["oas"] = lm.oas
+        common["name"] = lm.name
+        common["lat_deg"] = lm.lat_deg
+        common["lon_deg"] = lm.lon_deg
+        common["height_amsl_m"] = lm.height_amsl_m
+        common["accuracy_class"] = lm.accuracy_class
+        if s.slant_m is not None:
+            common["slant_m"] = float(s.slant_m)
+    elif s.target.kind == TargetKind.CELESTIAL:
+        if s.target.ra_hours is not None:
+            common["ra_hours"] = float(s.target.ra_hours)
+        if s.target.dec_deg is not None:
+            common["dec_deg"] = float(s.target.dec_deg)
+        if s.target.vmag is not None:
+            common["vmag"] = float(s.target.vmag)
+        if s.target.bayer:
+            common["bayer"] = s.target.bayer
+    elif s.target.kind == TargetKind.PLATESOLVE:
+        if s.target.seed_az_deg is not None:
+            common["seed_az_deg"] = float(s.target.seed_az_deg)
+        if s.target.seed_el_deg is not None:
+            common["seed_el_deg"] = float(s.target.seed_el_deg)
+    return common
+
+
+def _none_or_finite(x: float | None) -> float | None:
+    if x is None:
+        return None
+    return float(x) if math.isfinite(float(x)) else None
 
 
 def _predict_mount_azel_from_topo(
@@ -558,6 +753,8 @@ def write_calibration(
     sol: RotationSolution,
     site: ObserverSite,
     landmark_records: list[dict],
+    *,
+    calibration_method: str | None = None,
 ) -> None:
     """Write the calibration JSON every consumer reads.
 
@@ -565,9 +762,17 @@ def write_calibration(
     yaw/pitch/roll + origin_offset_ecef_m are the minimum every loader
     honours. ``observer`` ties the calibration to the site that
     produced it; ``landmarks`` records per-point residuals for audit.
+
+    ``calibration_method`` defaults to the legacy ``rotation_landmarks``
+    when every record is a FAA landmark, ``rotation_unified`` when the
+    record set mixes target kinds, and ``rotation_celestial`` /
+    ``rotation_platesolve`` when the records are all of one non-FAA kind.
+    Callers can override explicitly when they want a specific tag.
     """
+    if calibration_method is None:
+        calibration_method = _infer_calibration_method(landmark_records)
     payload = {
-        "calibration_method": "rotation_landmarks",
+        "calibration_method": calibration_method,
         "calibrated_at": time.strftime("%Y-%m-%dT%H-%M-%S%z"),
         "yaw_offset_deg": sol.yaw_deg,
         "pitch_offset_deg": sol.pitch_deg,
@@ -592,6 +797,25 @@ def write_calibration(
     write_atomic_json(path, payload, indent=2)
 
 
+def _infer_calibration_method(records: list[dict]) -> str:
+    """Pick a ``calibration_method`` tag from a record set's kinds.
+
+    Mixed-kind sessions get ``rotation_unified``; single-kind sessions
+    get a kind-specific tag so existing audit tooling can quickly
+    grep for daytime-only calibrations.
+    """
+    kinds = {r.get("kind", "faa") for r in records}
+    if len(kinds) <= 1:
+        only = next(iter(kinds), "faa")
+        if only == TargetKind.FAA.value:
+            return "rotation_landmarks"
+        if only == TargetKind.CELESTIAL.value:
+            return "rotation_celestial"
+        if only == TargetKind.PLATESOLVE.value:
+            return "rotation_platesolve"
+    return "rotation_unified"
+
+
 # ---------- CalibrationSession --------------------------------------
 
 
@@ -605,6 +829,12 @@ ARRIVE_TOL_SLEW_DEG = 0.3
 ARRIVE_TOL_NUDGE_DEG = 0.1
 
 
+def _now_utc() -> datetime:
+    """Aware-UTC datetime. Wrapped so tests can monkeypatch the time
+    source without touching ``datetime.now``."""
+    return datetime.now(timezone.utc)
+
+
 @dataclass
 class _Command:
     """Worker-thread queue entry."""
@@ -613,23 +843,39 @@ class _Command:
     payload: dict[str, Any] = field(default_factory=dict)
 
 
+class _PlateSolveSightingFailure(Exception):
+    """Raised inside :meth:`CalibrationSession._capture_and_solve` to
+    signal that the plate-solve sub-flow failed and the sighting must
+    not be appended. Caught one level up so the operator can retry."""
+
+
 @dataclass
 class CalibrationStatus:
     """JSON-serialisable session snapshot for the browser."""
 
     active: bool
-    phase: str  # init / slewing / nudging / sighting / review / committed / cancelled / error
+    # init / slewing / nudging / plate_solving / sighting / review /
+    # committed / cancelled / error. ``plate_solving`` is set while a
+    # plate-solve sighting's inner loop is running so the UI can show
+    # a spinner and disable Sight ✓ until the result lands.
+    phase: str
     target_idx: int
     n_targets: int
     current_landmark: (
         dict | None
-    )  # {oas, name, true_az_deg, true_el_deg, slant_m, lit, accuracy_class}
+    )  # kind-aware: {kind, label, true_az_deg, true_el_deg, slant_m?, ...}
     target_az_deg: float | None  # pending encoder target (drives the mount)
     target_el_deg: float | None
     encoder_az_deg: float | None  # last-read encoder (polled each cycle)
     encoder_el_deg: float | None
     solution: dict | None  # {yaw, pitch, roll, rms, per_landmark}
     errors: list[str]
+    # Heterogeneous list of all selected targets, in the order the
+    # session will visit them. Each entry is the same kind-aware dict
+    # ``current_landmark`` uses (without truth fields). The UI uses
+    # this to render the "FAA / ★ / 🎯 plate" tag next to each pending
+    # row.
+    targets: list[dict] | None = None
 
 
 class CalibrationSession:
@@ -660,25 +906,78 @@ class CalibrationSession:
     def __init__(
         self,
         telescope_id: int,
-        targets: list[tuple[Landmark, float, float, float]],
-        site: ObserverSite,
+        targets: list[tuple[Landmark, float, float, float]] | None = None,
+        site: ObserverSite | None = None,
         *,
         out_path: Path,
         prior_frame: MountFrame | None = None,
         alpaca_host: str = "127.0.0.1",
         alpaca_port: int | None = None,
         dry_run: bool = False,
+        target_specs: list[CalibrationTargetSpec] | None = None,
+        plate_solver: Any | None = None,
+        capture_image_fn: Any | None = None,
     ) -> None:
-        if not targets:
+        """Construct a calibration session.
+
+        Two ways to specify targets, mutually exclusive:
+
+        - ``target_specs``: the unified path. A list of
+          :class:`CalibrationTargetSpec` of any kind (FAA, celestial,
+          plate-solve). Used by the unified picker.
+        - ``targets``: legacy FAA-only path. List of
+          ``(landmark, true_az, true_el, slant)`` tuples — each is
+          wrapped into an FAA-kind ``CalibrationTargetSpec``. Existing
+          callers + tests keep working without code changes.
+
+        ``plate_solver`` and ``capture_image_fn`` are required iff any
+        spec has ``kind=PLATESOLVE``. ``capture_image_fn`` is an
+        ``() -> Path`` that captures from the imager and returns the
+        resulting image path; the session calls it when the operator
+        clicks Sight on a plate-solve target.
+        """
+        if site is None:
+            raise ValueError("site is required")
+        if target_specs is None and targets is None:
+            raise ValueError("need either target_specs or targets")
+        if target_specs is not None and targets is not None:
+            raise ValueError(
+                "pass target_specs or targets, not both"
+            )
+        if target_specs is None:
+            target_specs = [
+                CalibrationTargetSpec.from_landmark(lm, slant_m=float(slant))
+                for (lm, _az, _el, slant) in targets
+            ]
+        if not target_specs:
             raise ValueError("need at least 1 target")
+        # Sanity-check plate-solve targets have a solver wired up.
+        if any(
+            ts.kind == TargetKind.PLATESOLVE for ts in target_specs
+        ) and plate_solver is None:
+            raise ValueError(
+                "plate_solver required when target_specs contain PLATESOLVE"
+            )
         self.telescope_id = int(telescope_id)
-        self.targets = list(targets)
+        self.target_specs: list[CalibrationTargetSpec] = list(target_specs)
+        # Pre-resolved truth + sigma cache for FAA targets so the status
+        # response can render the active-target banner before sighting
+        # (matches the legacy ``targets`` tuple shape). Celestial /
+        # plate-solve entries are resolved on demand.
+        self._target_meta: list[dict] = self._resolve_target_meta()
+        # Backwards-compat alias kept so internal consumers that relied
+        # on ``self.targets`` (and tests / call sites) keep working.
+        # Each entry mirrors the legacy 4-tuple shape for FAA targets;
+        # for non-FAA targets, ``true_az/el/slant`` are None / NaN.
+        self.targets = self._legacy_targets_view()
         self.site = site
         self.out_path = Path(out_path)
         self._prior_frame = prior_frame
         self._alpaca_host = alpaca_host
         self._alpaca_port = alpaca_port
         self.dry_run = bool(dry_run)
+        self._plate_solver = plate_solver
+        self._capture_image_fn = capture_image_fn
 
         self._queue: queue.Queue[_Command] = queue.Queue()
         self._stop_evt = threading.Event()
@@ -695,6 +994,75 @@ class CalibrationSession:
         self._encoder_az: float | None = None
         self._encoder_el: float | None = None
         self._errors: list[str] = []
+        # Per-target plate-solve diagnostics carried into the status
+        # response so the UI can render a "Solving…" spinner / failure
+        # message without polling its own endpoint.
+        self._last_platesolve_error: str | None = None
+
+    @classmethod
+    def from_landmarks(
+        cls,
+        telescope_id: int,
+        targets: list[tuple[Landmark, float, float, float]],
+        site: ObserverSite,
+        *,
+        out_path: Path,
+        prior_frame: MountFrame | None = None,
+        alpaca_host: str = "127.0.0.1",
+        alpaca_port: int | None = None,
+        dry_run: bool = False,
+    ) -> "CalibrationSession":
+        """Backwards-compat factory for FAA-only sessions. Wraps each
+        ``(landmark, az, el, slant)`` tuple into an FAA-kind
+        :class:`CalibrationTargetSpec` and forwards to ``__init__``.
+        Use this in callers that predate the unified picker."""
+        return cls(
+            telescope_id=telescope_id,
+            targets=targets,
+            site=site,
+            out_path=out_path,
+            prior_frame=prior_frame,
+            alpaca_host=alpaca_host,
+            alpaca_port=alpaca_port,
+            dry_run=dry_run,
+        )
+
+    def _resolve_target_meta(self) -> list[dict]:
+        """Pre-resolve display metadata for each target. Called once
+        at construction; FAA targets resolve their truth + slant + σ
+        from the spec; celestial / plate-solve targets fill placeholder
+        fields the sighting cycle will overwrite."""
+        meta: list[dict] = []
+        for ts in self.target_specs:
+            entry: dict[str, Any] = {
+                "kind": ts.kind.value,
+                "label": ts.label,
+                "spec": ts,
+            }
+            if ts.kind == TargetKind.FAA and ts.landmark is not None:
+                # FAA truth is time-independent, so resolve eagerly.
+                # ``site`` is needed; called before self.site is set,
+                # so accept None ``slant_m`` and recompute lazily in
+                # ``status()``.
+                pass
+            meta.append(entry)
+        return meta
+
+    def _legacy_targets_view(
+        self,
+    ) -> list[tuple[Landmark | None, float, float, float]]:
+        """Compatibility shim for code that still expects the legacy
+        4-tuple shape. FAA entries get the original landmark + truth;
+        non-FAA entries get a placeholder so existing index iteration
+        doesn't crash. New callers should use ``self.target_specs``."""
+        out: list[tuple[Landmark | None, float, float, float]] = []
+        for ts in self.target_specs:
+            if ts.kind == TargetKind.FAA and ts.landmark is not None:
+                slant = ts.slant_m if ts.slant_m is not None else float("nan")
+                out.append((ts.landmark, float("nan"), float("nan"), slant))
+            else:
+                out.append((None, float("nan"), float("nan"), float("nan")))
+        return out
 
     # ---------- public lifecycle ----------
 
@@ -719,32 +1087,10 @@ class CalibrationSession:
         return self._thread is not None and self._thread.is_alive()
 
     def status(self) -> CalibrationStatus:
-        from scripts.trajectory.faa_dof import (
-            aiming_hint as _aim,
-            faa_accuracy_ft as _acc,
-        )
-
-        def _nan_to_none(x: float) -> float | None:
-            return None if not math.isfinite(x) else float(x)
-
         with self._lock:
             lm_info = None
-            if 0 <= self._target_idx < len(self.targets):
-                lm, az, el, slant = self.targets[self._target_idx]
-                h_ft, v_ft = _acc(lm.accuracy_class)
-                sigma_az, sigma_el = pointing_uncertainty_deg(slant, h_ft, v_ft)
-                lm_info = {
-                    "oas": lm.oas,
-                    "name": lm.name,
-                    "true_az_deg": float(az),
-                    "true_el_deg": float(el),
-                    "slant_m": float(slant),
-                    "lit": bool(lm.lit),
-                    "accuracy_class": lm.accuracy_class,
-                    "aiming_hint": _aim(lm),
-                    "sigma_az_deg": _nan_to_none(sigma_az),
-                    "sigma_el_deg": _nan_to_none(sigma_el),
-                }
+            if 0 <= self._target_idx < len(self.target_specs):
+                lm_info = self._target_status_dict(self._target_idx)
             sol_info = None
             if self._solution is not None:
                 sol_info = {
@@ -754,11 +1100,12 @@ class CalibrationSession:
                     "residual_rms_deg": self._solution.residual_rms_deg,
                     "per_landmark": list(self._solution.per_landmark),
                 }
+            targets_list = [ts.to_dict() for ts in self.target_specs]
             return CalibrationStatus(
                 active=self.is_alive(),
                 phase=self._phase,
                 target_idx=self._target_idx,
-                n_targets=len(self.targets),
+                n_targets=len(self.target_specs),
                 current_landmark=lm_info,
                 target_az_deg=self._target_az,
                 target_el_deg=self._target_el,
@@ -766,7 +1113,66 @@ class CalibrationSession:
                 encoder_el_deg=self._encoder_el,
                 solution=sol_info,
                 errors=list(self._errors),
+                targets=targets_list,
             )
+
+    def _target_status_dict(self, idx: int) -> dict | None:
+        """Build the ``current_landmark`` payload for the status
+        response. Kind-aware: FAA records preserve the legacy field set
+        (``oas``, ``name``, ``slant_m``, ``aiming_hint``) so the existing
+        UI banner keeps rendering; celestial / plate-solve add their own
+        kind-specific fields. Every record carries ``kind`` so the UI
+        can pick the right glyph and tooltip."""
+        if not (0 <= idx < len(self.target_specs)):
+            return None
+        ts = self.target_specs[idx]
+        out: dict[str, Any] = ts.to_dict()
+        # Truth / sigma resolve. For FAA targets we resolve from the
+        # cached spec; celestial uses a fresh now-UTC; plate-solve
+        # surfaces the seed (or NaN) until a sighting fills in the
+        # WCS-derived truth.
+        if ts.kind == TargetKind.FAA and ts.landmark is not None:
+            try:
+                az, el, slant = ts.resolve_true_altaz(self.site, _now_utc())
+            except Exception:
+                az = el = float("nan")
+                slant = None
+            out["true_az_deg"] = _none_or_finite(az)
+            out["true_el_deg"] = _none_or_finite(el)
+            if slant is not None:
+                out["slant_m"] = float(slant)
+            from scripts.trajectory.faa_dof import aiming_hint as _aim
+            out["aiming_hint"] = _aim(ts.landmark)
+        elif ts.kind == TargetKind.CELESTIAL:
+            try:
+                az, el, _ = ts.resolve_true_altaz(self.site, _now_utc())
+                out["true_az_deg"] = float(az)
+                out["true_el_deg"] = float(el)
+            except Exception:
+                out["true_az_deg"] = None
+                out["true_el_deg"] = None
+            out["aiming_hint"] = (
+                f"Centre {ts.label} in the eyepiece; bright stars "
+                "click into focus crisply."
+            )
+        elif ts.kind == TargetKind.PLATESOLVE:
+            out["true_az_deg"] = (
+                float(ts.seed_az_deg) if ts.seed_az_deg is not None else None
+            )
+            out["true_el_deg"] = (
+                float(ts.seed_el_deg) if ts.seed_el_deg is not None else None
+            )
+            out["aiming_hint"] = (
+                "Free-aim: jog the mount toward the sky region you want, "
+                "then Sight to capture + plate-solve."
+            )
+        # Per-target sigma from the spec helper.
+        saz, sel = ts.sigma_az_el_deg()
+        out["sigma_az_deg"] = _none_or_finite(saz) if saz is not None else None
+        out["sigma_el_deg"] = _none_or_finite(sel) if sel is not None else None
+        if self._last_platesolve_error and ts.kind == TargetKind.PLATESOLVE:
+            out["last_platesolve_error"] = self._last_platesolve_error
+        return out
 
     # ---------- command posts ----------
 
@@ -956,27 +1362,87 @@ class CalibrationSession:
                 self._errors.append(f"nudge move_to_ff failed: {exc}")
 
     def _on_sight(self, cli) -> None:
-        """Record the current encoder as a Sighting and refit."""
+        """Record the current encoder as a Sighting and refit.
+
+        Kind-aware truth resolution:
+
+        - FAA / CELESTIAL: encoder is already at the operator-aligned
+          position; resolve truth at sighting time and append.
+        - PLATESOLVE: capture from the imager + run plate-solve. If the
+          inner loop fails, the sight attempt fails — we don't append a
+          sighting and surface ``last_platesolve_error`` so the UI can
+          let the user retry.
+        """
         self._poll_encoder_nonfatal(cli)
         with self._lock:
             if self._encoder_az is None or self._encoder_el is None:
                 self._errors.append("cannot sight: no encoder read yet")
                 return
-            if not (0 <= self._target_idx < len(self.targets)):
+            if not (0 <= self._target_idx < len(self.target_specs)):
                 return
-            lm, true_az, true_el, slant = self.targets[self._target_idx]
-            s = Sighting(
-                landmark=lm,
-                encoder_az_deg=float(self._encoder_az),
-                encoder_el_deg=float(self._encoder_el),
-                true_az_deg=float(true_az),
-                true_el_deg=float(true_el),
-                slant_m=float(slant),
-                t_unix=time.time(),
+            ts = self.target_specs[self._target_idx]
+            enc_az = float(self._encoder_az)
+            enc_el = float(self._encoder_el)
+        # Resolve truth + handle plate-solve outside the lock — celestial
+        # ephem and the plate-solver both can take seconds.
+        if ts.kind == TargetKind.PLATESOLVE:
+            self._set_phase("plate_solving")
+            try:
+                outcome = self._capture_and_solve(ts, enc_az, enc_el)
+            except _PlateSolveSightingFailure as exc:
+                with self._lock:
+                    self._last_platesolve_error = str(exc)
+                    self._errors.append(f"plate-solve sight failed: {exc}")
+                # Stay on the same target; don't auto-advance.
+                self._set_phase("nudging")
+                return
+            true_az = outcome.true_az_deg
+            true_el = outcome.true_el_deg
+            slant = None
+            sigma = (
+                outcome.sigma_deg
+                if outcome.sigma_deg is not None
+                else None
             )
+            sigma_az = sigma_el = sigma
+        else:
+            try:
+                az, el, slant = ts.resolve_true_altaz(self.site, _now_utc())
+            except Exception as exc:
+                with self._lock:
+                    self._errors.append(
+                        f"resolve {ts.label} truth: {exc}"
+                    )
+                return
+            true_az = float(az)
+            true_el = float(el)
+            saz, sel = ts.sigma_az_el_deg()
+            sigma_az = saz
+            sigma_el = sel
+        # Wrap az to match the encoder convention so residual math
+        # doesn't trip on the ±180 boundary.
+        true_az_wrapped = ((float(true_az) + 180.0) % 360.0) - 180.0
+        s = Sighting(
+            target=ts,
+            encoder_az_deg=enc_az,
+            encoder_el_deg=enc_el,
+            true_az_deg=true_az_wrapped,
+            true_el_deg=float(true_el),
+            slant_m=(
+                float(slant) if slant is not None else None
+            ),
+            t_unix=time.time(),
+            sigma_az_deg=sigma_az,
+            sigma_el_deg=sigma_el,
+        )
+        # Pre-compute / refresh the per-sighting sigma if the spec
+        # carries enough info (FAA accuracy class). This is also done
+        # by ``ts.sigma_az_el_deg()`` above; carry through to Sighting.
+        with self._lock:
             self._sightings.append(s)
             sightings = list(self._sightings)
             next_idx = self._target_idx + 1
+            self._last_platesolve_error = None
         # Fit outside the lock.
         try:
             sol = solve_rotation(sightings, self.site)
@@ -988,15 +1454,86 @@ class CalibrationSession:
 
         with self._lock:
             self._target_idx = next_idx
-        if next_idx >= len(self.targets):
+        if next_idx >= len(self.target_specs):
             self._set_phase("review")
         else:
             self._slew_to_target(cli, next_idx)
             self._set_phase("nudging")
 
+    def _capture_and_solve(
+        self, ts: CalibrationTargetSpec, enc_az: float, enc_el: float
+    ) -> PlateSolveOutcome:
+        """Drive the plate-solve sub-flow for a PLATESOLVE sighting.
+
+        Reuses :func:`device.nighttime_calibration.radec_to_topocentric_azel`
+        so the celestial transform stays in one place. Raises
+        :class:`_PlateSolveSightingFailure` for any of: missing solver,
+        capture failure, solver error, FOV out of range, or transform
+        failure. Caller catches it, surfaces the error, and lets the
+        operator retry.
+        """
+        if self._plate_solver is None:
+            raise _PlateSolveSightingFailure(
+                "plate solver not configured; cannot sight a "
+                "platesolve target"
+            )
+        if self._capture_image_fn is None:
+            raise _PlateSolveSightingFailure(
+                "no capture_image_fn configured; cannot sight a "
+                "platesolve target"
+            )
+        try:
+            image_path = self._capture_image_fn()
+        except Exception as exc:
+            raise _PlateSolveSightingFailure(
+                f"image capture failed: {exc}"
+            ) from exc
+        try:
+            solve_result = self._plate_solver.solve(Path(image_path))
+        except Exception as exc:
+            raise _PlateSolveSightingFailure(
+                f"solver error: {exc}"
+            ) from exc
+        # Convert (RA, Dec) → topocentric (az, el) using the same path
+        # the standalone NighttimeCalibrationSession uses.
+        from device.nighttime_calibration import radec_to_topocentric_azel
+
+        try:
+            true_az, true_el = radec_to_topocentric_azel(
+                solve_result.ra_deg,
+                solve_result.dec_deg,
+                time.time(),
+                self.site,
+            )
+        except Exception as exc:
+            raise _PlateSolveSightingFailure(
+                f"radec→azel transform failed: {exc}"
+            ) from exc
+        # The solver's reported FOV is a sanity gate — outside of the
+        # S50's expected range, the match is almost certainly wrong.
+        from device.plate_solver import S50_FOV_MAX_DEG, S50_FOV_MIN_DEG
+
+        fx = float(solve_result.fov_x_deg)
+        fy = float(solve_result.fov_y_deg)
+        if not (
+            S50_FOV_MIN_DEG <= fx <= S50_FOV_MAX_DEG
+            and S50_FOV_MIN_DEG <= fy <= S50_FOV_MAX_DEG
+        ):
+            raise _PlateSolveSightingFailure(
+                f"solver FOV {fx:.2f}×{fy:.2f}° outside "
+                f"[{S50_FOV_MIN_DEG}, {S50_FOV_MAX_DEG}]°"
+            )
+        return PlateSolveOutcome(
+            true_az_deg=float(true_az),
+            true_el_deg=float(true_el),
+            ra_deg=float(solve_result.ra_deg),
+            dec_deg=float(solve_result.dec_deg),
+            sigma_deg=None,
+        )
+
     def _on_skip(self, cli) -> None:
         with self._lock:
-            remaining = len(self.targets) - (self._target_idx + 1)
+            remaining = len(self.target_specs) - (self._target_idx + 1)
             already_sighted = len(self._sightings)
             projected = already_sighted + remaining
         if projected < 2:
@@ -1006,7 +1543,7 @@ class CalibrationSession:
         with self._lock:
             next_idx = self._target_idx + 1
             self._target_idx = next_idx
-        if next_idx >= len(self.targets):
+        if next_idx >= len(self.target_specs):
             self._set_phase("review")
         else:
             self._slew_to_target(cli, next_idx)
@@ -1031,31 +1568,80 @@ class CalibrationSession:
 
     def _slew_to_target(self, cli, idx: int) -> None:
         """Drive the mount to the predicted encoder (az, el) for
-        ``targets[idx]``. Updates pending target + current encoder."""
-        if not (0 <= idx < len(self.targets)):
+        ``target_specs[idx]``. Updates pending target + current encoder.
+
+        Dispatches by kind:
+
+        - FAA: predict via the prior mount frame from the landmark's
+          ECEF (legacy behaviour).
+        - CELESTIAL: resolve fresh topocentric (az, el) from ephem at
+          slew time, then rotate through the prior mount frame.
+        - PLATESOLVE: use the spec's seed (az, el) when present;
+          otherwise leave the mount where it is (free-aim — the
+          operator jogs to a clearer-sky region before sighting).
+        """
+        if not (0 <= idx < len(self.target_specs)):
             return
-        lm, _true_az, _true_el, _slant = self.targets[idx]
+        ts = self.target_specs[idx]
         prior_frame = self._prior_frame or MountFrame.from_identity_enu(self.site)
-        pred_az, pred_el, _ = prior_frame.ecef_to_mount_azel(lm.ecef())
+        # Plate-solve free-aim mode: no slew, no sun check (the operator
+        # is already pointing somewhere they jogged to). Skip ahead.
+        if ts.kind == TargetKind.PLATESOLVE and (
+            ts.seed_az_deg is None or ts.seed_el_deg is None
+        ):
+            return
+        # Resolve seed (mount-frame) + truth (sky-frame). For FAA /
+        # CELESTIAL we resolve the truth from the spec; for seeded
+        # PLATESOLVE the operator-supplied seed *is* the mount-frame
+        # target and serves as the sky-frame proxy for sun safety.
+        if ts.kind == TargetKind.PLATESOLVE:
+            pred_az = float(ts.seed_az_deg)
+            pred_el = float(ts.seed_el_deg)
+            true_az = pred_az
+            true_el = pred_el
+        else:
+            try:
+                true_az, true_el, _ = ts.resolve_true_altaz(
+                    self.site, _now_utc()
+                )
+            except Exception as exc:
+                with self._lock:
+                    self._errors.append(
+                        f"resolve {ts.label}: {exc}"
+                    )
+                    self._phase = "error"
+                self._stop_evt.set()
+                return
+            if ts.kind == TargetKind.FAA and ts.landmark is not None:
+                # FAA: predict mount-frame az/el via prior_frame from
+                # the landmark's ECEF (legacy behaviour preserves the
+                # refraction-after-rotation convention).
+                pred_az, pred_el, _ = prior_frame.ecef_to_mount_azel(
+                    ts.landmark.ecef()
+                )
+            else:
+                # CELESTIAL — rotate the topocentric apparent (az, el)
+                # through ``prior_frame.topo_to_mount`` to get
+                # mount-frame (az, el).
+                pred_az, pred_el = _topo_to_mount_azel(
+                    true_az, true_el, prior_frame.topo_to_mount
+                )
         pred_az_wrapped = ((pred_az + 180.0) % 360.0) - 180.0
 
-        # Pre-flight sun-avoidance check. Uses the landmark's TRUE
-        # topocentric (az, el) — `_true_az` / `_true_el` were computed
-        # from the site + landmark position earlier in the pipeline and
-        # are in sky frame regardless of calibration state. This is
-        # authoritative for sun-separation and avoids any dependence on
-        # the (possibly wrong) prior frame. Stop the worker on failure
-        # so `_run()` bails before transitioning to the nudging phase.
+        # Pre-flight sun-avoidance. Uses the *true* topocentric (az, el)
+        # for the target so the check is in sky frame regardless of the
+        # prior calibration's accuracy. Plate-solve seeded slews use the
+        # mount-frame seed (operator-chosen) — sun-check that too.
         from device.sun_safety import is_sun_safe as _is_sun_safe
 
         sun_safe, sun_reason = _is_sun_safe(
-            float(_true_az) % 360.0,
-            float(_true_el),
+            float(true_az) % 360.0,
+            float(true_el),
         )
         if not sun_safe:
             with self._lock:
                 self._errors.append(
-                    f"{sun_reason} (landmark {getattr(lm, 'oas', '?')})"
+                    f"{sun_reason} (target {ts.label})"
                 )
                 self._phase = "error"
             self._stop_evt.set()
@@ -1126,7 +1712,7 @@ class CalibrationSession:
                 self._encoder_el = new_el
         except Exception as exc:
             with self._lock:
-                self._errors.append(f"slew to {lm.oas} failed: {exc}")
+                self._errors.append(f"slew to {ts.label} failed: {exc}")
 
     # ---------- helpers ----------
 
