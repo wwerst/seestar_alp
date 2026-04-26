@@ -4648,7 +4648,14 @@ _CALIBRATION_JSON_PATH = (
 
 
 def _calibration_status_dict(status):
-    """Serialise a CalibrationStatus (or None) to a plain dict."""
+    """Serialise a CalibrationStatus (or None) to a plain dict.
+
+    The unified picker exposes ``targets`` so the UI can render the
+    full pending list (FAA + celestial + plate-solve) with kind tags
+    and phase pills. ``current_landmark`` keeps its name for backwards
+    compat with the existing UI bindings even though it now carries
+    kind-aware fields for non-FAA targets.
+    """
     if status is None:
         return {"active": False}
     return {
@@ -4663,6 +4670,7 @@ def _calibration_status_dict(status):
         "encoder_el_deg": status.encoder_el_deg,
         "solution": status.solution,
         "errors": list(status.errors),
+        "targets": list(status.targets) if status.targets else None,
     }
 
 
@@ -4868,16 +4876,154 @@ def _nan_to_none(x):
     return None if x is None or not _m.isfinite(x) else float(x)
 
 
-class CalibrationStartResource:
-    """Body: {altitude_m, clear_prior, target_oas?}.
+class CalibrationCelestialTargetsResource:
+    """Return the visible bright-star + planet picker pool for the
+    unified calibration picker.
 
-    ``target_oas`` is an optional list of OAS strings; when absent the
-    session uses the above-horizon subset of DEFAULT_LANDMARKS. On
-    clear, the prior JSON is atomically renamed to ``.bak``."""
+    Backed by :mod:`scripts.trajectory.celestial_targets`. Filters by
+    horizon visibility, bright magnitude, and sun / moon separation,
+    and orders by proximity to the current pointing when supplied
+    (else by magnitude — brightest first)."""
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        from datetime import datetime, timezone
+
+        from device.alpaca_client import AlpacaClient
+        from scripts.trajectory.celestial_targets import (
+            all_targets,
+            filter_visible,
+            sort_by_magnitude,
+            sort_by_proximity,
+        )
+        from scripts.trajectory.observer import (
+            build_site,
+            fetch_telescope_lonlat,
+        )
+
+        alt_raw = req.params.get("altitude_m", "2.0")
+        try:
+            alt_m = float(alt_raw)
+        except (TypeError, ValueError):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "altitude_m must be numeric"})
+            return
+        cur_az_raw = req.params.get("current_az_deg")
+        cur_el_raw = req.params.get("current_el_deg")
+        # Both-or-neither: a partial pointing makes the proximity sort
+        # ambiguous, so reject 400 rather than silently fall back to
+        # magnitude sort.
+        if (cur_az_raw is None) != (cur_el_raw is None):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps(
+                {
+                    "error": (
+                        "current_az_deg and current_el_deg must be "
+                        "supplied together or omitted together"
+                    )
+                }
+            )
+            return
+        cur_az: float | None = None
+        cur_el: float | None = None
+        if cur_az_raw is not None and cur_el_raw is not None:
+            try:
+                cur_az = float(cur_az_raw)
+                cur_el = float(cur_el_raw)
+            except (TypeError, ValueError):
+                resp.status = falcon.HTTP_400
+                resp.content_type = "application/json"
+                resp.text = json.dumps(
+                    {"error": "current_az_deg / current_el_deg must be numeric"}
+                )
+                return
+        try:
+            cli = AlpacaClient("127.0.0.1", int(Config.port), int(telescope_id))
+            lat, lon = fetch_telescope_lonlat(cli)
+        except Exception as exc:
+            resp.status = falcon.HTTP_503
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": f"GPS unavailable: {exc}"})
+            return
+        site = build_site(lat_deg=lat, lon_deg=lon, alt_m=alt_m)
+        when_utc = datetime.now(timezone.utc)
+        pool = all_targets(when_utc, site)
+        visible = filter_visible(pool, site, when_utc)
+        if cur_az is not None and cur_el is not None:
+            ranked = sort_by_proximity(visible, cur_az, cur_el)
+            entries = [
+                {
+                    "name": t.name,
+                    "kind": t.kind,
+                    "ra_hours": t.ra_hours,
+                    "dec_deg": t.dec_deg,
+                    "vmag": t.vmag,
+                    "bayer": t.bayer,
+                    "notes": t.notes,
+                    "az_deg": float(az),
+                    "el_deg": float(el),
+                    "distance_deg": float(dist),
+                }
+                for (t, az, el, dist) in ranked
+            ]
+        else:
+            ranked = sort_by_magnitude(visible)
+            entries = [
+                {
+                    "name": t.name,
+                    "kind": t.kind,
+                    "ra_hours": t.ra_hours,
+                    "dec_deg": t.dec_deg,
+                    "vmag": t.vmag,
+                    "bayer": t.bayer,
+                    "notes": t.notes,
+                    "az_deg": float(az),
+                    "el_deg": float(el),
+                }
+                for (t, az, el) in ranked
+            ]
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            {
+                "targets": entries,
+                "observer": {"lat_deg": lat, "lon_deg": lon, "alt_m": alt_m},
+                "when_utc": when_utc.isoformat(),
+            }
+        )
+
+
+class CalibrationStartResource:
+    """Body: ``{altitude_m, clear_prior, targets?, target_oas?, dry_run?}``.
+
+    Two payload shapes, mutually exclusive:
+
+    - ``targets`` (new): a list of ``{kind, ...}`` tagged-union entries
+      mixing FAA / celestial / plate-solve targets in one calibration.
+    - ``target_oas`` (legacy): a list of FAA OAS strings; equivalent to
+      ``[{"kind": "faa", "oas": <s>}, ...]``. Existing FAA-only callers
+      keep working unchanged.
+
+    When neither is supplied the session falls back to the above-horizon
+    subset of DEFAULT_LANDMARKS — the legacy default behaviour.
+
+    On ``clear_prior=true`` the prior JSON is atomically renamed to
+    ``.bak`` before the new session starts.
+    """
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
         from device.alpaca_client import AlpacaClient
+        from device.calibration_targets import (
+            CalibrationTargetSpec,
+            TargetKind,
+        )
+        from device.plate_solver import (
+            UnavailablePlateSolver,
+            get_default_plate_solver,
+        )
         from device.rotation_calibration import (
             CalibrationSession,
             get_calibration_manager,
@@ -4911,7 +5057,31 @@ class CalibrationStartResource:
             return
         clear_prior = bool(body.get("clear_prior", False))
         dry_run = bool(body.get("dry_run", False))
+        targets_payload = body.get("targets")
         target_oas = body.get("target_oas")
+        # Mutual-exclusion gate. The two payload shapes overlap in
+        # intent; specifying both is almost always a client bug.
+        if targets_payload is not None and target_oas is not None:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps(
+                {"error": "pass either 'targets' or 'target_oas', not both"}
+            )
+            return
+        if targets_payload is not None:
+            # Need ≥2 sightings to fit a 3-DOF mount frame; the session
+            # itself will refuse to commit with fewer (`_on_commit`).
+            # Reject up-front so the client gets a clear 400 instead of
+            # starting a session that can never be committed.
+            if not isinstance(targets_payload, list) or len(targets_payload) < 2:
+                resp.status = falcon.HTTP_400
+                resp.content_type = "application/json"
+                resp.text = json.dumps(
+                    {
+                        "error": "'targets' must be a non-empty list with at least 2 items"
+                    }
+                )
+                return
         if target_oas is not None and not (
             isinstance(target_oas, list) and all(isinstance(x, str) for x in target_oas)
         ):
@@ -4954,66 +5124,137 @@ class CalibrationStartResource:
                 except Exception:
                     prior_frame = None
 
-        default_hits = filter_visible(
-            list(DEFAULT_LANDMARKS),
-            site,
-            min_el_deg=0.3,
-            preserve_order=True,
-        )
-        pool = list(default_hits)
-        if len(pool) < 2 or target_oas:
-            # Fall through to DOF when defaults aren't enough, or the
-            # caller is picking custom landmarks.
-            try:
-                candidates = fetch_nearby_landmarks(site)
-                dof_hits = filter_visible(candidates, site, top_n=30)
-            except Exception as exc:
-                dof_hits = []
-                dof_err = str(exc)
-            else:
-                dof_err = None
-            seen = {hit[0].oas for hit in pool}
-            for hit in dof_hits:
-                if hit[0].oas not in seen:
-                    pool.append(hit)
-                    seen.add(hit[0].oas)
-            if target_oas:
-                chosen = [h for h in pool if h[0].oas in target_oas]
-                missing = set(target_oas) - {h[0].oas for h in chosen}
-                if missing:
-                    resp.status = falcon.HTTP_400
-                    resp.content_type = "application/json"
-                    resp.text = json.dumps(
-                        {
-                            "error": f"landmarks not visible or not found: "
-                            f"{sorted(missing)}",
-                            "dof_fetch_error": dof_err,
-                        }
-                    )
-                    return
-                targets = chosen
-            else:
-                targets = pool[:2]
-        else:
-            targets = default_hits[:2]
-
-        if len(targets) < 2:
-            resp.status = falcon.HTTP_400
-            resp.content_type = "application/json"
-            resp.text = json.dumps(
-                {
-                    "error": "need at least 2 visible landmarks to calibrate",
-                }
+        # ---------- target spec assembly ----------
+        target_specs: list[CalibrationTargetSpec] = []
+        plate_solver = None
+        # Legacy path: target_oas → FAA-kind specs via the existing
+        # DOF lookup. Default to DEFAULT_LANDMARKS when target_oas is
+        # missing (back-compat with the original /start contract).
+        if targets_payload is None:
+            default_hits = filter_visible(
+                list(DEFAULT_LANDMARKS),
+                site,
+                min_el_deg=0.3,
+                preserve_order=True,
             )
-            return
+            pool = list(default_hits)
+            if len(pool) < 2 or target_oas:
+                try:
+                    candidates = fetch_nearby_landmarks(site)
+                    dof_hits = filter_visible(candidates, site, top_n=30)
+                except Exception as exc:
+                    dof_hits = []
+                    dof_err = str(exc)
+                else:
+                    dof_err = None
+                seen = {hit[0].oas for hit in pool}
+                for hit in dof_hits:
+                    if hit[0].oas not in seen:
+                        pool.append(hit)
+                        seen.add(hit[0].oas)
+                if target_oas:
+                    chosen = [h for h in pool if h[0].oas in target_oas]
+                    missing = set(target_oas) - {h[0].oas for h in chosen}
+                    if missing:
+                        resp.status = falcon.HTTP_400
+                        resp.content_type = "application/json"
+                        resp.text = json.dumps(
+                            {
+                                "error": f"landmarks not visible or not found: "
+                                f"{sorted(missing)}",
+                                "dof_fetch_error": dof_err,
+                            }
+                        )
+                        return
+                    chosen_pool = chosen
+                else:
+                    chosen_pool = pool[:2]
+            else:
+                chosen_pool = default_hits[:2]
+            if len(chosen_pool) < 2:
+                resp.status = falcon.HTTP_400
+                resp.content_type = "application/json"
+                resp.text = json.dumps(
+                    {
+                        "error": "need at least 2 visible landmarks to calibrate",
+                    }
+                )
+                return
+            target_specs = [
+                CalibrationTargetSpec.from_landmark(lm, slant_m=float(slant))
+                for (lm, _az, _el, slant) in chosen_pool
+            ]
+        else:
+            # Unified path: explicit list of tagged-union targets.
+            # We resolve FAA entries via the same DOF lookup the legacy
+            # path uses so unknown OAS values still get the same 400.
+            faa_oas_in_payload = [
+                str(t["oas"])
+                for t in targets_payload
+                if isinstance(t, dict)
+                and t.get("kind") == TargetKind.FAA.value
+                and t.get("oas")
+            ]
+            faa_pool: list = []
+            if faa_oas_in_payload:
+                default_hits = filter_visible(
+                    list(DEFAULT_LANDMARKS),
+                    site,
+                    min_el_deg=0.3,
+                    preserve_order=True,
+                )
+                faa_pool = list(default_hits)
+                seen = {hit[0].oas for hit in faa_pool}
+                try:
+                    candidates = fetch_nearby_landmarks(site)
+                    dof_hits = filter_visible(candidates, site, top_n=30)
+                except Exception as exc:
+                    dof_hits = []
+                    dof_err = str(exc)
+                else:
+                    dof_err = None
+                for hit in dof_hits:
+                    if hit[0].oas not in seen:
+                        faa_pool.append(hit)
+                        seen.add(hit[0].oas)
+            specs, err = _build_unified_target_specs(targets_payload, faa_pool=faa_pool)
+            if err is not None:
+                resp.status = err.get("status", falcon.HTTP_400)
+                resp.content_type = "application/json"
+                resp.text = json.dumps({"error": err["error"]})
+                return
+            target_specs = specs
+
+        # Plate-solve gate: refuse if any spec is platesolve and no
+        # solver is configured. Surfacing a 503 here avoids the
+        # session crashing on first sight.
+        needs_solver = any(ts.kind == TargetKind.PLATESOLVE for ts in target_specs)
+        if needs_solver:
+            plate_solver = get_default_plate_solver()
+            if isinstance(plate_solver, UnavailablePlateSolver):
+                resp.status = falcon.HTTP_503
+                resp.content_type = "application/json"
+                resp.text = json.dumps(
+                    {
+                        "error": "plate-solve targets requested but no "
+                        "plate solver is configured",
+                    }
+                )
+                return
 
         session = CalibrationSession(
             telescope_id=int(telescope_id),
-            targets=targets,
+            target_specs=target_specs,
             site=site,
             out_path=_CALIBRATION_JSON_PATH,
             prior_frame=prior_frame,
             dry_run=dry_run,
+            plate_solver=plate_solver,
+            capture_image_fn=(
+                _calibration_capture_image_fn(int(telescope_id))
+                if needs_solver
+                else None
+            ),
         )
         try:
             get_calibration_manager().start(session)
@@ -5029,6 +5270,174 @@ class CalibrationStartResource:
                 get_calibration_manager().status(int(telescope_id))
             )
         )
+
+
+def _build_unified_target_specs(targets_payload, *, faa_pool):
+    """Translate a JSON ``targets`` array into a list of
+    :class:`CalibrationTargetSpec`.
+
+    Returns ``(specs, error_dict_or_None)``. On error the caller
+    returns the dict's ``status`` + ``error`` straight to the client.
+
+    Validation:
+
+    - Each entry must be a dict with a known ``kind``.
+    - ``kind=faa`` requires ``oas``; the OAS must resolve in
+      ``faa_pool`` (the visible-DOF set the picker uses).
+    - ``kind=celestial`` requires ``name``, ``ra_hours``, ``dec_deg``.
+      ``vmag`` and ``bayer`` are optional.
+    - ``kind=platesolve`` requires ``label``. ``seed_az_deg`` /
+      ``seed_el_deg`` are optional.
+    """
+    from device.calibration_targets import (
+        CalibrationTargetSpec,
+        TargetKind,
+    )
+
+    specs: list[CalibrationTargetSpec] = []
+    for i, entry in enumerate(targets_payload):
+        if not isinstance(entry, dict):
+            return [], {
+                "error": f"targets[{i}] must be a JSON object",
+                "status": falcon.HTTP_400,
+            }
+        kind_raw = entry.get("kind")
+        try:
+            kind = TargetKind(kind_raw)
+        except ValueError:
+            return [], {
+                "error": (
+                    f"targets[{i}] unknown kind {kind_raw!r}; "
+                    "expected faa, celestial, or platesolve"
+                ),
+                "status": falcon.HTTP_400,
+            }
+        if kind == TargetKind.FAA:
+            oas = entry.get("oas")
+            if not isinstance(oas, str) or not oas:
+                return [], {
+                    "error": f"targets[{i}] (faa) requires 'oas'",
+                    "status": falcon.HTTP_400,
+                }
+            hit = next((h for h in faa_pool if h[0].oas == oas), None)
+            if hit is None:
+                return [], {
+                    "error": (
+                        f"targets[{i}] (faa) oas {oas!r} not visible or not found"
+                    ),
+                    "status": falcon.HTTP_400,
+                }
+            lm, _az, _el, slant = hit
+            specs.append(CalibrationTargetSpec.from_landmark(lm, slant_m=float(slant)))
+        elif kind == TargetKind.CELESTIAL:
+            name = entry.get("name")
+            ra_hours = entry.get("ra_hours")
+            dec_deg = entry.get("dec_deg")
+            if (
+                not isinstance(name, str)
+                or not name
+                or ra_hours is None
+                or dec_deg is None
+            ):
+                return [], {
+                    "error": (
+                        f"targets[{i}] (celestial) requires name, ra_hours, dec_deg"
+                    ),
+                    "status": falcon.HTTP_400,
+                }
+            try:
+                ra_h = float(ra_hours)
+                dec_d = float(dec_deg)
+            except (TypeError, ValueError):
+                return [], {
+                    "error": (
+                        f"targets[{i}] (celestial) ra_hours / dec_deg must be numeric"
+                    ),
+                    "status": falcon.HTTP_400,
+                }
+            vmag = entry.get("vmag")
+            try:
+                vmag_v = float(vmag) if vmag is not None else None
+            except (TypeError, ValueError):
+                return [], {
+                    "error": (f"targets[{i}] (celestial) vmag must be numeric"),
+                    "status": falcon.HTTP_400,
+                }
+            bayer = entry.get("bayer")
+            specs.append(
+                CalibrationTargetSpec.celestial(
+                    name=name,
+                    ra_hours=ra_h,
+                    dec_deg=dec_d,
+                    vmag=vmag_v,
+                    bayer=(str(bayer) if bayer else None),
+                )
+            )
+        elif kind == TargetKind.PLATESOLVE:
+            label = entry.get("label")
+            if not isinstance(label, str) or not label:
+                return [], {
+                    "error": (f"targets[{i}] (platesolve) requires 'label'"),
+                    "status": falcon.HTTP_400,
+                }
+            seed_az = entry.get("seed_az_deg")
+            seed_el = entry.get("seed_el_deg")
+            try:
+                seed_az_v = float(seed_az) if seed_az is not None else None
+                seed_el_v = float(seed_el) if seed_el is not None else None
+            except (TypeError, ValueError):
+                return [], {
+                    "error": (
+                        f"targets[{i}] (platesolve) seed_az_deg / "
+                        "seed_el_deg must be numeric"
+                    ),
+                    "status": falcon.HTTP_400,
+                }
+            specs.append(
+                CalibrationTargetSpec.platesolve(
+                    label=label,
+                    seed_az_deg=seed_az_v,
+                    seed_el_deg=seed_el_v,
+                )
+            )
+    return specs, None
+
+
+def _calibration_capture_image_fn(telescope_id: int):
+    """Return a thunk that captures an image from the given telescope's
+    imager and returns the resulting :class:`Path`.
+
+    Reuses the same ``do_action_device('iscope_capture_image', ...)``
+    path the standalone nighttime session uses; here we just expose it
+    as a callable the unified session can invoke at sight time.
+
+    Implementation note: in production the imager writes to a known
+    spool dir; the firmware returns the path via the action result.
+    For now we surface a runtime error if we can't get the path back —
+    the operator can switch to a different target kind or retry.
+    """
+
+    def _capture() -> Path:
+        try:
+            result = do_action_device(
+                "method_sync",
+                telescope_id,
+                {"method": "iscope_capture_image", "params": {"name": "calibrate"}},
+            )
+        except Exception as exc:
+            raise RuntimeError(f"image capture failed: {exc}") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError(f"image capture returned unexpected payload: {result!r}")
+        path = (
+            result.get("result", {}).get("image_path")
+            if isinstance(result.get("result"), dict)
+            else None
+        )
+        if not path:
+            raise RuntimeError("image capture: firmware did not return image_path")
+        return Path(str(path))
+
+    return _capture
 
 
 class CalibrationStatusResource:
@@ -6967,6 +7376,10 @@ class FrontMain:
         app.add_route(
             "/api/{telescope_id:int}/calibration/targets",
             CalibrationTargetsResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibration/celestial_targets",
+            CalibrationCelestialTargetsResource(),
         )
         app.add_route(
             "/api/{telescope_id:int}/calibration/start",

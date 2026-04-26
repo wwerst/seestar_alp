@@ -1424,4 +1424,332 @@ def test_calibrate_rotation_targets_default_first_is_hyperion(monkeypatch):
     defaults = payload["defaults"]
     assert len(defaults) >= 1
     assert defaults[0]["oas"] == HYPERION_06_000301.oas
+    assert "Hypername" not in defaults[0]["name"]  # smoke
     assert "Hyperion" in defaults[0]["name"]
+
+
+# ---------- Unified /calibration/start --------------------------------
+
+
+class _StartResp:
+    """Minimal ``resp`` stub for falcon-style resource tests. The
+    resources we test write ``status`` / ``content_type`` / ``text``
+    directly, so this is enough."""
+
+    status = None
+    content_type = None
+    text = None
+
+
+class _StartReq:
+    """Minimal ``req`` stub. Falcon resources access ``req.media`` for
+    JSON; we precompute it here."""
+
+    def __init__(self, media):
+        self.media = media
+
+
+def _patch_unified_start_env(monkeypatch, tmp_path):
+    """Common setup for ``CalibrationStartResource.on_post`` tests:
+    fake telescope GPS, a tmpdir-rooted calibration JSON, and a
+    minimal Alpaca stub.
+
+    Stops any previously-running calibration session so each test
+    starts from a clean slate.
+    """
+    from device.config import Config
+
+    monkeypatch.setattr(Config, "port", 5555)
+
+    class FakeAlpaca:
+        def __init__(self, *_a, **_k):
+            pass
+
+    monkeypatch.setattr("device.alpaca_client.AlpacaClient", FakeAlpaca)
+    # GPS at Dockweiler so DEFAULT_LANDMARKS hit visibility.
+    monkeypatch.setattr(
+        "scripts.trajectory.observer.fetch_telescope_lonlat",
+        lambda _cli: (33.9615051, -118.4581361),
+    )
+    # Redirect the calibration JSON path so we don't write into
+    # device/mount_calibration.json on the dev machine.
+    out = tmp_path / "cal.json"
+    monkeypatch.setattr(front_app, "_CALIBRATION_JSON_PATH", out)
+    # Disable the worker thread's actual mount driving — use dry_run
+    # in the body instead. The session still spins up but doesn't
+    # talk to the (fake) Alpaca client.
+    # Neutralise sun-safety so the celestial slew doesn't fail when
+    # the wall-clock places Vega near the sun.
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **kw: (True, ""))
+
+    # Reset any leftover calibration manager from a previous test so
+    # the `409` path doesn't trip when we call start() back-to-back.
+    from device.rotation_calibration import get_calibration_manager
+
+    mgr = get_calibration_manager()
+    for tid in list(mgr._sessions.keys()):
+        try:
+            mgr.stop(tid)
+        except Exception:
+            pass
+        mgr._sessions.pop(tid, None)
+    return out
+
+
+def test_calibration_start_with_unified_targets_payload(monkeypatch, tmp_path):
+    """POST /start with a tagged-union ``targets`` array starts a
+    session with kind-aware specs and the status surfaces them."""
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {
+                "kind": "celestial",
+                "name": "Vega",
+                "ra_hours": 18.6157,
+                "dec_deg": 38.7837,
+                "vmag": 0.03,
+                "bayer": "alpha Lyr",
+            },
+        ],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "200 OK"
+    payload = json.loads(resp.text)
+    assert payload["active"] is True
+    assert payload["n_targets"] == 2
+    kinds = [t["kind"] for t in (payload.get("targets") or [])]
+    assert kinds == ["faa", "celestial"]
+
+
+def test_calibration_start_legacy_target_oas_payload_still_works(monkeypatch, tmp_path):
+    """The existing ``target_oas`` shape must keep working — the
+    resource translates it into FAA-kind specs."""
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "target_oas": ["06-000301", "06-000177"],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "200 OK"
+    payload = json.loads(resp.text)
+    assert payload["n_targets"] == 2
+    assert payload["targets"][0]["kind"] == "faa"
+
+
+def test_calibration_start_rejects_both_targets_and_target_oas(monkeypatch, tmp_path):
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [{"kind": "faa", "oas": "06-000301"}],
+        "target_oas": ["06-000301"],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "not both" in json.loads(resp.text)["error"]
+
+
+def test_calibration_start_rejects_empty_targets_list(monkeypatch, tmp_path):
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {"altitude_m": 2.0, "dry_run": True, "targets": []}
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "at least 2" in json.loads(resp.text)["error"]
+
+
+def test_calibration_start_rejects_single_target_list(monkeypatch, tmp_path):
+    """Sessions with fewer than 2 sightings can never commit
+    (`_on_commit` requires ≥2). Reject the request up-front instead of
+    starting a session that's stuck."""
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [{"kind": "faa", "oas": "06-000301"}],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "at least 2" in json.loads(resp.text)["error"]
+
+
+def test_calibration_start_rejects_unknown_kind(monkeypatch, tmp_path):
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {"kind": "ad-hoc", "label": "?"},
+        ],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "unknown kind" in json.loads(resp.text)["error"]
+
+
+def test_calibration_start_rejects_celestial_missing_radec(monkeypatch, tmp_path):
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {"kind": "celestial", "name": "Vega"},  # missing ra/dec
+        ],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "celestial" in json.loads(resp.text)["error"]
+
+
+def test_calibration_start_rejects_celestial_non_numeric_vmag(monkeypatch, tmp_path):
+    """A non-numeric ``vmag`` must produce a 400, not a 500 from a
+    bare ``float()`` call."""
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {
+                "kind": "celestial",
+                "name": "Vega",
+                "ra_hours": 18.6157,
+                "dec_deg": 38.7837,
+                "vmag": "bright",
+            },
+        ],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "vmag" in json.loads(resp.text)["error"]
+
+
+def test_calibration_start_rejects_unknown_faa_oas(monkeypatch, tmp_path):
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {"kind": "faa", "oas": "ZZ-999999"},
+        ],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
+    assert "ZZ-999999" in json.loads(resp.text)["error"]
+
+
+def test_calibration_start_platesolve_without_solver_returns_503(monkeypatch, tmp_path):
+    """If the targets array has a platesolve entry but no plate solver
+    is configured, the start request must 503 rather than crash on
+    first sight."""
+    _patch_unified_start_env(monkeypatch, tmp_path)
+    # Force ``get_default_plate_solver`` to return UnavailablePlateSolver.
+    from device.plate_solver import UnavailablePlateSolver
+
+    monkeypatch.setattr(
+        "device.plate_solver.get_default_plate_solver",
+        lambda: UnavailablePlateSolver(),
+    )
+    body = {
+        "altitude_m": 2.0,
+        "dry_run": True,
+        "targets": [
+            {"kind": "faa", "oas": "06-000301"},
+            {"kind": "platesolve", "label": "free aim 1"},
+        ],
+    }
+    req = _StartReq(media=body)
+    resp = _StartResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=1)
+    assert resp.status == "503 Service Unavailable"
+    assert "plate solver" in json.loads(resp.text)["error"]
+
+
+# ---------- Celestial targets endpoint --------------------------------
+
+
+def test_celestial_targets_returns_visible_pool(monkeypatch):
+    """``/calibration/celestial_targets`` returns the visible bright-
+    star + planet pool with az/el populated."""
+    from device.config import Config
+
+    monkeypatch.setattr(Config, "port", 5555)
+    monkeypatch.setattr("device.alpaca_client.AlpacaClient", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "scripts.trajectory.observer.fetch_telescope_lonlat",
+        lambda _cli: (34.0522, -118.2437),
+    )
+
+    class _Req:
+        params = {"altitude_m": "30.0"}
+
+    class _Resp:
+        status = None
+        content_type = None
+        text = None
+
+    req = _Req()
+    resp = _Resp()
+    front_app.CalibrationCelestialTargetsResource.on_get(req, resp, telescope_id=1)
+    assert resp.status == "200 OK"
+    payload = json.loads(resp.text)
+    assert "targets" in payload
+    assert "observer" in payload
+    assert "when_utc" in payload
+    # All entries have az/el and a name.
+    for t in payload["targets"]:
+        assert "name" in t
+        assert "az_deg" in t
+        assert "el_deg" in t
+
+
+def test_celestial_targets_partial_pointing_400(monkeypatch):
+    """current_az_deg without current_el_deg (or vice versa) is
+    ambiguous — server must 400."""
+    from device.config import Config
+
+    monkeypatch.setattr(Config, "port", 5555)
+    monkeypatch.setattr("device.alpaca_client.AlpacaClient", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "scripts.trajectory.observer.fetch_telescope_lonlat",
+        lambda _cli: (34.0522, -118.2437),
+    )
+
+    class _Req:
+        params = {"altitude_m": "30.0", "current_az_deg": "100.0"}
+
+    class _Resp:
+        status = None
+        content_type = None
+        text = None
+
+    req = _Req()
+    resp = _Resp()
+    front_app.CalibrationCelestialTargetsResource.on_get(req, resp, telescope_id=1)
+    assert resp.status == "400 Bad Request"
