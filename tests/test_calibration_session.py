@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -73,10 +74,16 @@ class _FakeCli:
         return {"result": None}
 
 
-def _install_fakes(monkeypatch, cli: _FakeCli):
+def _install_fakes(monkeypatch, cli: _FakeCli, *, neutralise_sun=False):
     """Replace the per-call imports inside CalibrationSession with
     lightweight fakes. ``move_to_ff`` updates the cli's encoder state
-    to ``(target_az, target_el)`` and returns (new_el, new_az, {})."""
+    to ``(target_az, target_el)`` and returns (new_el, new_az, {}).
+
+    When ``neutralise_sun`` is true, ``device.sun_safety.is_sun_safe`` is
+    monkeypatched to always return ``(True, '')`` so a celestial /
+    plate-solve test pinned to a specific (az, el) doesn't fail when
+    the wall-clock places the sun there.
+    """
     import device.rotation_calibration as rc
 
     monkeypatch.setattr(
@@ -123,6 +130,10 @@ def _install_fakes(monkeypatch, cli: _FakeCli):
         "device.velocity_controller.set_tracking",
         fake_set_tracking,
     )
+    if neutralise_sun:
+        from device import sun_safety as ss
+
+        monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **kw: (True, ""))
     # Make Config.port resolution cheap.
     import device.config as cfg
 
@@ -480,3 +491,322 @@ def test_manager_refuses_while_tracker_running(monkeypatch, tmp_path):
 
 def test_get_calibration_manager_is_singleton():
     assert get_calibration_manager() is get_calibration_manager()
+
+
+# ---------- unified target-spec session ----------------------------
+
+
+def _faa_specs(site):
+    """Helper: build a list of FAA target specs from the visible
+    defaults. Mirrors what CalibrationStartResource passes through
+    its translation step."""
+    from device.calibration_targets import CalibrationTargetSpec
+
+    hits = _targets(site)
+    return [
+        CalibrationTargetSpec.from_landmark(lm, slant_m=float(slant))
+        for (lm, _az, _el, slant) in hits
+    ]
+
+
+def test_from_landmarks_factory_produces_working_faa_session(
+    monkeypatch, tmp_path
+):
+    """The legacy factory must round-trip the existing FAA-only
+    targets list through the unified session unchanged."""
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli)
+    session = CalibrationSession.from_landmarks(
+        telescope_id=10,
+        targets=_targets(site),
+        site=site,
+        out_path=tmp_path / "cal.json",
+    )
+    session.start()
+    try:
+        _wait_for_phase(session, "nudging")
+        st = session.status()
+        assert st.n_targets == 2
+        assert st.current_landmark["kind"] == "faa"
+        assert st.current_landmark["oas"] == "06-000301"
+        # The new ``targets`` list mirrors the spec pool.
+        assert st.targets is not None
+        assert all(t["kind"] == "faa" for t in st.targets)
+    finally:
+        session.stop()
+
+
+def test_targets_and_target_specs_are_mutually_exclusive(
+    monkeypatch, tmp_path
+):
+    site = _site()
+    _install_fakes(monkeypatch, _FakeCli())
+    from device.calibration_targets import CalibrationTargetSpec
+
+    specs = _faa_specs(site)
+    with pytest.raises(ValueError, match="not both"):
+        CalibrationSession(
+            telescope_id=11,
+            targets=_targets(site),
+            target_specs=specs,
+            site=site,
+            out_path=tmp_path / "cal.json",
+        )
+
+
+def test_session_requires_target_specs_or_targets(monkeypatch, tmp_path):
+    site = _site()
+    _install_fakes(monkeypatch, _FakeCli())
+    with pytest.raises(ValueError, match="need either target_specs or targets"):
+        CalibrationSession(
+            telescope_id=12,
+            site=site,
+            out_path=tmp_path / "cal.json",
+        )
+
+
+def test_mixed_faa_and_celestial_session_runs_through_sighting(
+    monkeypatch, tmp_path
+):
+    """A mixed (FAA, celestial) session must drive both targets and
+    fit a 3-DOF rotation. The celestial truth is mocked so the test is
+    deterministic regardless of wall-clock."""
+    from device.calibration_targets import CalibrationTargetSpec, TargetKind
+
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+    # Pin celestial resolution to a known answer so the fit is
+    # deterministic. Patch resolve_true_altaz on the spec via
+    # ``_resolve_celestial`` — the simplest deterministic stub.
+    fixed_celestial = (
+        45.0,  # az
+        60.0,  # el
+        None,
+    )
+
+    def _fake_celestial(self, site_, when_utc):
+        return fixed_celestial
+
+    monkeypatch.setattr(
+        CalibrationTargetSpec, "_resolve_celestial", _fake_celestial
+    )
+    faa_specs = _faa_specs(site)
+    celestial_spec = CalibrationTargetSpec.celestial(
+        "Vega", ra_hours=18.6157, dec_deg=38.7837, vmag=0.03
+    )
+    session = CalibrationSession(
+        telescope_id=21,
+        target_specs=[faa_specs[0], celestial_spec],
+        site=site,
+        out_path=tmp_path / "cal.json",
+    )
+    session.start()
+    try:
+        _wait_for_phase(session, "nudging")
+        # Sight the FAA target first.
+        session.sight()
+        time.sleep(0.4)
+        st = session.status()
+        assert st.target_idx == 1
+        assert st.current_landmark["kind"] == TargetKind.CELESTIAL.value
+        # Sight the celestial target.
+        session.sight()
+        _wait_for_phase(session, "review")
+        st2 = session.status()
+        assert st2.solution is not None
+        assert len(st2.solution["per_landmark"]) == 2
+        kinds = {r["kind"] for r in st2.solution["per_landmark"]}
+        assert kinds == {"faa", "celestial"}
+    finally:
+        session.stop()
+
+
+def test_celestial_only_session_writes_unified_or_celestial_method(
+    monkeypatch, tmp_path
+):
+    """Three celestial sightings produce a 3-DOF fit and the
+    written calibration tags ``calibration_method`` based on the
+    record set's kinds."""
+    from device.calibration_targets import CalibrationTargetSpec, TargetKind
+
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+
+    # Spec-keyed canned truth so slew + sight for the same target
+    # always agree (encoder == truth → residual ≈ 0). Ordering makes
+    # sightings well-separated on the sky so the 3-DOF LM fit isn't
+    # degenerate.
+    truth_by_label = {
+        "Vega": (45.0, 60.0, None),
+        "Capella": (135.0, 50.0, None),
+        "Arcturus": (225.0, 45.0, None),
+    }
+
+    def _fake_celestial(self, site_, when_utc):
+        return truth_by_label[self.label]
+
+    monkeypatch.setattr(
+        CalibrationTargetSpec, "_resolve_celestial", _fake_celestial
+    )
+    specs = [
+        CalibrationTargetSpec.celestial(
+            "Vega", ra_hours=18.6157, dec_deg=38.7837, vmag=0.03
+        ),
+        CalibrationTargetSpec.celestial(
+            "Capella", ra_hours=5.2782, dec_deg=45.998, vmag=0.08
+        ),
+        CalibrationTargetSpec.celestial(
+            "Arcturus", ra_hours=14.261, dec_deg=19.1825, vmag=-0.05
+        ),
+    ]
+    out = tmp_path / "cal.json"
+    session = CalibrationSession(
+        telescope_id=22,
+        target_specs=specs,
+        site=site,
+        out_path=out,
+    )
+    session.start()
+    try:
+        _wait_for_phase(session, "nudging")
+        for _ in range(3):
+            session.sight()
+            time.sleep(0.3)
+        _wait_for_phase(session, "review")
+        st = session.status()
+        assert st.solution is not None
+        assert len(st.solution["per_landmark"]) == 3
+        for rec in st.solution["per_landmark"]:
+            assert rec["kind"] == TargetKind.CELESTIAL.value
+        session.commit()
+        _wait_for_phase(session, "committed")
+    finally:
+        session.stop()
+    assert out.exists()
+    payload = json.loads(out.read_text())
+    assert payload["calibration_method"] == "rotation_celestial"
+    assert payload["n_landmarks"] == 3
+
+
+def test_platesolve_session_requires_solver(monkeypatch, tmp_path):
+    """A session with a PLATESOLVE spec must be constructed with a
+    plate solver — otherwise the session refuses at construction."""
+    from device.calibration_targets import CalibrationTargetSpec
+
+    site = _site()
+    _install_fakes(monkeypatch, _FakeCli())
+    with pytest.raises(ValueError, match="plate_solver required"):
+        CalibrationSession(
+            telescope_id=31,
+            target_specs=[
+                CalibrationTargetSpec.from_landmark(
+                    HYPERION_06_000301, slant_m=5523.0
+                ),
+                CalibrationTargetSpec.platesolve("free aim 1"),
+            ],
+            site=site,
+            out_path=tmp_path / "cal.json",
+        )
+
+
+def test_platesolve_failure_does_not_append_sighting(monkeypatch, tmp_path):
+    """If the inner plate-solve fails, the session must surface the
+    error and leave the sightings list untouched so the operator can
+    retry without losing prior good sightings."""
+    from device.calibration_targets import CalibrationTargetSpec
+    from device.plate_solver import FakePlateSolver
+
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+    solver = FakePlateSolver(results={"/tmp/fake-cap.fits": None})
+
+    def _capture():
+        return Path("/tmp/fake-cap.fits")
+
+    spec_faa = CalibrationTargetSpec.from_landmark(
+        HYPERION_06_000301, slant_m=5523.0
+    )
+    spec_lab = CalibrationTargetSpec.from_landmark(
+        LA_BROADCAST_06_000177, slant_m=8500.0
+    )
+    spec_ps = CalibrationTargetSpec.platesolve("free aim 1")
+    session = CalibrationSession(
+        telescope_id=32,
+        target_specs=[spec_faa, spec_ps, spec_lab],
+        site=site,
+        out_path=tmp_path / "cal.json",
+        plate_solver=solver,
+        capture_image_fn=_capture,
+    )
+    session.start()
+    try:
+        _wait_for_phase(session, "nudging")
+        # Sight the first FAA target → success.
+        session.sight()
+        time.sleep(0.4)
+        st = session.status()
+        assert st.target_idx == 1
+        assert st.current_landmark["kind"] == "platesolve"
+        assert st.solution is not None
+        assert len(st.solution["per_landmark"]) == 1
+        # Sight the plate-solve target → fake solver returns None →
+        # PlateSolverFailed → the sight attempt fails.
+        session.sight()
+        # Allow the worker to process.
+        time.sleep(0.4)
+        st2 = session.status()
+        # Sighting count unchanged; idx still pointing at the
+        # plate-solve target (no auto-advance on failure).
+        assert st2.target_idx == 1
+        assert st2.solution is not None
+        assert len(st2.solution["per_landmark"]) == 1
+        assert any("plate-solve" in e.lower() for e in st2.errors)
+        assert st2.current_landmark.get("last_platesolve_error") is not None
+    finally:
+        session.stop()
+
+
+def test_status_response_includes_kind_metadata(monkeypatch, tmp_path):
+    from device.calibration_targets import CalibrationTargetSpec
+
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+    fixed = (45.0, 60.0, None)
+
+    def _fake_celestial(self, site_, when_utc):
+        return fixed
+
+    monkeypatch.setattr(
+        CalibrationTargetSpec, "_resolve_celestial", _fake_celestial
+    )
+    specs = [
+        CalibrationTargetSpec.from_landmark(
+            HYPERION_06_000301, slant_m=5523.0
+        ),
+        CalibrationTargetSpec.celestial(
+            "Vega", ra_hours=18.6157, dec_deg=38.7837, vmag=0.03
+        ),
+    ]
+    session = CalibrationSession(
+        telescope_id=33,
+        target_specs=specs,
+        site=site,
+        out_path=tmp_path / "cal.json",
+    )
+    session.start()
+    try:
+        _wait_for_phase(session, "nudging")
+        st = session.status()
+        assert st.targets is not None
+        assert [t["kind"] for t in st.targets] == ["faa", "celestial"]
+        assert st.targets[1]["label"] == "Vega"
+        # current_landmark on first target should carry FAA fields.
+        assert st.current_landmark["kind"] == "faa"
+        assert st.current_landmark["oas"] == "06-000301"
+    finally:
+        session.stop()
