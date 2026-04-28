@@ -133,9 +133,7 @@ def test_get_default_plate_solver_prefers_seestar_when_runner_provided(monkeypat
     import device.plate_solver as ps
 
     monkeypatch.setattr(ps.shutil, "which", lambda *a, **kw: "/fake/solve-field")
-    s = ps.get_default_plate_solver(
-        telescope_id=1, action_runner=lambda *a, **kw: None
-    )
+    s = ps.get_default_plate_solver(telescope_id=1, action_runner=lambda *a, **kw: None)
     assert isinstance(s, SeestarPlateSolver)
     assert s.kind == "seestar"
 
