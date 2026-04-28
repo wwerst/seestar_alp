@@ -3,15 +3,21 @@
 Plate solving converts a sky image to (RA, Dec) by matching the visible
 star pattern against a catalog. We use it to anchor each nighttime
 calibration sighting to celestial coordinates: command the mount to
-``(commanded_az, commanded_el)``, capture an image, plate-solve to
-``(true_ra, true_dec)``, and convert that back to true ``(az, el)``
-using the site location + UTC. The pair forms one input to the same
-3-DOF rotation solver the daytime FAA-landmark workflow uses.
+``(commanded_az, commanded_el)``, plate-solve to ``(true_ra, true_dec)``,
+and convert that back to true ``(az, el)`` using the site location +
+UTC. The pair forms one input to the same 3-DOF rotation solver the
+daytime FAA-landmark workflow uses.
 
-Three backends:
+Backends:
 
+- :class:`SeestarPlateSolver` — runs the firmware's onboard solver via
+  the ``start_solve`` RPC and parses the ``PlateSolve`` completion
+  event. **Default** when a telescope id + Alpaca action runner are
+  available; needs no host-side dependencies.
 - :class:`SolveFieldPlateSolver` — wraps the ``solve-field`` CLI from
-  astrometry.net. Default when the binary is on PATH.
+  astrometry.net. Used as a fallback when the firmware solver isn't
+  reachable (e.g. dry-running calibration logic against captured FITS
+  images on a workstation with no scope attached).
 - :class:`FakePlateSolver` — used by tests. Returns canned
   :class:`SolveResult` values keyed by image path.
 - :class:`UnavailablePlateSolver` — sentinel returned when no real
@@ -20,10 +26,9 @@ Three backends:
   ``isinstance(get_default_plate_solver(), UnavailablePlateSolver)``
   for a fast availability flag.
 
-The solver dependency is **optional** — if neither the CLI nor an API
-key is available, the nighttime calibrate tab is disabled with a clear
-"Plate solver not configured" message; daytime calibration is
-unaffected.
+The :class:`SeestarPlateSolver` ignores the ``image_path`` argument:
+the scope solves whatever it is currently looking at, no on-disk file
+is involved.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 
 # Minimum / maximum field-of-view (degrees) we consider sane for an S50
@@ -75,9 +80,16 @@ class SolveResult:
 
 @runtime_checkable
 class PlateSolver(Protocol):
-    """Duck-typed interface."""
+    """Duck-typed interface.
 
-    def solve(self, image_path: Path) -> SolveResult: ...
+    ``image_path`` is optional: backends that drive the scope's onboard
+    solver (:class:`SeestarPlateSolver`) ignore it because the firmware
+    plate-solves whatever it's currently looking at — there is no
+    on-disk image. File-based backends (:class:`SolveFieldPlateSolver`)
+    require it.
+    """
+
+    def solve(self, image_path: Path | None = None) -> SolveResult: ...
 
     def is_available(self) -> bool: ...
 
@@ -123,11 +135,15 @@ class SolveFieldPlateSolver:
     def is_available(self) -> bool:
         return bool(self.binary_path)
 
-    def solve(self, image_path: Path) -> SolveResult:
+    def solve(self, image_path: Path | None = None) -> SolveResult:
         if not self.is_available():
             raise PlateSolverNotAvailable(
                 "solve-field binary not on PATH; install astrometry.net "
                 "(see plans/nighttime_calibration.md)"
+            )
+        if image_path is None:
+            raise PlateSolverFailed(
+                "solve-field requires an on-disk image; pass image_path"
             )
         image_path = Path(image_path)
         if not image_path.exists():
@@ -233,6 +249,110 @@ def _parse_solve_field_stdout(stdout: str, raw_dict: dict | None = None) -> Solv
     )
 
 
+# ---------- SeestarPlateSolver ---------------------------------------
+
+
+# Type alias for the Alpaca action callable. Matches
+# ``front.app.do_action_device(action, dev_num, parameters) -> dict | None``.
+SeestarActionRunner = Callable[[str, int, dict], "Any"]
+
+
+class SeestarPlateSolver:
+    """Onboard plate solver via the Seestar firmware's ``start_solve`` RPC.
+
+    The scope solves whatever it is currently looking at; ``solve()``
+    therefore ignores ``image_path``. The implementation drives the
+    Alpaca custom action ``start_solve_sync`` (registered in
+    ``device/telescope.py``), which sends ``start_solve`` and blocks
+    until the page-level ``PlateSolve`` completion event arrives. The
+    firmware reports RA in **hours** and Dec in **degrees**; we
+    convert RA to degrees on the way out for parity with the
+    ``solve-field`` backend.
+
+    Constructor takes an injectable ``action_runner`` so tests can
+    pass a stub. In production, ``front.app.do_action_device`` is the
+    runner.
+    """
+
+    kind = "seestar"
+
+    def __init__(
+        self,
+        action_runner: SeestarActionRunner,
+        telescope_id: int,
+        *,
+        timeout_s: float = 60.0,
+    ):
+        self.action_runner = action_runner
+        self.telescope_id = int(telescope_id)
+        self.timeout_s = float(timeout_s)
+
+    def is_available(self) -> bool:
+        # We don't pre-check connectivity; ``solve()`` raises loudly
+        # if the scope is offline. Returning True here keeps the
+        # availability endpoint cheap.
+        return True
+
+    def solve(self, image_path: Path | None = None) -> SolveResult:
+        try:
+            response = self.action_runner(
+                "start_solve_sync",
+                self.telescope_id,
+                {"timeout_s": self.timeout_s},
+            )
+        except Exception as exc:
+            raise PlateSolverFailed(f"seestar plate solve failed: {exc}") from exc
+        if response is None:
+            raise PlateSolverFailed(
+                "seestar plate solve: no response from device "
+                f"(telescope {self.telescope_id} unreachable?)"
+            )
+        # The Alpaca driver propagates ``request_plate_solve_sync``
+        # exceptions (timeout / firmware ``fail`` event) as a non-zero
+        # ``ErrorNumber`` response with no ``Value`` field.
+        if isinstance(response, dict):
+            err_num = response.get("ErrorNumber")
+            if err_num not in (None, 0):
+                raise PlateSolverFailed(
+                    f"seestar plate solve: device error "
+                    f"{err_num} {response.get('ErrorMessage', '')}".strip()
+                )
+        # Alpaca wraps the firmware result under ``Value``; some test
+        # doubles return the inner dict directly.
+        if isinstance(response, dict) and "Value" in response:
+            payload = response["Value"]
+        else:
+            payload = response
+        if not isinstance(payload, dict) or "ra_dec" not in payload:
+            raise PlateSolverFailed(
+                f"seestar plate solve: missing ra_dec in response {payload!r}"
+            )
+        ra_dec = payload["ra_dec"]
+        try:
+            # Firmware emits RA in hours, Dec in degrees.
+            ra_hours = float(ra_dec[0])
+            dec_deg = float(ra_dec[1])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise PlateSolverFailed(
+                f"seestar plate solve: malformed ra_dec {ra_dec!r}"
+            ) from exc
+        fov = payload.get("fov") or [0.0, 0.0]
+        try:
+            fov_x = float(fov[0])
+            fov_y = float(fov[1])
+        except (TypeError, ValueError, IndexError):
+            fov_x = fov_y = 0.0
+        return SolveResult(
+            ra_deg=ra_hours * 15.0,
+            dec_deg=dec_deg,
+            fov_x_deg=fov_x,
+            fov_y_deg=fov_y,
+            position_angle_deg=float(payload.get("angle", 0.0) or 0.0),
+            stars_used=int(payload.get("star_number", 0) or 0),
+            raw=dict(payload),
+        )
+
+
 # ---------- FakePlateSolver ------------------------------------------
 
 
@@ -259,14 +379,17 @@ class FakePlateSolver:
     def add(self, image_path: Path, result: SolveResult | None) -> None:
         self.results[str(image_path)] = result
 
-    def solve(self, image_path: Path) -> SolveResult:
-        path_str = str(Path(image_path))
-        self.calls.append(Path(image_path))
+    def solve(self, image_path: Path | None = None) -> SolveResult:
+        # Use a sentinel key so callers (Seestar mode) that don't
+        # supply a path can still register a single canned result via
+        # ``""`` -> SolveResult.
+        path_str = "" if image_path is None else str(Path(image_path))
+        self.calls.append(Path(image_path) if image_path is not None else Path(""))
         if path_str not in self.results:
-            raise FileNotFoundError(f"no fake result for {path_str}")
+            raise FileNotFoundError(f"no fake result for {path_str!r}")
         result = self.results[path_str]
         if result is None:
-            raise PlateSolverFailed(f"fake failure for {path_str}")
+            raise PlateSolverFailed(f"fake failure for {path_str!r}")
         return result
 
 
@@ -284,7 +407,7 @@ class UnavailablePlateSolver:
     def is_available(self) -> bool:
         return False
 
-    def solve(self, image_path: Path) -> SolveResult:
+    def solve(self, image_path: Path | None = None) -> SolveResult:
         raise PlateSolverNotAvailable(
             "plate solver not configured; install astrometry.net or "
             "configure ASTROMETRY_API_KEY (see plans/nighttime_calibration.md)"
@@ -294,17 +417,25 @@ class UnavailablePlateSolver:
 # ---------- factory --------------------------------------------------
 
 
-def get_default_plate_solver() -> PlateSolver:
+def get_default_plate_solver(
+    telescope_id: int | None = None,
+    action_runner: SeestarActionRunner | None = None,
+) -> PlateSolver:
     """Return the best available plate solver.
 
-    Prefers a local ``solve-field`` install. Returns an
-    :class:`UnavailablePlateSolver` if nothing is configured — callers
-    can check ``is_available()`` to decide whether to enable nighttime
-    mode.
+    Preference order:
 
-    Web-service fallback (astroquery.astrometry_net) is not implemented
-    in this PR; see plans/nighttime_calibration.md for the design.
+    1. :class:`SeestarPlateSolver` when both ``telescope_id`` and
+       ``action_runner`` are supplied — the firmware's onboard solver
+       has no host-side dependencies.
+    2. :class:`SolveFieldPlateSolver` if the ``solve-field`` binary is
+       on PATH — used as a workstation fallback for solving captured
+       FITS images without a scope attached.
+    3. :class:`UnavailablePlateSolver` — callers can check
+       ``is_available()`` before enabling nighttime mode.
     """
+    if telescope_id is not None and action_runner is not None:
+        return SeestarPlateSolver(action_runner, int(telescope_id))
     sf = SolveFieldPlateSolver()
     if sf.is_available():
         return sf

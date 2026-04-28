@@ -476,6 +476,52 @@ class Seestar:
         tmp = self.send_message_param_sync({"method": "start_solve"})
         self.logger.info(f"requested plate solve for BPA: {tmp}")
 
+    def request_plate_solve_sync(self, timeout_s: float = 60.0) -> dict:
+        """Run the firmware's onboard plate solver and return the result.
+
+        Sends ``start_solve`` and waits for the page-level ``PlateSolve``
+        ``complete`` event that carries the ``ra_dec`` / ``fov`` /
+        ``angle`` / ``star_number`` payload. The trailing top-level
+        ``complete`` event has no result attached, which is why we
+        filter on the ``result`` key rather than relying on
+        ``event_state["PlateSolve"]``.
+        """
+        done = threading.Event()
+        holder: dict = {}
+
+        def _on_event(sender, **_kw):
+            if not isinstance(sender, dict) or sender.get("Event") != "PlateSolve":
+                return
+            state = sender.get("state")
+            if (
+                state == "complete"
+                and isinstance(sender.get("result"), dict)
+                and "ra_dec" in sender["result"]
+            ):
+                holder["result"] = sender["result"]
+                done.set()
+            elif state == "fail":
+                holder["error"] = sender.get("error") or f"code {sender.get('code')}"
+                done.set()
+
+        self.eventbus.connect(_on_event)
+        try:
+            ack = self.send_message_param_sync({"method": "start_solve"})
+            if isinstance(ack, dict) and ack.get("code") not in (None, 0):
+                raise RuntimeError(f"start_solve rejected by firmware: {ack}")
+            if not done.wait(timeout=float(timeout_s)):
+                raise RuntimeError(
+                    f"plate solve did not complete within {timeout_s:.0f}s"
+                )
+            if "error" in holder:
+                raise RuntimeError(f"plate solve failed: {holder['error']}")
+            return holder["result"]
+        finally:
+            try:
+                self.eventbus.disconnect(_on_event)
+            except Exception:
+                pass
+
     def receive_message_thread_fn(self) -> None:
         msg_remainder = ""
         while self.is_watch_events:

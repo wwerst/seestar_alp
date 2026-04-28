@@ -448,6 +448,20 @@ class SeestarSimulator:
                 "code": 0,
                 "id": cur_cmdid,
             }
+        elif method == "start_solve":
+            # Mirror the firmware: ack immediately, then emit a
+            # ``PlateSolve`` ``complete`` event with a ``result``
+            # payload from a background thread so callers waiting on
+            # the eventbus see a realistic sequence.
+            self._fire_plate_solve_async()
+            return {
+                "jsonrpc": "2.0",
+                "Timestamp": timestamp,
+                "method": "start_solve",
+                "result": 0,
+                "code": 0,
+                "id": cur_cmdid,
+            }
         elif method == "set_user_location":
             loc = data.get("params", {})
             self.state["location_lon_lat"] = [loc.get("lon", 0), loc.get("lat", 0)]
@@ -847,6 +861,75 @@ class SeestarSimulator:
         self.polar_align_response_thread = threading.Thread(target=self._polar_align)
         self.polar_align_response_thread.start()
         return True
+
+    def _fire_plate_solve_async(self) -> None:
+        """Background thread that emits a realistic ``PlateSolve`` event
+        sequence in response to ``start_solve``.
+
+        Mirrors the firmware: a top-level ``working`` event, a
+        page-level ``complete`` event carrying the ``result`` payload,
+        then a trailing top-level ``complete``. The ``result`` values
+        are stable so unit tests can assert on them.
+        """
+
+        def _emit():
+            try:
+                ts = lambda: f"{time.time() - self.start_time:2.9f}"  # noqa: E731
+                self.send_unsolicited_message(
+                    self.socket,
+                    (self.host, self.port),
+                    json.dumps(
+                        {
+                            "Event": "PlateSolve",
+                            "Timestamp": ts(),
+                            "state": "working",
+                            "lapse_ms": 0,
+                            "route": [],
+                        }
+                    )
+                    + "\r\n",
+                )
+                time.sleep(0.1)
+                self.send_unsolicited_message(
+                    self.socket,
+                    (self.host, self.port),
+                    json.dumps(
+                        {
+                            "Event": "PlateSolve",
+                            "Timestamp": ts(),
+                            "page": "preview",
+                            "state": "complete",
+                            "result": {
+                                "ra_dec": [12.0, 30.0],
+                                "fov": [1.27, 0.71],
+                                "focal_len": 250.0,
+                                "angle": 0.0,
+                                "image_id": 1,
+                                "star_number": 800,
+                                "duration_ms": 100,
+                            },
+                        }
+                    )
+                    + "\r\n",
+                )
+                self.send_unsolicited_message(
+                    self.socket,
+                    (self.host, self.port),
+                    json.dumps(
+                        {
+                            "Event": "PlateSolve",
+                            "Timestamp": ts(),
+                            "state": "complete",
+                            "lapse_ms": 100,
+                            "route": [],
+                        }
+                    )
+                    + "\r\n",
+                )
+            except Exception as exc:
+                print(f"_fire_plate_solve_async: {exc}")
+
+        threading.Thread(target=_emit, daemon=True).start()
 
     # 'Event': 'EqModePA', 'Timestamp': '457.182378072', 'state': 'complete', 'lapse_ms': 78917, 'total': 20.020836, 'x': -20.020597, 'y': 0.097836, 'route': []}
     def _polar_align(self):

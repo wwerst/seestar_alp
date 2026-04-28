@@ -1,4 +1,4 @@
-"""Nighttime calibration session — plate-solve a series of sky images
+"""Nighttime calibration session — plate-solve a series of sky frames
 to fit the same 3-DOF mount rotation the daytime FAA-landmark workflow
 fits.
 
@@ -8,8 +8,11 @@ Each sighting cycle:
    pre-set sky position; the operator then nudges via the live-tracker
    continuous-control loop from PR #15 if needed).
 2. Mount settles (motion session reports ``is_settled``).
-3. Caller invokes :meth:`NighttimeCalibrationSession.capture_sighting`
-   with an image path captured from the imager.
+3. Caller invokes :meth:`NighttimeCalibrationSession.capture_sighting`.
+   With the default :class:`SeestarPlateSolver` no image path is
+   needed — the scope's onboard solver inspects whatever it is
+   currently looking at. With the ``solve-field`` fallback the caller
+   passes the captured image path explicitly.
 4. The session runs the plate solver in a background thread, converts
    the solved (RA, Dec) to topocentric (az, el) for the site + capture
    time, and stores the resulting ``(encoder_az_el, true_az_el)`` pair.
@@ -267,16 +270,21 @@ class NighttimeCalibrationSession:
 
     def capture_sighting(
         self,
-        image_path: Path | str,
-        encoder_az_deg: float,
-        encoder_el_deg: float,
+        image_path: Path | str | None = None,
+        encoder_az_deg: float = 0.0,
+        encoder_el_deg: float = 0.0,
     ) -> None:
-        """Queue a plate solve on ``image_path`` for the given encoder
-        position. Background-threaded. Caller polls :meth:`status` for
+        """Queue a plate solve for the given encoder position.
+        Background-threaded; caller polls :meth:`status` for
         completion.
 
+        ``image_path`` is optional: the default
+        :class:`SeestarPlateSolver` ignores it because the firmware
+        plate-solves the live view. Pass a path only when using the
+        ``solve-field`` fallback against a captured FITS image.
+
         Raises if a previous solve is still in flight (single-flight) or
-        if the encoder position is below the altitude floor.
+        if the encoder position is outside the altitude window.
         """
         if encoder_el_deg < MIN_SIGHTING_ALTITUDE_DEG:
             raise ValueError(
@@ -295,7 +303,7 @@ class NighttimeCalibrationSession:
             ):
                 raise RuntimeError("a plate-solve is already in flight; wait")
             self._pending = PendingCapture(
-                image_path=str(image_path),
+                image_path="" if image_path is None else str(image_path),
                 encoder_az_deg=float(encoder_az_deg),
                 encoder_el_deg=float(encoder_el_deg),
                 t_started_unix=time.time(),
@@ -366,9 +374,13 @@ class NighttimeCalibrationSession:
             pending.status = "solving"
 
         # Run the (possibly slow) solver outside the lock so other
-        # methods like status() stay responsive.
+        # methods like status() stay responsive. Pass None when the
+        # session wasn't given a captured image — the Seestar onboard
+        # solver doesn't use it; ``solve-field`` will surface a clear
+        # error in that case.
+        solver_arg = Path(pending.image_path) if pending.image_path else None
         try:
-            solve_result = self.plate_solver.solve(Path(pending.image_path))
+            solve_result = self.plate_solver.solve(solver_arg)
         except PlateSolverNotAvailable as exc:
             self._record_failure(pending, str(exc))
             return
