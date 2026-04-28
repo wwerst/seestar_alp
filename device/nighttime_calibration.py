@@ -271,8 +271,8 @@ class NighttimeCalibrationSession:
     def capture_sighting(
         self,
         image_path: Path | str | None = None,
-        encoder_az_deg: float = 0.0,
-        encoder_el_deg: float = 0.0,
+        encoder_az_deg: float | None = None,
+        encoder_el_deg: float | None = None,
     ) -> None:
         """Queue a plate solve for the given encoder position.
         Background-threaded; caller polls :meth:`status` for
@@ -283,9 +283,18 @@ class NighttimeCalibrationSession:
         plate-solves the live view. Pass a path only when using the
         ``solve-field`` fallback against a captured FITS image.
 
+        ``encoder_az_deg`` and ``encoder_el_deg`` are required — they
+        are sentinel-defaulted to ``None`` only so ``image_path`` can
+        remain optional in keyword calls. Forgetting them raises a
+        clear ``ValueError`` rather than silently treating the encoder
+        as pointing at the horizon (which would fail later with the
+        confusing altitude-floor error).
+
         Raises if a previous solve is still in flight (single-flight) or
         if the encoder position is outside the altitude window.
         """
+        if encoder_az_deg is None or encoder_el_deg is None:
+            raise ValueError("encoder_az_deg and encoder_el_deg are required")
         if encoder_el_deg < MIN_SIGHTING_ALTITUDE_DEG:
             raise ValueError(
                 f"encoder el {encoder_el_deg:.2f}° below "

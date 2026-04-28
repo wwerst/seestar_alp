@@ -264,6 +264,19 @@ def test_session_capture_sighting_works_without_image_path(tmp_path):
         nc.radec_to_topocentric_azel = nc_radec
 
 
+def test_session_capture_requires_encoder_position(tmp_path):
+    """Forgetting to pass ``encoder_az_deg`` / ``encoder_el_deg`` must
+    raise a clear ValueError, not yield a confusing altitude-floor
+    error from a silent ``0.0`` default."""
+    session = _make_session(tmp_path, FakePlateSolver())
+    with pytest.raises(ValueError, match="required"):
+        session.capture_sighting(image_path=tmp_path / "img.jpg")
+    with pytest.raises(ValueError, match="required"):
+        session.capture_sighting(image_path=tmp_path / "img.jpg", encoder_az_deg=180.0)
+    with pytest.raises(ValueError, match="required"):
+        session.capture_sighting(image_path=tmp_path / "img.jpg", encoder_el_deg=40.0)
+
+
 def test_solve_field_solver_requires_image_path():
     """``solve-field`` backend must reject a missing path with a clear
     error rather than running the binary on an empty argument."""
