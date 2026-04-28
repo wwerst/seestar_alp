@@ -1862,3 +1862,91 @@ def test_get_events_focus_empty_queue_and_watch_firmware_init(monkeypatch, seest
     )
     seestar.start_watch_thread()
     assert seestar.firmware_ver_int == 2600
+
+
+def test_request_plate_solve_sync_single_flight_serializes(monkeypatch, seestar):
+    """Two concurrent ``request_plate_solve_sync`` callers must not be
+    able to share a single completion event. The per-device single-flight
+    lock should keep the second caller blocked until the first finishes,
+    so there is exactly one ``start_solve`` and one wait inflight at a
+    time.
+
+    Without the lock, both callers connect their ``_on_event`` handlers
+    before any completion arrives, so a single firmware completion event
+    would unblock both — yielding stale/wrong results for one of them.
+    """
+    import threading
+
+    inflight = {"count": 0, "max": 0, "next_tag": 0}
+    state_lock = threading.Lock()
+    second_started = threading.Event()
+    first_started = threading.Event()
+
+    def fake_send(payload):
+        with state_lock:
+            inflight["count"] += 1
+            if inflight["count"] > inflight["max"]:
+                inflight["max"] = inflight["count"]
+            inflight["next_tag"] += 1
+            tag = inflight["next_tag"]
+
+        # Signal that we've entered start_solve so the second caller can
+        # try to enter request_plate_solve_sync. Without the lock, that
+        # second caller's _on_event handler would attach BEFORE we emit
+        # the completion below, and a single completion event would then
+        # complete both callers' waits with the same payload.
+        if tag == 1:
+            first_started.set()
+            # Give the second thread a beat to attach (or be blocked by
+            # the lock — the whole point of this test).
+            second_started.wait(timeout=2.0)
+
+        def _emit():
+            # Tiny delay so emission happens after we've returned the ack
+            # and the caller is sitting in done.wait().
+            seestar.eventbus.send(
+                {
+                    "Event": "PlateSolve",
+                    "state": "complete",
+                    "result": {"ra_dec": [float(tag), float(tag)], "tag": tag},
+                }
+            )
+
+        threading.Thread(target=_emit, daemon=True).start()
+
+        with state_lock:
+            inflight["count"] -= 1
+        return {"code": 0}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_send)
+
+    results = {}
+    errors = {}
+
+    def call(label):
+        try:
+            results[label] = seestar.request_plate_solve_sync(timeout_s=5.0)
+        except Exception as e:
+            errors[label] = e
+
+    t1 = threading.Thread(target=call, args=("a",))
+    t1.start()
+    # Wait until t1 is committed inside start_solve before launching t2.
+    assert first_started.wait(timeout=5.0)
+    t2 = threading.Thread(target=call, args=("b",))
+    t2.start()
+    # Let t1 know t2 has had its chance to attach (without a lock it
+    # would; with the lock it is blocked at the lock acquire).
+    second_started.set()
+    t1.join(timeout=10.0)
+    t2.join(timeout=10.0)
+
+    assert not errors, f"unexpected errors: {errors}"
+    assert inflight["max"] == 1, (
+        f"expected serialized start_solve, saw concurrency level {inflight['max']}"
+    )
+    tags = sorted(r["tag"] for r in results.values())
+    # Each caller must end up with its own completion payload (tags 1
+    # and 2). Without the lock, t2's handler would catch tag=1 too and
+    # we'd see [1, 1].
+    assert tags == [1, 2], f"expected distinct results per caller, got {results}"
