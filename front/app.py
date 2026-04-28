@@ -5919,13 +5919,29 @@ class CalibrateNighttimeAvailabilityResource:
             get_default_plate_solver,
         )
 
+        tid = int(telescope_id)
         solver = get_default_plate_solver(
-            telescope_id=int(telescope_id),
+            telescope_id=tid,
             action_runner=do_action_device,
         )
-        available = solver.is_available()
-        kind = solver.kind
-        path = getattr(solver, "binary_path", "") if available else ""
+        kind = getattr(solver, "kind", "")
+        is_seestar_backend = (
+            kind == "seestar" or solver.__class__.__name__ == "SeestarPlateSolver"
+        )
+
+        if is_seestar_backend:
+            try:
+                available = bool(check_api_state(tid))
+            except Exception:
+                logger.exception(
+                    "Failed to determine Seestar API state for telescope_id=%s", tid
+                )
+                available = False
+            path = "onboard" if available else ""
+        else:
+            available = solver.is_available()
+            path = getattr(solver, "binary_path", "") if available else ""
+
         resp.status = falcon.HTTP_200
         resp.content_type = "application/json"
         resp.text = json.dumps(

@@ -1753,3 +1753,115 @@ def test_celestial_targets_partial_pointing_400(monkeypatch):
     resp = _Resp()
     front_app.CalibrationCelestialTargetsResource.on_get(req, resp, telescope_id=1)
     assert resp.status == "400 Bad Request"
+
+
+def test_calibrate_nighttime_availability_seestar_online(monkeypatch):
+    """When the Seestar onboard solver is selected and the API is
+    reachable, the resource must report the solver as available with
+    ``solver_path='onboard'`` (so the UI label is meaningful, not the
+    misleading ``(... on PATH)`` text from an empty path)."""
+    import device.plate_solver as ps
+
+    class _FakeSeestarSolver:
+        kind = "seestar"
+
+        def is_available(self):
+            return True
+
+    monkeypatch.setattr(
+        ps,
+        "get_default_plate_solver",
+        lambda telescope_id, action_runner: _FakeSeestarSolver(),
+    )
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+
+    class _Req:
+        pass
+
+    class _Resp:
+        status = None
+        content_type = None
+        text = None
+
+    resp = _Resp()
+    front_app.CalibrateNighttimeAvailabilityResource.on_get(
+        _Req(), resp, telescope_id=1
+    )
+    payload = json.loads(resp.text)
+    assert payload["solver_available"] is True
+    assert payload["solver_kind"] == "seestar"
+    assert payload["solver_path"] == "onboard"
+
+
+def test_calibrate_nighttime_availability_seestar_offline(monkeypatch):
+    """When the scope is offline, ``check_api_state`` returns False and
+    the resource must report unavailable with no solver_path so the UI
+    doesn't show a green / "on PATH" indicator."""
+    import device.plate_solver as ps
+
+    class _FakeSeestarSolver:
+        kind = "seestar"
+
+        def is_available(self):
+            return True
+
+    monkeypatch.setattr(
+        ps,
+        "get_default_plate_solver",
+        lambda telescope_id, action_runner: _FakeSeestarSolver(),
+    )
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: False)
+
+    class _Req:
+        pass
+
+    class _Resp:
+        status = None
+        content_type = None
+        text = None
+
+    resp = _Resp()
+    front_app.CalibrateNighttimeAvailabilityResource.on_get(
+        _Req(), resp, telescope_id=1
+    )
+    payload = json.loads(resp.text)
+    assert payload["solver_available"] is False
+    assert payload["solver_kind"] == "unavailable"
+    assert payload["solver_path"] == ""
+
+
+def test_calibrate_nighttime_availability_solve_field_branch(monkeypatch):
+    """The non-Seestar (workstation) path keeps using
+    ``is_available()`` + ``binary_path`` — verify it isn't broken by the
+    new Seestar branch."""
+    import device.plate_solver as ps
+
+    class _FakeSolveField:
+        kind = "solve-field"
+        binary_path = "/usr/local/bin/solve-field"
+
+        def is_available(self):
+            return True
+
+    monkeypatch.setattr(
+        ps,
+        "get_default_plate_solver",
+        lambda telescope_id, action_runner: _FakeSolveField(),
+    )
+
+    class _Req:
+        pass
+
+    class _Resp:
+        status = None
+        content_type = None
+        text = None
+
+    resp = _Resp()
+    front_app.CalibrateNighttimeAvailabilityResource.on_get(
+        _Req(), resp, telescope_id=1
+    )
+    payload = json.loads(resp.text)
+    assert payload["solver_available"] is True
+    assert payload["solver_kind"] == "solve-field"
+    assert payload["solver_path"] == "/usr/local/bin/solve-field"
