@@ -6,8 +6,7 @@ each cell's center. It runs in a daemon thread and emits live updates
 via a small in-process pub/sub so the UI can render the map as it
 fills in.
 
-Algorithm summary (full design in
-``~/.openclaw/workspace/visibility-map-design-notes.md``):
+Algorithm summary:
 
 1. **Grid**: alt/az band tiling with ~950 cells (or HEALPix if
    available). Each cell has a Beta posterior, a per-altitude prior, a
@@ -86,6 +85,12 @@ MRF_BLEND_W = 0.3
 CANDIDATE_TOP_K = 100
 CANDIDATE_CAP = 200
 
+# Persist throttle: rewriting ~1 KB×n_cells of JSON every observation
+# adds tens of ms per loop on slow disks and dominates the loop time on
+# CI runners. Save at most this often during a run; we always save once
+# at start (so the file exists for the UI) and once at stop.
+PERSIST_INTERVAL_S = 5.0
+
 MIN_RUN_BEFORE_USER_STOP_S = 5 * 60.0
 CONVERGENCE_ELAPSED_S = 30 * 60.0
 CONVERGENCE_MEDIAN_ENTROPY_NATS = 0.08
@@ -113,7 +118,9 @@ class SolveOutcome(str, Enum):
 @dataclass
 class StopReason:
     reason: str  # human-friendly
-    code: str  # one of "user", "force", "convergence", "max_runtime", "system_errors", "sun_refusals"
+    # One of: "user", "force", "convergence", "max_runtime",
+    # "system_errors", "sun_refusals", "internal_error".
+    code: str
 
 
 # ---------- math utilities ------------------------------------------
@@ -150,10 +157,12 @@ def prior_for_alt(alt_deg: float) -> tuple[float, float]:
 # ---------- callback types ------------------------------------------
 
 
-# slew_func(az_deg, alt_deg) → True if slew completed (or commanded
-# successfully). False signals refusal. The mapper interprets a
-# returned False as "sun-safety refusal" by default; supply the
-# optional ``slew_kind`` second-tuple element to distinguish.
+# slew_func(az_deg, alt_deg) → bool. ``True`` if the slew completed
+# (or was commanded successfully); ``False`` signals a sun-safety
+# refusal that the mapper counts toward its sun-refusal abort
+# threshold. To signal a transient/system failure (network, RPC,
+# astropy), raise an exception instead — the mapper increments its
+# consecutive-system-errors counter on raise.
 SlewFunc = Callable[[float, float], bool]
 PlateSolveFunc = Callable[[float], SolveOutcome]
 EmitFunc = Callable[[dict], None]
@@ -176,6 +185,7 @@ class VisibilityMapperOptions:
     min_run_before_user_stop_s: float = MIN_RUN_BEFORE_USER_STOP_S
     frontier_decay_window_s: float = FRONTIER_DECAY_WINDOW_S
     failure_recent_window_s: float = FAILURE_RECENT_WINDOW_S
+    persist_interval_s: float = PERSIST_INTERVAL_S
 
 
 # ---------- mapper --------------------------------------------------
@@ -251,6 +261,7 @@ class VisibilityMapper:
         self._stopped_at: Optional[float] = None
         self._stop_reason: Optional[StopReason] = None
         self._last_decay_at: Optional[float] = None
+        self._last_persist_at: Optional[float] = None
         self._cur_target_idx: Optional[int] = None
         self._last_pointing: tuple[float, float] = (0.0, 90.0)  # zenith default
         self._sun_refusals: deque[float] = deque(maxlen=SUN_REFUSAL_LIMIT * 2)
@@ -295,37 +306,58 @@ class VisibilityMapper:
                 continue
 
     def _persist(self) -> None:
+        """Force a snapshot write. Use ``_maybe_persist`` from the loop."""
         try:
             path = visibility_map_path(self.state_dir, self.telescope_id)
         except OSError as exc:
             logger.warning("cannot create state dir for visibility map: %s", exc)
             return
-        elapsed = self._elapsed_s_locked()
-        cells = [
-            {
-                "idx": int(i),
-                "az_deg": float(self._az[i]),
-                "alt_deg": float(self._alt[i]),
-                "alpha": float(self._alpha[i]),
-                "beta": float(self._beta[i]),
-                "failure_count": int(self._failure_count[i]),
-                "n_obs": int(self._n_observations_at[i]),
-            }
-            for i in range(self._n)
-        ]
+        with self._lock:
+            elapsed = self._elapsed_s_locked()
+            cells = [
+                {
+                    "idx": int(i),
+                    "az_deg": float(self._az[i]),
+                    "alt_deg": float(self._alt[i]),
+                    "alpha": float(self._alpha[i]),
+                    "beta": float(self._beta[i]),
+                    "failure_count": int(self._failure_count[i]),
+                    "n_obs": int(self._n_observations_at[i]),
+                }
+                for i in range(self._n)
+            ]
+            grid_kind = self.grid.kind
+            min_alt = self.options.min_alt_deg
+            started = self._started_at or 0.0
+            n_obs = self._n_observations
         try:
             save_snapshot(
                 path,
                 telescope_id=self.telescope_id,
-                grid_kind=self.grid.kind,
-                min_alt_deg=self.options.min_alt_deg,
+                grid_kind=grid_kind,
+                min_alt_deg=min_alt,
                 cells=cells,
-                started_at=self._started_at or 0.0,
+                started_at=started,
                 elapsed_s=elapsed,
-                n_observations=self._n_observations,
+                n_observations=n_obs,
             )
         except OSError as exc:
             logger.warning("visibility map snapshot failed: %s", exc)
+        with self._lock:
+            self._last_persist_at = self._time()
+
+    def _maybe_persist(self, now: float) -> None:
+        """Persist only if it has been long enough since the last save.
+
+        Always writes the first time so the snapshot file exists for the
+        UI within the first observation window.
+        """
+        with self._lock:
+            last = self._last_persist_at
+            interval = self.options.persist_interval_s
+        if last is not None and (now - last) < interval:
+            return
+        self._persist()
 
     # ---------- public API ------------------------------------------
 
@@ -743,6 +775,10 @@ class VisibilityMapper:
 
     def _run_loop(self) -> None:
         try:
+            # Write an initial snapshot so the file exists for the UI
+            # before the first observation completes (and so short
+            # tests still see a saved snapshot).
+            self._persist()
             self._loop_body()
         except Exception:  # noqa: BLE001
             logger.exception("visibility mapper crashed")
@@ -755,6 +791,9 @@ class VisibilityMapper:
             with self._lock:
                 self._stopped_at = self._time()
                 self._seq += 1
+            # Always save the final state on stop, regardless of when
+            # the throttled in-loop save last ran.
+            self._persist()
             self._emit({"type": "complete", "status": self.status()})
 
     def _loop_body(self) -> None:
@@ -855,7 +894,7 @@ class VisibilityMapper:
                 self._consecutive_system_errors = 0
             self._apply_observation(target, outcome, now)
             self._mrf_smooth_pass()
-            self._persist()
+            self._maybe_persist(now)
             self._emit(
                 {
                     "type": "observation",

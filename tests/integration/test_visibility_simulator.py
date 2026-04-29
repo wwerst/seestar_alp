@@ -58,9 +58,11 @@ def _build_visibility_test_app():
 def visibility_app(monkeypatch, tmp_path):
     """Build the test app with the device layer mocked.
 
-    `do_action_device` returns canned plate-solve results so the mapper
-    sees SOLVED on every observation.  GPS returns a stable lat/lon so
-    the alt/az ↔ RA/Dec conversion in the slew callback can run.
+    The slew callback now goes through ``device.telescope.
+    get_seestar_device(tid)._slew_to_ra_dec``; the plate-solve
+    callback still uses ``do_action_device("start_solve_sync", ...)``.
+    Mock all three plus GPS/AlpacaClient so the alt/az ↔ RA/Dec
+    conversion in the slew callback can run.
     """
     monkeypatch.setattr(front_app, "_VISIBILITY_STATE_DIR", tmp_path)
 
@@ -74,17 +76,20 @@ def visibility_app(monkeypatch, tmp_path):
         lambda _cli: (34.0, -118.0),
     )
 
+    class _FakeDevice:
+        def _slew_to_ra_dec(self, params):  # noqa: D401
+            return True
+
+    monkeypatch.setattr(
+        "device.telescope.get_seestar_device", lambda _tid: _FakeDevice()
+    )
+    # The visibility slew callback also pre-checks ``is_sun_safe``
+    # before dispatching to ``_slew_to_ra_dec``. Pin it to "safe" so
+    # the test isn't sensitive to the sun's actual position at run
+    # time.
+    monkeypatch.setattr("device.sun_safety.is_sun_safe", lambda az, alt: (True, ""))
+
     def _do_action_device(action, dev_num, parameters, is_schedule=False):
-        # Slew: return a benign success.
-        if action == "method_sync" and isinstance(parameters, dict):
-            method = parameters.get("method")
-            if method == "scope_goto":
-                return {
-                    "ErrorNumber": 0,
-                    "ErrorMessage": "",
-                    "Value": {"result": 0},
-                }
-            return {"ErrorNumber": 0, "ErrorMessage": "", "Value": {}}
         # Plate solve: simulate a solved result.
         if action == "start_solve_sync":
             return {

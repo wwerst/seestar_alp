@@ -6224,47 +6224,59 @@ def _azel_to_radec_for_telescope(
 def _make_visibility_slew_func(telescope_id: int):
     """Build the ``slew_func`` callback for a telescope.
 
-    Converts (az, alt) → (RA, Dec) for the current time and posts a
-    ``scope_goto`` via the action API. Returns ``True`` on success,
-    ``False`` if the slew was refused (so the mapper counts it toward
-    sun-safety abort) or another error occurred.
+    Converts (az, alt) → (RA, Dec) for the current time, runs the
+    same sun-safety pre-flight that ``Seestar._slew_to_ra_dec`` uses,
+    and dispatches the slew through the device's
+    ``_slew_to_ra_dec`` (which runs sun-safety again as
+    defense-in-depth and waits for the goto to complete).
 
-    The conversion + action call inherits the existing sun-safety
-    pre-flight in ``_slew_to_ra_dec`` — we don't bypass it.
+    Mapper contract:
+      * returns ``True``  → slew completed; mapper proceeds to plate solve.
+      * returns ``False`` → sun-safety refusal; mapper counts toward
+        sun-refusal abort threshold.
+      * raises Exception  → transient/system failure; mapper counts
+        toward consecutive-system-errors abort threshold.
+
+    A ``method_sync(scope_goto, ...)`` call would *not* invoke
+    ``_slew_to_ra_dec`` (the action handler forwards directly to
+    ``send_message_param_sync``), which is why we go via the device
+    object instead of the HTTP action.
     """
+    from device import telescope as _telescope_module
+    from device.sun_safety import is_sun_safe
 
     def slew(az_deg: float, alt_deg: float) -> bool:
-        try:
-            ra_hours, dec_deg = _azel_to_radec_for_telescope(
-                az_deg, alt_deg, telescope_id
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "visibility map: az/el→RA/Dec failed (az=%.2f alt=%.2f): %s",
+        ra_hours, dec_deg = _azel_to_radec_for_telescope(az_deg, alt_deg, telescope_id)
+        # Sun-safety pre-check at the (az, alt) we were asked to slew
+        # to. ``_slew_to_ra_dec`` checks again from the resolved
+        # ra/dec → altaz path; the explicit check here lets us
+        # distinguish a sun-safety refusal (return False) from a
+        # mount/RPC error (raise) for the mapper.
+        sun_safe, reason = is_sun_safe(az_deg % 360.0, alt_deg)
+        if not sun_safe:
+            logger.info(
+                "visibility map: refusing slew (az=%.1f° alt=%.1f°): %s",
                 az_deg,
                 alt_deg,
-                exc,
+                reason,
             )
             return False
-        try:
-            result = do_action_device(
-                "method_sync",
-                telescope_id,
-                {"method": "scope_goto", "params": [ra_hours, dec_deg]},
+        dev = _telescope_module.get_seestar_device(int(telescope_id))
+        if dev is None:
+            raise RuntimeError(
+                f"visibility map: telescope {telescope_id} not available"
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("visibility map: scope_goto raised: %s", exc)
-            return False
-        if not isinstance(result, dict):
-            return False
-        # The wrapper returns either {Value: ...} or the raw result. We
-        # treat anything that wasn't an explicit error as success, and
-        # rely on the device-side sun-safety guard to refuse internally.
-        if "error" in result:
-            return False
-        value = result.get("Value", result)
-        if isinstance(value, dict) and value.get("error"):
-            return False
+        ok = dev._slew_to_ra_dec([ra_hours, dec_deg])
+        if not ok:
+            # We pre-checked sun safety, so a False here is most likely
+            # a mount/RPC error or a race where conditions changed
+            # between our check and the device's check. Treat as a
+            # transient system error so the mapper backs off rather
+            # than poisoning the posterior with a false sun refusal.
+            raise RuntimeError(
+                f"_slew_to_ra_dec returned False (ra_hours={ra_hours:.4f} "
+                f"dec_deg={dec_deg:.4f})"
+            )
         return True
 
     return slew
