@@ -212,6 +212,12 @@ class action:
             elif action_name == "method_async":
                 result = cur_dev.send_message_param(params)
                 resp.text = MethodResponse(req, value="async request sent.").json
+            elif action_name == "start_solve_sync":
+                # Fire the firmware's onboard plate solver and block
+                # until the PlateSolve completion event lands.
+                timeout_s = float(params.get("timeout_s", 60.0))
+                result = cur_dev.request_plate_solve_sync(timeout_s=timeout_s)
+                resp.text = MethodResponse(req, value=result).json
             elif action_name == "start_stack":
                 result = cur_dev.start_stack(params)
                 resp.text = MethodResponse(req, value=result).json

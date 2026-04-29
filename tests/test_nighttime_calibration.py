@@ -25,9 +25,11 @@ from device.plate_solver import (
     FakePlateSolver,
     PlateSolverFailed,
     PlateSolverNotAvailable,
+    SeestarPlateSolver,
     SolveResult,
     UnavailablePlateSolver,
     _parse_solve_field_stdout,
+    get_default_plate_solver,
 )
 from device.rotation_calibration import solve_rotation_from_pairs
 from scripts.trajectory.observer import build_site
@@ -121,6 +123,179 @@ def test_get_default_plate_solver_returns_unavailable_without_solve_field(monkey
     monkeypatch.setattr(ps.shutil, "which", lambda *a, **kw: None)
     s = ps.get_default_plate_solver()
     assert isinstance(s, UnavailablePlateSolver)
+
+
+def test_get_default_plate_solver_prefers_seestar_when_runner_provided(monkeypatch):
+    """Even when ``solve-field`` is on PATH, if the caller passes a
+    telescope id and an action runner the factory returns the
+    firmware-onboard backend so calibration sessions don't need
+    astrometry.net installed."""
+    import device.plate_solver as ps
+
+    monkeypatch.setattr(ps.shutil, "which", lambda *a, **kw: "/fake/solve-field")
+    s = ps.get_default_plate_solver(telescope_id=1, action_runner=lambda *a, **kw: None)
+    assert isinstance(s, SeestarPlateSolver)
+    assert s.kind == "seestar"
+
+
+# ---------- SeestarPlateSolver ----------------------------------------
+
+
+def test_seestar_plate_solver_parses_firmware_response():
+    """Firmware reports RA in **hours** and Dec in **degrees**; the
+    solver wraps everything in an Alpaca ``Value`` envelope. We must
+    convert RA to degrees so the rotation solver downstream gets
+    consistent units with the ``solve-field`` backend."""
+    captured = {}
+
+    def fake_runner(action, dev_num, params):
+        captured["action"] = action
+        captured["dev_num"] = dev_num
+        captured["params"] = params
+        return {
+            "Value": {
+                "ra_dec": [12.0, 30.0],  # 12h = 180°, 30°
+                "fov": [1.27, 0.71],
+                "angle": -177.79,
+                "star_number": 1267,
+                "duration_ms": 13223,
+            },
+            "ErrorNumber": 0,
+            "ErrorMessage": "",
+        }
+
+    solver = SeestarPlateSolver(fake_runner, telescope_id=7, timeout_s=10.0)
+    assert solver.is_available()
+    result = solver.solve()  # no image_path
+    assert captured == {
+        "action": "start_solve_sync",
+        "dev_num": 7,
+        "params": {"timeout_s": 10.0},
+    }
+    assert result.ra_deg == pytest.approx(180.0)  # 12h × 15
+    assert result.dec_deg == pytest.approx(30.0)
+    assert result.fov_x_deg == pytest.approx(1.27)
+    assert result.fov_y_deg == pytest.approx(0.71)
+    assert result.position_angle_deg == pytest.approx(-177.79)
+    assert result.stars_used == 1267
+
+
+def test_seestar_plate_solver_handles_alpaca_error_envelope():
+    """Non-zero ``ErrorNumber`` (e.g. firmware ``fail`` event or
+    ``request_plate_solve_sync`` timeout surfaced via
+    DevDriverException) should raise ``PlateSolverFailed`` with the
+    error text propagated."""
+
+    def fake_runner(action, dev_num, params):
+        return {
+            "ErrorNumber": 0x500,
+            "ErrorMessage": "plate solve failed: code 251",
+        }
+
+    solver = SeestarPlateSolver(fake_runner, telescope_id=1)
+    with pytest.raises(PlateSolverFailed, match="device error"):
+        solver.solve()
+
+
+def test_seestar_plate_solver_handles_unreachable_device():
+    """``do_action_device`` returns ``None`` when the Alpaca driver
+    refuses the request (e.g. scope offline). The solver must surface
+    that as a clear failure rather than crashing on attribute access."""
+
+    def fake_runner(action, dev_num, params):
+        return None
+
+    solver = SeestarPlateSolver(fake_runner, telescope_id=1)
+    with pytest.raises(PlateSolverFailed, match="no response"):
+        solver.solve()
+
+
+def test_seestar_plate_solver_rejects_malformed_payload():
+    def fake_runner(action, dev_num, params):
+        return {"Value": {"unrelated": True}}
+
+    solver = SeestarPlateSolver(fake_runner, telescope_id=1)
+    with pytest.raises(PlateSolverFailed, match="missing ra_dec"):
+        solver.solve()
+
+
+def test_seestar_plate_solver_propagates_runner_exception():
+    """If the action runner itself raises (network blip, JSON parse
+    error), the solver should wrap it as ``PlateSolverFailed`` so the
+    nighttime session records a failure for that sighting rather than
+    aborting the whole run."""
+
+    def fake_runner(action, dev_num, params):
+        raise ConnectionError("boom")
+
+    solver = SeestarPlateSolver(fake_runner, telescope_id=1)
+    with pytest.raises(PlateSolverFailed, match="boom"):
+        solver.solve()
+
+
+def test_session_capture_sighting_works_without_image_path(tmp_path):
+    """The Seestar onboard solver doesn't take an image path. The
+    session must accept an omitted ``image_path`` and still record
+    the sighting using whatever the solver returns."""
+    import device.nighttime_calibration as nc
+
+    # Skip astropy by short-circuiting the topocentric conversion.
+    nc_radec = nc.radec_to_topocentric_azel
+    try:
+        nc.radec_to_topocentric_azel = lambda ra, dec, t, site: (ra, dec)
+        canned = SolveResult(
+            ra_deg=180.0,
+            dec_deg=30.0,
+            fov_x_deg=1.27,
+            fov_y_deg=0.71,
+            position_angle_deg=0.0,
+        )
+        # ``""`` is the FakePlateSolver sentinel for no image path.
+        fake = FakePlateSolver({"": canned})
+        session = _make_session(tmp_path, fake)
+        session.capture_sighting(
+            encoder_az_deg=180.0, encoder_el_deg=40.0
+        )  # no image_path
+        assert _wait_for(lambda: session.status().pending is None, timeout_s=5.0)
+        st = session.status()
+        assert st.n_accepted == 1
+        assert st.sightings[0]["image_path"] == ""
+    finally:
+        nc.radec_to_topocentric_azel = nc_radec
+
+
+def test_session_capture_requires_encoder_position(tmp_path):
+    """Forgetting to pass ``encoder_az_deg`` / ``encoder_el_deg`` must
+    raise a clear ValueError, not yield a confusing altitude-floor
+    error from a silent ``0.0`` default."""
+    session = _make_session(tmp_path, FakePlateSolver())
+    with pytest.raises(ValueError, match="required"):
+        session.capture_sighting(image_path=tmp_path / "img.jpg")
+    with pytest.raises(ValueError, match="required"):
+        session.capture_sighting(image_path=tmp_path / "img.jpg", encoder_az_deg=180.0)
+    with pytest.raises(ValueError, match="required"):
+        session.capture_sighting(image_path=tmp_path / "img.jpg", encoder_el_deg=40.0)
+
+
+def test_solve_field_solver_requires_image_path():
+    """``solve-field`` backend must reject a missing path with a clear
+    error rather than running the binary on an empty argument."""
+    from device.plate_solver import SolveFieldPlateSolver
+
+    sf = SolveFieldPlateSolver(binary_path="/usr/bin/solve-field")
+    with pytest.raises(PlateSolverFailed, match="requires an on-disk image"):
+        sf.solve(None)
+
+
+def test_get_default_plate_solver_no_args_keeps_legacy_behaviour(monkeypatch):
+    """Calling ``get_default_plate_solver()`` with no args (the
+    legacy unified-calibration call site) should still fall back to
+    ``solve-field`` when present, preserving compatibility."""
+    import device.plate_solver as ps
+
+    monkeypatch.setattr(ps.shutil, "which", lambda *a, **kw: "/fake/solve-field")
+    s = get_default_plate_solver()
+    assert s.kind == "solve-field"
 
 
 # ---------- solve_rotation_from_pairs ---------------------------------

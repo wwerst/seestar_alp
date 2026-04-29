@@ -5905,10 +5905,12 @@ def _nighttime_session_or_404(req, resp, telescope_id):
 
 
 class CalibrateNighttimeAvailabilityResource:
-    """GET: report whether a plate solver is configured.
+    """GET: report which plate solver is configured.
 
-    Drives the UI mode-toggle: the nighttime tab is disabled if no
-    solver is on PATH and no API key is set.
+    Drives the UI mode-toggle. With the firmware-onboard
+    :class:`SeestarPlateSolver` the nighttime tab is always available
+    when a scope is reachable; ``solve-field`` is only consulted as a
+    workstation fallback.
     """
 
     @staticmethod
@@ -5917,10 +5919,29 @@ class CalibrateNighttimeAvailabilityResource:
             get_default_plate_solver,
         )
 
-        solver = get_default_plate_solver()
-        available = solver.is_available()
-        kind = solver.kind
-        path = getattr(solver, "binary_path", "") if available else ""
+        tid = int(telescope_id)
+        solver = get_default_plate_solver(
+            telescope_id=tid,
+            action_runner=do_action_device,
+        )
+        kind = getattr(solver, "kind", "")
+        is_seestar_backend = (
+            kind == "seestar" or solver.__class__.__name__ == "SeestarPlateSolver"
+        )
+
+        if is_seestar_backend:
+            try:
+                available = bool(check_api_state(tid))
+            except Exception:
+                logger.exception(
+                    "Failed to determine Seestar API state for telescope_id=%s", tid
+                )
+                available = False
+            path = "onboard" if available else ""
+        else:
+            available = solver.is_available()
+            path = getattr(solver, "binary_path", "") if available else ""
+
         resp.status = falcon.HTTP_200
         resp.content_type = "application/json"
         resp.text = json.dumps(
@@ -5977,10 +5998,17 @@ class CalibrateNighttimeStartResource:
             resp.content_type = "application/json"
             resp.text = json.dumps(_nighttime_status_dict(existing.status()))
             return
+        from device.plate_solver import get_default_plate_solver
+
+        plate_solver = get_default_plate_solver(
+            telescope_id=int(telescope_id),
+            action_runner=do_action_device,
+        )
         session = NighttimeCalibrationSession(
             telescope_id=int(telescope_id),
             site=site,
             out_path=_CALIBRATION_JSON_PATH,
+            plate_solver=plate_solver,
         )
         try:
             get_nighttime_manager().start(session)
@@ -6019,11 +6047,16 @@ class CalibrateNighttimeStopResource:
 
 
 class CalibrateNighttimeCaptureResource:
-    """POST: queue a plate-solve on a captured image. Body must include
-    ``image_path``. The handler reads the current encoder via the
-    calibrate-motion session if one is alive (so the encoder snapshot is
-    consistent with the captured frame); otherwise body must include
-    ``encoder_az_deg`` / ``encoder_el_deg``.
+    """POST: queue a plate-solve at the current encoder position.
+
+    With the default :class:`SeestarPlateSolver` the firmware solves
+    its live view, so the body needs no ``image_path``. The field is
+    still accepted (and forwarded) so the ``solve-field`` workstation
+    fallback can be exercised end-to-end. The handler reads the
+    current encoder via the calibrate-motion session if one is alive
+    (so the encoder snapshot is consistent with the capture moment);
+    otherwise the body must include ``encoder_az_deg`` /
+    ``encoder_el_deg``.
     """
 
     @staticmethod
@@ -6032,12 +6065,13 @@ class CalibrateNighttimeCaptureResource:
             body = req.media or {}
         except Exception:
             body = {}
-        if not isinstance(body, dict) or "image_path" not in body:
+        if not isinstance(body, dict):
             resp.status = falcon.HTTP_400
             resp.content_type = "application/json"
-            resp.text = json.dumps({"error": "body must include image_path"})
+            resp.text = json.dumps({"error": "request body must be a JSON object"})
             return
-        image_path = str(body["image_path"])
+        image_path = body.get("image_path")
+        image_path = str(image_path) if image_path else None
         # Encoder snapshot: prefer body fields; fall back to motion session.
         enc_az = body.get("encoder_az_deg")
         enc_el = body.get("encoder_el_deg")
