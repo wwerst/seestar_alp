@@ -1,0 +1,634 @@
+{% extends "base.html" %}
+
+{% block title %}Sky Visibility Map - SSC{% endblock %}
+
+{% block content %}
+<style>
+.svm-wrap { padding: 16px; max-width: 1280px; margin: 0 auto; }
+.svm-grid {
+  display: grid;
+  grid-template-columns: minmax(640px, 1fr) 380px;
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  .svm-grid { grid-template-columns: 1fr; }
+}
+.svm-card {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.svm-card h3 { margin: 0 0 12px 0; font-size: 1rem; }
+.svm-canvas-wrap {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  max-width: 720px;
+  margin: 0 auto;
+}
+.svm-canvas {
+  width: 100%;
+  height: 100%;
+  background: #0a0e1a;
+  border-radius: 50%;
+  display: block;
+  box-shadow: 0 0 40px rgba(0,0,0,0.5) inset;
+}
+.svm-status-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 0;
+  font-size: 0.92rem;
+}
+.svm-status-row .label { opacity: 0.7; }
+.svm-status-row .value { font-family: monospace; }
+.svm-bar {
+  height: 8px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.svm-bar > .fill {
+  height: 100%;
+  background: linear-gradient(90deg, #1e6fff 0%, #2ed573 100%);
+  transition: width 0.3s ease;
+}
+.svm-form-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.svm-form-row label { flex: 0 0 140px; opacity: 0.85; font-size: 0.92rem; }
+.svm-form-row input {
+  flex: 1;
+  padding: 4px 8px;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 4px;
+  color: inherit;
+}
+.svm-buttons { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.svm-buttons button {
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.2);
+  background: rgba(255,255,255,0.05);
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.svm-buttons button:hover:not(:disabled) { background: rgba(255,255,255,0.1); }
+.svm-buttons button.primary { background: #1e6fff; border-color: #1e6fff; color: #fff; }
+.svm-buttons button.danger { background: #c0392b; border-color: #c0392b; color: #fff; }
+.svm-buttons button.warn { background: #d35400; border-color: #d35400; color: #fff; }
+.svm-buttons button:disabled { opacity: 0.4; cursor: not-allowed; }
+.svm-legend {
+  display: flex;
+  justify-content: space-around;
+  padding: 8px 0;
+  font-size: 0.78rem;
+}
+.svm-legend .swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.svm-errors {
+  font-family: monospace;
+  font-size: 0.8rem;
+  background: rgba(192,57,43,0.15);
+  border: 1px solid rgba(192,57,43,0.4);
+  border-radius: 4px;
+  padding: 8px;
+  margin-top: 8px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.svm-stop-reason {
+  font-family: monospace;
+  font-size: 0.85rem;
+  background: rgba(46,213,115,0.15);
+  border: 1px solid rgba(46,213,115,0.4);
+  border-radius: 4px;
+  padding: 8px;
+  margin-top: 8px;
+}
+</style>
+
+<div class="svm-wrap">
+  <h2>Sky Visibility Map</h2>
+  <p style="opacity: 0.75; margin-bottom: 16px;">
+    Builds a live, progressively-refined map of which alt/az cells the
+    telescope can plate-solve. Use this on a site with limited sky
+    access (apartment courtyard, partial tree cover) to learn the
+    visible polygon. Run for 5 min minimum; more time = sharper
+    boundary. Mapping resumes from the on-disk snapshot if available.
+    <a href="{{ root }}/{{ telescope_id }}/calibrate_rotation">← Back to mount calibration</a>.
+  </p>
+
+  <div class="svm-grid">
+    <div>
+      <div class="svm-card">
+        <h3>Sky map (zenith at center, horizon at outer edge)</h3>
+        <div class="svm-canvas-wrap">
+          <canvas id="svm-canvas" class="svm-canvas" width="720" height="720"></canvas>
+        </div>
+        <div class="svm-legend">
+          <span><span class="swatch" style="background:#222;"></span> Unknown</span>
+          <span><span class="swatch" style="background:#345;"></span> Uncertain</span>
+          <span><span class="swatch" style="background:#1e6fff;"></span> Probably visible</span>
+          <span><span class="swatch" style="background:#2ed573;"></span> Confirmed visible</span>
+          <span><span class="swatch" style="background:#c0392b;"></span> Confirmed obstructed</span>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="svm-card">
+        <h3>Run controls</h3>
+        <div id="svm-form-area">
+          <div class="svm-form-row">
+            <label for="svm-min-alt">Min altitude (°)</label>
+            <input type="number" id="svm-min-alt" value="10" min="0" max="80" step="1">
+          </div>
+          <div class="svm-form-row">
+            <label for="svm-max-runtime">Max runtime (min)</label>
+            <input type="number" id="svm-max-runtime" value="480" min="1" max="1440" step="10">
+          </div>
+        </div>
+        <div class="svm-buttons">
+          <button id="svm-start" class="primary">Start</button>
+          <button id="svm-stop" disabled>Stop (≥5 min)</button>
+          <button id="svm-force-stop" class="warn" disabled>Force stop</button>
+        </div>
+        <div id="svm-stop-reason" class="svm-stop-reason" style="display: none;"></div>
+        <div id="svm-errors" class="svm-errors" style="display: none;"></div>
+      </div>
+
+      <div class="svm-card">
+        <h3>Status</h3>
+        <div class="svm-status-row"><span class="label">State</span><span class="value" id="svm-state">idle</span></div>
+        <div class="svm-status-row"><span class="label">Elapsed</span><span class="value" id="svm-elapsed">—</span></div>
+        <div class="svm-status-row"><span class="label">Cells observed / total</span><span class="value" id="svm-counts">—</span></div>
+        <div class="svm-status-row"><span class="label">Visible cells (E[p]&gt;0.7)</span><span class="value" id="svm-visible">—</span></div>
+        <div class="svm-status-row"><span class="label">Median entropy (nats)</span><span class="value" id="svm-entropy">—</span></div>
+        <div class="svm-status-row"><span class="label">Map quality</span><span class="value" id="svm-quality">—</span></div>
+        <div class="svm-bar"><div class="fill" id="svm-quality-bar" style="width: 0%;"></div></div>
+        <div class="svm-status-row"><span class="label">Auto-stop ETA</span><span class="value" id="svm-eta">—</span></div>
+        <div class="svm-status-row"><span class="label">Observations total</span><span class="value" id="svm-obs">0</span></div>
+        <div class="svm-status-row"><span class="label">Grid kind</span><span class="value" id="svm-grid-kind">—</span></div>
+      </div>
+
+      <div class="svm-card">
+        <h3>Hover info</h3>
+        <div class="svm-status-row"><span class="label">Az / Alt</span><span class="value" id="svm-hover-azel">— / —</span></div>
+        <div class="svm-status-row"><span class="label">α / β</span><span class="value" id="svm-hover-ab">— / —</span></div>
+        <div class="svm-status-row"><span class="label">E[p]</span><span class="value" id="svm-hover-ep">—</span></div>
+        <div class="svm-status-row"><span class="label">Observations</span><span class="value" id="svm-hover-obs">—</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const tid = {{ telescope_id }};
+  const apiRoot = `/api/${tid}/calibrate_visibility`;
+  const canvas = document.getElementById('svm-canvas');
+  const ctx = canvas.getContext('2d');
+  const startBtn = document.getElementById('svm-start');
+  const stopBtn = document.getElementById('svm-stop');
+  const forceStopBtn = document.getElementById('svm-force-stop');
+
+  let cells = [];
+  let cellsByIdx = new Map();
+  let status = { active: false };
+  let cellPolling = null;
+  let statusPolling = null;
+  let sse = null;
+  let overlays = new Map(); // name → {points, options}
+
+  function fmtElapsed(s) {
+    if (s == null) return '—';
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}m ${sec}s`;
+  }
+
+  function colorForCell(c) {
+    if (c.below_floor) return '#1a1a1a';
+    const tot = c.alpha + c.beta;
+    const ep = c.ep;
+    if (tot < 1.5) return '#262626'; // uninformative
+    if (c.fail >= 3) return '#c0392b'; // confirmed obstructed
+    if (ep < 0.3) {
+      // dark gray → red
+      const t = ep / 0.3;
+      const r = Math.round(40 + (192 - 40) * (1 - t));
+      const g = Math.round(40 + (57 - 40) * (1 - t));
+      const b = 40;
+      return `rgb(${r},${g},${b})`;
+    }
+    if (ep < 0.7) {
+      // gray → blue
+      const t = (ep - 0.3) / 0.4;
+      const r = Math.round(60 + (30 - 60) * t);
+      const g = Math.round(60 + (111 - 60) * t);
+      const b = Math.round(60 + (255 - 60) * t);
+      return `rgb(${r},${g},${b})`;
+    }
+    // 0.7–1: blue → green
+    const t = (ep - 0.7) / 0.3;
+    const r = Math.round(30 + (46 - 30) * t);
+    const g = Math.round(111 + (213 - 111) * t);
+    const b = Math.round(255 + (115 - 255) * t);
+    return `rgb(${r},${g},${b})`;
+  }
+
+  function project(az, alt, w, h) {
+    const cx = w / 2;
+    const cy = h / 2;
+    const rMax = Math.min(w, h) / 2 - 8;
+    const r = ((90 - alt) / 90) * rMax;
+    const rad = (az * Math.PI) / 180;
+    return {
+      x: cx + r * Math.sin(rad),
+      y: cy - r * Math.cos(rad),
+    };
+  }
+
+  function unproject(x, y, w, h) {
+    const cx = w / 2;
+    const cy = h / 2;
+    const rMax = Math.min(w, h) / 2 - 8;
+    const dx = x - cx;
+    const dy = y - cy;
+    const r = Math.sqrt(dx * dx + dy * dy);
+    if (r > rMax) return null;
+    const alt = 90 - (r / rMax) * 90;
+    let az = (Math.atan2(dx, -dy) * 180) / Math.PI;
+    if (az < 0) az += 360;
+    return { az, alt };
+  }
+
+  function draw() {
+    const w = canvas.width;
+    const h = canvas.height;
+    const cx = w / 2;
+    const cy = h / 2;
+    const rMax = Math.min(w, h) / 2 - 8;
+    ctx.clearRect(0, 0, w, h);
+    // Outer ring (horizon)
+    ctx.fillStyle = '#0a0e1a';
+    ctx.beginPath();
+    ctx.arc(cx, cy, rMax, 0, 2 * Math.PI);
+    ctx.fill();
+    // Cells: render as small filled rectangles in az/alt space.
+    if (cells.length > 0) {
+      // Estimate dot size from grid density; small enough not to overlap.
+      // Group by altitude to get band cell count.
+      const altCount = new Map();
+      cells.forEach(c => {
+        const key = Math.round(c.alt * 10) / 10;
+        altCount.set(key, (altCount.get(key) || 0) + 1);
+      });
+      cells.forEach(c => {
+        if (c.below_floor) return;
+        const p = project(c.az, c.alt, w, h);
+        const bandSize = altCount.get(Math.round(c.alt * 10) / 10) || 50;
+        // Cell radial extent: ~2.5° wide.
+        const dr = (5.0 / 90) * rMax / 2;
+        // Cell tangential extent: 360/n_az/2 degrees.
+        const dtheta = (360 / bandSize) / 2;
+        // Approximate cell as filled wedge.
+        const r = ((90 - c.alt) / 90) * rMax;
+        const r0 = Math.max(0, r - dr);
+        const r1 = Math.min(rMax, r + dr);
+        const t0 = (c.az - dtheta) * Math.PI / 180;
+        const t1 = (c.az + dtheta) * Math.PI / 180;
+        ctx.beginPath();
+        ctx.moveTo(cx + r0 * Math.sin(t0), cy - r0 * Math.cos(t0));
+        ctx.lineTo(cx + r1 * Math.sin(t0), cy - r1 * Math.cos(t0));
+        ctx.lineTo(cx + r1 * Math.sin(t1), cy - r1 * Math.cos(t1));
+        ctx.lineTo(cx + r0 * Math.sin(t1), cy - r0 * Math.cos(t1));
+        ctx.closePath();
+        ctx.fillStyle = colorForCell(c);
+        ctx.fill();
+      });
+    }
+    // Concentric alt rings every 30°.
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    for (const altGuide of [0, 30, 60]) {
+      const r = ((90 - altGuide) / 90) * rMax;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+      ctx.stroke();
+    }
+    // Az meridians (N/E/S/W).
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    for (const az of [0, 90, 180, 270]) {
+      const p = project(az, 0, w, h);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    }
+    // Cardinal labels.
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('N', cx, 14);
+    ctx.fillText('S', cx, h - 4);
+    ctx.fillText('E', w - 8, cy + 4);
+    ctx.fillText('W', 8, cy + 4);
+    // Visible polygon outline (cells with E[p] > 0.6).
+    const visibleSet = new Set();
+    cells.forEach(c => {
+      if (!c.below_floor && c.ep > 0.6) visibleSet.add(c.idx);
+    });
+    if (visibleSet.size > 0) {
+      ctx.strokeStyle = 'rgba(46,213,115,0.5)';
+      ctx.lineWidth = 1;
+      cells.forEach(c => {
+        if (!visibleSet.has(c.idx)) return;
+        const p = project(c.az, c.alt, w, h);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI);
+        ctx.stroke();
+      });
+    }
+    // Overlays (future ADS-B / TLE points).
+    overlays.forEach((overlay, name) => {
+      const opts = overlay.options || {};
+      ctx.strokeStyle = opts.color || '#ffeb3b';
+      ctx.fillStyle = opts.color || '#ffeb3b';
+      const r = Math.max(2, opts.radius || 4);
+      (overlay.points || []).forEach(pt => {
+        if (typeof pt.az !== 'number' || typeof pt.alt !== 'number') return;
+        if (pt.alt < 0) return;
+        const p = project(pt.az, pt.alt, w, h);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r, 0, 2 * Math.PI);
+        ctx.fill();
+        if (pt.label) {
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          ctx.font = '10px monospace';
+          ctx.fillText(pt.label, p.x + r + 2, p.y);
+          ctx.fillStyle = opts.color || '#ffeb3b';
+        }
+      });
+    });
+    // Highlight current target.
+    if (status && status.current_target_idx != null) {
+      const c = cellsByIdx.get(status.current_target_idx);
+      if (c) {
+        const p = project(c.az, c.alt, w, h);
+        ctx.strokeStyle = '#ffeb3b';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 8, 0, 2 * Math.PI);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function applyStatus(s) {
+    status = s || { active: false };
+    document.getElementById('svm-state').textContent =
+      status.active ? 'running' : (status.stop_reason ? `stopped (${status.stop_reason.code})` : 'idle');
+    document.getElementById('svm-elapsed').textContent = fmtElapsed(status.elapsed_s);
+    document.getElementById('svm-counts').textContent =
+      `${status.n_cells_observed || 0} / ${status.n_cells_active || 0}`;
+    document.getElementById('svm-visible').textContent = status.n_cells_visible || 0;
+    document.getElementById('svm-entropy').textContent =
+      (status.median_entropy_nats != null) ? status.median_entropy_nats.toFixed(3) : '—';
+    const q = status.map_quality || 0;
+    document.getElementById('svm-quality').textContent = `${(q * 100).toFixed(1)}%`;
+    document.getElementById('svm-quality-bar').style.width = `${(q * 100).toFixed(1)}%`;
+    document.getElementById('svm-eta').textContent =
+      (status.stop_eta_s != null) ? fmtElapsed(status.stop_eta_s) : '—';
+    document.getElementById('svm-obs').textContent = status.n_observations || 0;
+    document.getElementById('svm-grid-kind').textContent = status.grid_kind || '—';
+    // Buttons.
+    startBtn.disabled = !!status.active;
+    stopBtn.disabled = !status.active || !(status.stop_eligible);
+    forceStopBtn.disabled = !status.active;
+    if (status.active && !status.stop_eligible) {
+      const remaining = Math.max(0, 300 - (status.elapsed_s || 0));
+      stopBtn.textContent = `Stop (${Math.ceil(remaining)}s)`;
+    } else {
+      stopBtn.textContent = 'Stop';
+    }
+    // Stop reason.
+    const stopBox = document.getElementById('svm-stop-reason');
+    if (status.stop_reason) {
+      stopBox.style.display = '';
+      stopBox.textContent = `Stopped: ${status.stop_reason.reason}`;
+    } else {
+      stopBox.style.display = 'none';
+    }
+    // Errors.
+    const errBox = document.getElementById('svm-errors');
+    if (Array.isArray(status.errors) && status.errors.length) {
+      errBox.style.display = '';
+      errBox.textContent = status.errors.slice(-5).join('\n');
+    } else {
+      errBox.style.display = 'none';
+    }
+  }
+
+  function applyCells(cellList) {
+    cells = cellList || [];
+    cellsByIdx = new Map();
+    for (const c of cells) cellsByIdx.set(c.idx, c);
+    draw();
+  }
+
+  function applyObservation(evt) {
+    const c = cellsByIdx.get(evt.idx);
+    if (!c) return;
+    c.alpha = evt.alpha;
+    c.beta = evt.beta;
+    c.ep = evt.ep;
+    c.n_obs = (c.n_obs || 0) + 1;
+    draw();
+  }
+
+  async function fetchStatus() {
+    try {
+      const r = await fetch(`${apiRoot}/status`);
+      if (!r.ok) return;
+      const s = await r.json();
+      applyStatus(s);
+    } catch (e) { /* swallow */ }
+  }
+
+  async function fetchCells() {
+    try {
+      const r = await fetch(`${apiRoot}/cells`);
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.cells) applyCells(d.cells);
+      if (d.status) applyStatus(d.status);
+    } catch (e) { /* swallow */ }
+  }
+
+  function startSse() {
+    try {
+      sse = new EventSource(`${apiRoot}/events`);
+      sse.onmessage = (msg) => {
+        try {
+          const data = JSON.parse(msg.data);
+          if (data.type === 'init' && data.status) {
+            applyStatus(data.status);
+            return;
+          }
+          if (data.type === 'observation') {
+            applyObservation(data);
+            return;
+          }
+          if (data.type === 'complete') {
+            applyStatus(data.status);
+            sse && sse.close();
+            sse = null;
+            return;
+          }
+        } catch (e) { /* swallow */ }
+      };
+      sse.onerror = () => {
+        // Fall back to polling (open below in startPolling).
+        try { sse.close(); } catch (e) { /* swallow */ }
+        sse = null;
+      };
+    } catch (e) {
+      sse = null;
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    statusPolling = setInterval(fetchStatus, 2000);
+    cellPolling = setInterval(fetchCells, 5000);
+  }
+
+  function stopPolling() {
+    if (statusPolling) clearInterval(statusPolling);
+    if (cellPolling) clearInterval(cellPolling);
+    statusPolling = null;
+    cellPolling = null;
+  }
+
+  startBtn.addEventListener('click', async () => {
+    const minAlt = parseFloat(document.getElementById('svm-min-alt').value || '10');
+    const maxRun = parseFloat(document.getElementById('svm-max-runtime').value || '480');
+    startBtn.disabled = true;
+    try {
+      const r = await fetch(`${apiRoot}/start`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({min_alt: minAlt, max_runtime_min: maxRun}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({error: 'start failed'}));
+        alert(err.error || 'failed to start visibility map');
+        startBtn.disabled = false;
+        return;
+      }
+      await fetchCells();
+      startSse();
+    } catch (e) {
+      alert('failed to start visibility map: ' + e);
+      startBtn.disabled = false;
+    }
+  });
+
+  stopBtn.addEventListener('click', async () => {
+    stopBtn.disabled = true;
+    try {
+      const r = await fetch(`${apiRoot}/stop`, { method: 'POST' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({error: 'stop failed'}));
+        alert(err.error || 'stop failed');
+      }
+      await fetchStatus();
+    } catch (e) { /* swallow */ }
+  });
+
+  forceStopBtn.addEventListener('click', async () => {
+    if (!confirm('Force-stop the visibility mapper?')) return;
+    forceStopBtn.disabled = true;
+    try {
+      await fetch(`${apiRoot}/force_stop`, { method: 'POST' });
+      await fetchStatus();
+    } catch (e) { /* swallow */ }
+  });
+
+  // Hover tooltip.
+  canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+    const u = unproject(x, y, canvas.width, canvas.height);
+    if (!u) {
+      document.getElementById('svm-hover-azel').textContent = '— / —';
+      document.getElementById('svm-hover-ab').textContent = '— / —';
+      document.getElementById('svm-hover-ep').textContent = '—';
+      document.getElementById('svm-hover-obs').textContent = '—';
+      return;
+    }
+    document.getElementById('svm-hover-azel').textContent =
+      `${u.az.toFixed(1)}° / ${u.alt.toFixed(1)}°`;
+    // Find nearest cell.
+    let best = null;
+    let bestD = Infinity;
+    for (const c of cells) {
+      if (c.below_floor) continue;
+      const dAz = Math.min(
+        Math.abs(c.az - u.az),
+        360 - Math.abs(c.az - u.az)
+      );
+      const d = Math.hypot(dAz, c.alt - u.alt);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    if (best) {
+      document.getElementById('svm-hover-ab').textContent =
+        `${best.alpha.toFixed(2)} / ${best.beta.toFixed(2)}`;
+      document.getElementById('svm-hover-ep').textContent = best.ep.toFixed(3);
+      document.getElementById('svm-hover-obs').textContent = best.n_obs || 0;
+    }
+  });
+
+  // Public overlay API for downstream features (ADS-B / satellite tracking).
+  window.skyVisibilityMap = {
+    addOverlay(name, points, options) {
+      overlays.set(String(name), { points: points || [], options: options || {} });
+      draw();
+    },
+    removeOverlay(name) {
+      overlays.delete(String(name));
+      draw();
+    },
+    listOverlays() {
+      return Array.from(overlays.keys());
+    },
+  };
+
+  // Boot.
+  fetchCells().then(() => {
+    if (status.active) startSse();
+    startPolling();
+  });
+})();
+</script>
+{% endblock %}

@@ -6178,6 +6178,434 @@ class CalibrateNighttimeApplyResource:
         resp.text = json.dumps(_nighttime_status_dict(session.status()))
 
 
+# ---- Sky-visibility map (Bayesian active-sampling plate-solver) -----
+#
+# Long-running mapper that progressively builds a per-cell confidence
+# map of which alt/az cells the telescope can plate-solve. Used to
+# derive a polygon of the visible sky for downstream filtering of
+# satellite/aircraft tracks.
+
+_VISIBILITY_STATE_DIR = Path(__file__).resolve().parents[1] / "device_state"
+
+
+def _azel_to_radec_for_telescope(
+    az_deg: float, alt_deg: float, telescope_id: int, t_unix: float | None = None
+) -> tuple[float, float]:
+    """Convert (az, alt) → (RA hours, Dec deg) for the telescope's site
+    at the current (or supplied) UTC time.
+
+    RA is returned in *hours* because that's what ``scope_goto`` expects
+    in this codebase.
+    """
+    from astropy import units as u
+    from astropy.coordinates import AltAz, EarthLocation, ICRS, SkyCoord
+    from astropy.time import Time
+    from device.alpaca_client import AlpacaClient
+    from scripts.trajectory.observer import fetch_telescope_lonlat
+
+    if t_unix is None:
+        t_unix = time.time()
+    cli = AlpacaClient("127.0.0.1", int(Config.port), int(telescope_id))
+    lat, lon = fetch_telescope_lonlat(cli)
+    loc = EarthLocation.from_geodetic(
+        lon=lon * u.deg, lat=lat * u.deg, height=2.0 * u.m
+    )
+    altaz = SkyCoord(
+        az=az_deg * u.deg,
+        alt=alt_deg * u.deg,
+        frame=AltAz(obstime=Time(t_unix, format="unix"), location=loc),
+    )
+    icrs = altaz.transform_to(ICRS())
+    ra_hours = float(icrs.ra.hour)
+    dec_deg = float(icrs.dec.deg)
+    return ra_hours, dec_deg
+
+
+def _make_visibility_slew_func(telescope_id: int):
+    """Build the ``slew_func`` callback for a telescope.
+
+    Converts (az, alt) → (RA, Dec) for the current time and posts a
+    ``scope_goto`` via the action API. Returns ``True`` on success,
+    ``False`` if the slew was refused (so the mapper counts it toward
+    sun-safety abort) or another error occurred.
+
+    The conversion + action call inherits the existing sun-safety
+    pre-flight in ``_slew_to_ra_dec`` — we don't bypass it.
+    """
+
+    def slew(az_deg: float, alt_deg: float) -> bool:
+        try:
+            ra_hours, dec_deg = _azel_to_radec_for_telescope(
+                az_deg, alt_deg, telescope_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "visibility map: az/el→RA/Dec failed (az=%.2f alt=%.2f): %s",
+                az_deg,
+                alt_deg,
+                exc,
+            )
+            return False
+        try:
+            result = do_action_device(
+                "method_sync",
+                telescope_id,
+                {"method": "scope_goto", "params": [ra_hours, dec_deg]},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("visibility map: scope_goto raised: %s", exc)
+            return False
+        if not isinstance(result, dict):
+            return False
+        # The wrapper returns either {Value: ...} or the raw result. We
+        # treat anything that wasn't an explicit error as success, and
+        # rely on the device-side sun-safety guard to refuse internally.
+        if "error" in result:
+            return False
+        value = result.get("Value", result)
+        if isinstance(value, dict) and value.get("error"):
+            return False
+        return True
+
+    return slew
+
+
+def _make_visibility_plate_solve_func(telescope_id: int):
+    """Build the ``plate_solve_func`` callback for a telescope.
+
+    Calls ``start_solve_sync`` via the action API; classifies the
+    response into one of the four outcomes the mapper expects.
+    """
+    from device.visibility_mapper import SolveOutcome
+
+    def plate_solve(timeout_s: float) -> SolveOutcome:
+        try:
+            result = do_action_device(
+                "start_solve_sync",
+                telescope_id,
+                {"timeout_s": float(timeout_s)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("visibility map: plate_solve raised: %s", exc)
+            return SolveOutcome.SYSTEM_ERROR
+        if not isinstance(result, dict):
+            return SolveOutcome.SYSTEM_ERROR
+        # Inspect the standard ASCOM-Alpaca wrapper. ErrorNumber !=0 with
+        # a "no solution"-style message → NO_STARS; timeout text →
+        # TIMEOUT; everything else → SYSTEM_ERROR.
+        err_no = result.get("ErrorNumber", 0)
+        err_msg = str(result.get("ErrorMessage", "") or "")
+        value = result.get("Value", result)
+        if err_no == 0 and isinstance(value, dict) and "ra_dec" in value:
+            return SolveOutcome.SOLVED
+        msg_lower = err_msg.lower()
+        if any(
+            tok in msg_lower
+            for tok in (
+                "no solution",
+                "no stars",
+                "failed to solve",
+                "plate solve failed",
+                "could not solve",
+            )
+        ):
+            return SolveOutcome.NO_STARS
+        if "timeout" in msg_lower or "did not complete" in msg_lower:
+            return SolveOutcome.TIMEOUT
+        # Unknown failure shape — treat as SYSTEM_ERROR so the mapper
+        # backs off rather than poisoning the posterior.
+        return SolveOutcome.SYSTEM_ERROR
+
+    return plate_solve
+
+
+class SkyVisibilityResource:
+    """GET: render the sky-visibility map page."""
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        context = get_context(telescope_id, req)
+        render_template(
+            req,
+            resp,
+            "sky_visibility.html",
+            telescope_id=telescope_id,
+            **context,
+        )
+
+
+class VisibilityStartResource:
+    """POST: kick off the mapper for ``telescope_id``.
+
+    Body: ``{min_alt: float = 10.0, max_runtime_min: float = 480, grid_kind?: "altaz"|"healpix"}``.
+    Returns 409 if a run is already in progress, 503 if the GPS isn't
+    available (we need a site for az/el ↔ RA/Dec).
+    """
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        from device.alpaca_client import AlpacaClient
+        from device.sky_grid import make_default_grid
+        from device.visibility_mapper import (
+            VisibilityMapper,
+            VisibilityMapperOptions,
+            get_visibility_manager,
+        )
+        from scripts.trajectory.observer import fetch_telescope_lonlat
+
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "request body must be a JSON object"})
+            return
+        try:
+            min_alt = float(body.get("min_alt", 10.0))
+        except (TypeError, ValueError):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "min_alt must be numeric"})
+            return
+        try:
+            max_runtime_min = float(body.get("max_runtime_min", 480.0))
+        except (TypeError, ValueError):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "max_runtime_min must be numeric"})
+            return
+        grid_kind = str(body.get("grid_kind", "altaz")).lower()
+        if grid_kind not in ("altaz", "healpix"):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "grid_kind must be 'altaz' or 'healpix'"})
+            return
+        if min_alt < 0.0 or min_alt > 80.0:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "min_alt must be in [0, 80]"})
+            return
+        if max_runtime_min < 1.0 or max_runtime_min > 24 * 60.0:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps(
+                {"error": "max_runtime_min must be between 1 and 1440"}
+            )
+            return
+
+        mgr = get_visibility_manager()
+        if mgr.is_running(int(telescope_id)):
+            resp.status = falcon.HTTP_409
+            resp.content_type = "application/json"
+            resp.text = json.dumps(
+                {
+                    "error": "a visibility-map run is already in progress for this telescope"
+                }
+            )
+            return
+        mgr.clear_inactive(int(telescope_id))
+
+        site_lat = None
+        site_lon = None
+        site_alt_m = 2.0
+        try:
+            cli = AlpacaClient("127.0.0.1", int(Config.port), int(telescope_id))
+            site_lat, site_lon = fetch_telescope_lonlat(cli)
+        except Exception as exc:  # noqa: BLE001
+            if grid_kind == "healpix":
+                resp.status = falcon.HTTP_503
+                resp.content_type = "application/json"
+                resp.text = json.dumps(
+                    {"error": f"GPS unavailable, cannot build HEALPix grid: {exc}"}
+                )
+                return
+            # alt/az grid is fine without site coords; we'll need them at
+            # slew time, but the mapper can be primed and start trying.
+            logger.info(
+                "visibility map: GPS unavailable on start (%s); proceeding with altaz grid",
+                exc,
+            )
+
+        grid = make_default_grid(
+            min_alt_deg=min_alt,
+            prefer=grid_kind,
+            site_lat_deg=site_lat,
+            site_lon_deg=site_lon,
+            site_alt_m=site_alt_m,
+            t_unix=time.time(),
+        )
+
+        slew_fn = _make_visibility_slew_func(int(telescope_id))
+        solve_fn = _make_visibility_plate_solve_func(int(telescope_id))
+
+        opts = VisibilityMapperOptions(
+            min_alt_deg=min_alt,
+            max_runtime_min=max_runtime_min,
+        )
+        mapper = VisibilityMapper(
+            telescope_id=int(telescope_id),
+            grid=grid,
+            slew_func=slew_fn,
+            plate_solve_func=solve_fn,
+            options=opts,
+            state_dir=_VISIBILITY_STATE_DIR,
+        )
+        try:
+            mgr.start(mapper)
+        except RuntimeError as exc:
+            resp.status = falcon.HTTP_409
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": str(exc)})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(mapper.status())
+
+
+class VisibilityStatusResource:
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        from device.visibility_mapper import get_visibility_manager
+
+        mapper = get_visibility_manager().get(int(telescope_id))
+        if mapper is None:
+            resp.status = falcon.HTTP_200
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"active": False})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(mapper.status())
+
+
+class VisibilityCellsResource:
+    """Return the full cell array. Used on initial page load and as
+    the polling fallback if SSE isn't available."""
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        from device.visibility_mapper import get_visibility_manager
+
+        mapper = get_visibility_manager().get(int(telescope_id))
+        if mapper is None:
+            resp.status = falcon.HTTP_200
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"active": False, "cells": []})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(
+            {
+                "active": mapper.is_active(),
+                "status": mapper.status(),
+                "cells": mapper.cells_snapshot(),
+            }
+        )
+
+
+class VisibilityStopResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        from device.visibility_mapper import get_visibility_manager
+
+        mgr = get_visibility_manager()
+        accepted, msg, status = mgr.stop(int(telescope_id), force=False)
+        if status is None:
+            resp.status = falcon.HTTP_404
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "no active visibility map"})
+            return
+        if not accepted:
+            resp.status = falcon.HTTP_409
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": msg, "status": status})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(status)
+
+
+class VisibilityForceStopResource:
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        from device.visibility_mapper import get_visibility_manager
+
+        mgr = get_visibility_manager()
+        accepted, msg, status = mgr.stop(int(telescope_id), force=True)
+        if status is None:
+            resp.status = falcon.HTTP_404
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "no active visibility map"})
+            return
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(status)
+
+
+class VisibilityEventsResource:
+    """SSE stream of mapper events.
+
+    Best-effort: with ``wsgiref.simple_server`` events may be buffered
+    until the connection closes, so the frontend should also poll the
+    /status + /cells endpoints as a fallback.
+    """
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        import collections as _collections
+
+        from device.visibility_mapper import get_visibility_manager
+
+        mapper = get_visibility_manager().get(int(telescope_id))
+        resp.status = falcon.HTTP_200
+        resp.content_type = "text/event-stream"
+        resp.append_header("Cache-Control", "no-cache")
+        resp.append_header("X-Accel-Buffering", "no")
+
+        def _gen():
+            initial = {
+                "type": "init",
+                "status": mapper.status() if mapper is not None else {"active": False},
+            }
+            yield f"data: {json.dumps(initial)}\n\n".encode("utf-8")
+            if mapper is None:
+                return
+            queue: _collections.deque = _collections.deque()
+            evt = threading.Event()
+
+            def _push(payload):
+                queue.append(payload)
+                evt.set()
+
+            unsub = mapper.add_listener(_push)
+            try:
+                start = time.time()
+                # Cap one connection at 5 minutes; clients reconnect.
+                while time.time() - start < 300.0:
+                    if evt.wait(timeout=15.0):
+                        evt.clear()
+                        while queue:
+                            payload = queue.popleft()
+                            yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+                            if payload.get("type") == "complete":
+                                return
+                    else:
+                        # Heartbeat to keep the connection alive.
+                        yield b": ping\n\n"
+                    if not mapper.is_active():
+                        # Drain any remaining events then close.
+                        while queue:
+                            payload = queue.popleft()
+                            yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+                        return
+            finally:
+                unsub()
+
+        resp.stream = _gen()
+
+
 class StatsContentResource:
     _last_render_by_key = {}
     _lock = threading.Lock()
@@ -7504,6 +7932,35 @@ class FrontMain:
         app.add_route(
             "/api/{telescope_id:int}/calibrate_nighttime/apply",
             CalibrateNighttimeApplyResource(),
+        )
+        # ---- Sky-visibility map (Bayesian active sampling) ----
+        app.add_route(
+            "/{telescope_id:int}/sky_visibility",
+            SkyVisibilityResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_visibility/start",
+            VisibilityStartResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_visibility/status",
+            VisibilityStatusResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_visibility/cells",
+            VisibilityCellsResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_visibility/stop",
+            VisibilityStopResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_visibility/force_stop",
+            VisibilityForceStopResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/calibrate_visibility/events",
+            VisibilityEventsResource(),
         )
         app.add_route("/config", ConfigResource())
         app.add_route("/pa_refine", BlindPolarAlignResource())
