@@ -667,8 +667,16 @@ class Seestar:
                     data["params"] = existing_params
                     return data
 
-                if isinstance(existing_params, list) and existing_params:
-                    if existing_params[-1] == "verify":
+                if isinstance(existing_params, list):
+                    # Firmware 7.06+ (2706+) rejects verify wrapping on list
+                    # params too: scope_goto with [[ra, dec], "verify"] returns
+                    # code 108 "expected float param". The device is
+                    # SSL-authenticated (is_verified: True) so list-param
+                    # commands don't need verify injection on 7.06+ — same
+                    # rationale as the dict-params path above.
+                    if getattr(self, "firmware_ver_int", 0) >= 2706:
+                        return data
+                    if existing_params and existing_params[-1] == "verify":
                         return data
 
                 if data.get("method") == "set_wheel_position" and isinstance(
