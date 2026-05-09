@@ -38,6 +38,9 @@ auto_level_logs/
 # CumulativeAzTracker runtime state (per-device, dynamic — not calibration).
 device/plant_limits_state.json
 
+# Visibility-mapper snapshots (per-telescope, dynamic — regenerated from observations).
+device_state/
+
 # Fetched trajectory data (regenerable from OpenSky / Celestrak).
 data/trajectories/
 data/fetch_aircraft.log
