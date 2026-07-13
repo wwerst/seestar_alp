@@ -1865,3 +1865,218 @@ def test_calibrate_nighttime_availability_solve_field_branch(monkeypatch):
     assert payload["solver_available"] is True
     assert payload["solver_kind"] == "solve-field"
     assert payload["solver_path"] == "/usr/local/bin/solve-field"
+
+
+# ---------- vendored Chart.js (offline field-Pi) ----------------------
+
+
+def _render_chart_page(template_name):
+    return front_app.fetch_template(template_name).render(
+        telescope_id=1,
+        **_minimal_context(template_name.replace(".html", ""), online=True),
+    )
+
+
+def test_velocity_controller_uses_vendored_chart_not_cdn():
+    """The velocity-controller page must load Chart.js from the vendored
+    /public asset (like the other public scripts) rather than jsdelivr, so
+    the page JS doesn't abort offline on a field Pi."""
+    html = _render_chart_page("velocity_controller.html")
+    assert "/public/chart.umd.min.js" in html
+    assert "cdn.jsdelivr.net" not in html
+    # Chart construction is guarded so a missing/failed Chart still leaves the
+    # polling/status loop alive.
+    assert "typeof Chart === 'undefined'" in html
+
+
+def test_live_tracker_uses_vendored_chart_not_cdn():
+    """Same vendored-asset contract for the live-tracker page, plus a guard so
+    status polling / start / stop / sliders survive a missing Chart."""
+    html = _render_chart_page("live_tracker.html")
+    assert "/public/chart.umd.min.js" in html
+    assert "cdn.jsdelivr.net" not in html
+    assert "typeof Chart !== 'undefined'" in html
+    # updateChart() no-ops when the chart couldn't be constructed.
+    assert "if (!chart) return;" in html
+
+
+# ---------- threaded front WSGI server --------------------------------
+
+
+def test_front_server_class_is_threaded():
+    """The front app must be served by a ThreadingMixIn WSGI server so a
+    long-lived SSE stream doesn't freeze every other request."""
+    from socketserver import ThreadingMixIn
+    from wsgiref.simple_server import WSGIServer
+
+    assert issubclass(front_app.ThreadingWSGIServer, ThreadingMixIn)
+    assert issubclass(front_app.ThreadingWSGIServer, WSGIServer)
+    assert front_app.ThreadingWSGIServer.daemon_threads is True
+
+
+def test_front_main_start_wires_threading_server(monkeypatch):
+    """FrontMain.start must hand ThreadingWSGIServer to make_server."""
+    captured = {}
+
+    class _FakeHttpd:
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def shutdown(self):
+            captured["shutdown"] = True
+
+    def _fake_make_server(host, port, app, server_class=None, handler_class=None):
+        captured["server_class"] = server_class
+        captured["handler_class"] = handler_class
+        return _FakeHttpd()
+
+    monkeypatch.setattr(front_app, "make_server", _fake_make_server)
+    monkeypatch.setattr(front_app, "get_listening_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(front_app, "check_internet_connection", lambda: False)
+
+    front_app.FrontMain().start()
+
+    assert captured["server_class"] is front_app.ThreadingWSGIServer
+    assert captured["handler_class"] is front_app.LoggingWSGIRequestHandler
+    assert captured.get("shutdown") is True
+
+
+# ---------- LiveTrackerTrackResource pre-check mapping ----------------
+
+
+def _patch_live_tracker_manager(monkeypatch, start_impl):
+    """Stub device.live_tracker so LiveTrackerTrackResource.on_post reaches
+    get_manager().start() without any real catalog / mount / thread work."""
+    import device.live_tracker as lt
+
+    class _Catalog:
+        def make_provider(self, kind, target_id, mount_frame):
+            return object()
+
+        def list_cached(self):
+            return []
+
+        def list_live(self):
+            return []
+
+    class _Manager:
+        def start(self, session):
+            start_impl(session)
+
+    monkeypatch.setattr(lt, "get_catalog", lambda: _Catalog())
+    monkeypatch.setattr(lt, "load_session_mount_frame", lambda: object())
+    monkeypatch.setattr(lt, "get_manager", lambda: _Manager())
+    monkeypatch.setattr(lt, "LiveTrackSession", lambda **kw: object())
+    return lt
+
+
+def test_live_tracker_track_precheck_failed_returns_400(monkeypatch):
+    """An infeasible trajectory raises device.live_tracker.PreCheckFailed;
+    the route must surface it as HTTP 400 with the reason, not a 500."""
+    import device.live_tracker as lt
+
+    def _raise(session):
+        raise lt.PreCheckFailed(
+            "telescope 1 track pre-check failed: cable-wrap hard stop"
+        )
+
+    _patch_live_tracker_manager(monkeypatch, _raise)
+    req = _DummyJSONReq(body={"kind": "file", "id": "sat-123"})
+    resp = _DummyJSONResp()
+    front_app.LiveTrackerTrackResource.on_post(req, resp, telescope_id=1)
+    assert "400" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert "pre-check failed" in payload["error"]
+
+
+def test_live_tracker_track_runtime_error_still_returns_409(monkeypatch):
+    """Existing RuntimeError handling (already-tracking) must keep its 409."""
+
+    def _raise(session):
+        raise RuntimeError("telescope 1 already tracking; stop first")
+
+    _patch_live_tracker_manager(monkeypatch, _raise)
+    req = _DummyJSONReq(body={"kind": "file", "id": "sat-123"})
+    resp = _DummyJSONResp()
+    front_app.LiveTrackerTrackResource.on_post(req, resp, telescope_id=1)
+    assert "409" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert "already tracking" in payload["error"]
+
+
+def test_live_tracker_track_precheck_import_fallback_returns_400(monkeypatch):
+    """If an older device module lacks PreCheckFailed, the defensive import
+    falls back to ValueError and a ValueError from start() still maps to 400."""
+    import device.live_tracker as lt
+
+    monkeypatch.delattr(lt, "PreCheckFailed", raising=False)
+
+    def _raise(session):
+        raise ValueError("trajectory infeasible")
+
+    _patch_live_tracker_manager(monkeypatch, _raise)
+    req = _DummyJSONReq(body={"kind": "file", "id": "sat-123"})
+    resp = _DummyJSONResp()
+    front_app.LiveTrackerTrackResource.on_post(req, resp, telescope_id=1)
+    assert "400" in str(resp.status)
+    payload = json.loads(resp.text)
+    assert "infeasible" in payload["error"]
+
+
+# ---------- calibrate_rotation error-body surfacing -------------------
+
+
+def test_calibrate_rotation_surfaces_server_error_body():
+    """The celestial-fetch error handler must await the JSON body before
+    reading .error (the old `(await r.json().catch(...).error)` read the
+    field off the promise, so server error bodies never surfaced)."""
+    html = front_app.fetch_template("calibrate_rotation.html").render(
+        telescope_id=1,
+        **_minimal_context("calibrate_rotation", online=True),
+    )
+    assert "const j = await r.json().catch(() => ({}));" in html
+    assert "(j.error || r.statusText)" in html
+    # The buggy member-access-on-promise form must be gone.
+    assert ".catch(()=>({})).error" not in html
+
+
+# ---------- sky_visibility SSE / polling coordination -----------------
+
+
+def test_sky_visibility_polling_is_sse_fallback_only():
+    """SSE and the 2s/5s polling loops must not run simultaneously: polling
+    starts only when SSE errors, stops when SSE (re)connects, and all loops
+    clear when the run goes idle."""
+    html = front_app.fetch_template("sky_visibility.html").render(
+        telescope_id=1,
+        **_minimal_context("sky_visibility", online=True),
+    )
+    # Central router keyed off run state.
+    assert "function syncTransports" in html
+    # SSE connect drops the fallback polling loops.
+    assert "sse.onopen" in html
+    # SSE error starts polling only while a run is active.
+    assert "if (status.active) startPolling();" in html
+    # Boot no longer unconditionally starts polling alongside SSE.
+    assert "fetchCells().then(fetchStatus);" in html
+
+
+# ---------- live_tracker slider vs status-poll race -------------------
+
+
+def test_live_tracker_status_poll_skips_busy_sliders():
+    """The 1 Hz status poll must not overwrite an offset slider the user is
+    mid-edit (dragging/focused) or that has a debounced POST pending."""
+    html = front_app.fetch_template("live_tracker.html").render(
+        telescope_id=1,
+        **_minimal_context("live_tracker", online=True),
+    )
+    assert "function offsetsEditing" in html
+    assert "function sliderBusy" in html
+    # Status poll guards its slider sync.
+    assert "if (s.offsets && !offsetsEditing())" in html
+    # Per-slider reconciliation also skips a busy slider.
+    assert "if (sliderBusy(sid)) return;" in html
+    # Debounced-post flag is cleared when the timer fires so the poll can
+    # resume once the user stops editing.
+    assert "pendingPost = null;" in html

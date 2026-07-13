@@ -1081,3 +1081,81 @@ def test_27_federation_home_lists_both_devices(two_device_federation):
     assert resp.status_code == 200
     assert "Seestar Alpha" in resp.text
     assert "Seestar Beta" in resp.text
+
+
+def test_28_threaded_server_sse_does_not_block_other_requests():
+    """The front app is served by front_app.ThreadingWSGIServer, so a
+    long-lived SSE stream (the visibility events endpoint holds its worker for
+    up to 300s) must not freeze concurrent page/poll requests. Serve a tiny
+    app that mimics an open SSE stream + a fast route through the real server
+    class and confirm the fast request completes while the stream is held."""
+    import http.client
+    from wsgiref.simple_server import make_server
+
+    release = threading.Event()
+
+    def app(environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        if path == "/slow":
+            start_response("200 OK", [("Content-Type", "text/event-stream")])
+
+            def gen():
+                # First heartbeat, then hold the worker thread like an open
+                # SSE connection would until the test releases it.
+                yield b": open\n\n"
+                release.wait(timeout=10)
+                yield b"data: done\n\n"
+
+            return gen()
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"fast"]
+
+    port = _find_free_port()
+    httpd = make_server(
+        "127.0.0.1",
+        port,
+        app,
+        server_class=front_app.ThreadingWSGIServer,
+        handler_class=front_app.LoggingWSGIRequestHandler,
+    )
+    assert isinstance(httpd, front_app.ThreadingWSGIServer)
+    assert httpd.daemon_threads is True
+
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    slow_conn = None
+    try:
+        _wait_for_tcp("127.0.0.1", port)
+
+        # Open the SSE-style stream and read its first chunk so the server-side
+        # generator (and its worker thread) is parked mid-response.
+        slow_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        slow_conn.request("GET", "/slow")
+        slow_resp = slow_conn.getresponse()
+        assert slow_resp.read(len(b": open\n\n")) == b": open\n\n"
+
+        # A concurrent request must complete promptly rather than queueing
+        # behind the held stream (which it would on a single-threaded server).
+        t0 = time.time()
+        fast_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        fast_conn.request("GET", "/fast")
+        fast_resp = fast_conn.getresponse()
+        body = fast_resp.read()
+        elapsed = time.time() - t0
+        fast_conn.close()
+
+        assert fast_resp.status == 200
+        assert body == b"fast"
+        assert elapsed < 3.0, (
+            f"fast request blocked {elapsed:.2f}s behind the SSE stream"
+        )
+    finally:
+        release.set()
+        if slow_conn is not None:
+            try:
+                slow_conn.close()
+            except Exception:
+                pass
+        httpd.shutdown()
+        httpd.server_close()
+        server_thread.join(timeout=3)

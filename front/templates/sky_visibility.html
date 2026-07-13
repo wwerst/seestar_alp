@@ -446,6 +446,23 @@
     } else {
       errBox.style.display = 'none';
     }
+    // Route the live-update transport off the run state. Every status update
+    // flows through here, so this is the single place that decides whether we
+    // need SSE, fallback polling, or nothing at all.
+    syncTransports();
+  }
+
+  function syncTransports() {
+    // SSE is the primary channel while a run is active; the 2s/5s polling
+    // loops are only a fallback for when SSE drops (see onopen/onerror). When
+    // the run goes idle we tear everything down so we stop hammering the
+    // single-threaded server for a run that isn't happening.
+    if (status.active) {
+      if (!sse) startSse();
+    } else {
+      if (sse) { try { sse.close(); } catch (e) { /* swallow */ } sse = null; }
+      stopPolling();
+    }
   }
 
   function applyCells(cellList) {
@@ -485,8 +502,14 @@
   }
 
   function startSse() {
+    if (sse) return;  // idempotent — one stream at a time
     try {
       sse = new EventSource(`${apiRoot}/events`);
+      sse.onopen = () => {
+        // SSE is live — drop the fallback polling loops so we're not
+        // double-loading the server (SSE + polls at the same time).
+        stopPolling();
+      };
       sse.onmessage = (msg) => {
         try {
           const data = JSON.parse(msg.data);
@@ -499,20 +522,26 @@
             return;
           }
           if (data.type === 'complete') {
+            // applyStatus() sees active:false and tears down via
+            // syncTransports(); close explicitly too for immediacy.
             applyStatus(data.status);
-            sse && sse.close();
+            try { sse && sse.close(); } catch (e) { /* swallow */ }
             sse = null;
+            stopPolling();
             return;
           }
         } catch (e) { /* swallow */ }
       };
       sse.onerror = () => {
-        // Fall back to polling (open below in startPolling).
-        try { sse.close(); } catch (e) { /* swallow */ }
-        sse = null;
+        // SSE dropped (transient blip or the server's 300s cap). Poll as a
+        // fallback while the browser auto-reconnects; onopen stops polling
+        // again once the stream is live. If the run has ended, the next
+        // status update tears everything down via syncTransports().
+        if (status.active) startPolling();
       };
     } catch (e) {
       sse = null;
+      if (status.active) startPolling();
     }
   }
 
@@ -546,7 +575,9 @@
         return;
       }
       await fetchCells();
-      startSse();
+      // Seed the active run state; applyStatus() → syncTransports() opens SSE
+      // and, if it later drops, the onerror fallback knows a run is live.
+      await fetchStatus();
     } catch (e) {
       alert('failed to start visibility map: ' + e);
       startBtn.disabled = false;
@@ -624,11 +655,10 @@
     },
   };
 
-  // Boot.
-  fetchCells().then(() => {
-    if (status.active) startSse();
-    startPolling();
-  });
+  // Boot. Pull an initial cells + status snapshot; applyStatus() →
+  // syncTransports() opens SSE iff a run is active. Polling stays off until
+  // SSE actually drops (onerror), so we're not running both loops at once.
+  fetchCells().then(fetchStatus);
 })();
 </script>
 {% endblock %}

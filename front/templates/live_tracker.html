@@ -191,7 +191,8 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<!-- Chart.js (vendored so the page still works offline on a field Pi) -->
+<script src="/public/chart.umd.min.js"></script>
 <script>
 (function(){
   const wrap = document.querySelector('.lt-wrap');
@@ -335,11 +336,35 @@
     if (pendingPost) clearTimeout(pendingPost);
     // Always post the full local snapshot so the server reconciles every
     // field (avoids stale slider values lingering from a previous session).
-    pendingPost = setTimeout(() => postOffsets({...offsetSnapshot}), 150);
+    pendingPost = setTimeout(() => {
+      // Clear the pending flag *before* the POST so the 1 Hz status poll
+      // (offsetsEditing) can resume syncing once the user has stopped
+      // dragging and this debounced write has fired.
+      pendingPost = null;
+      postOffsets({...offsetSnapshot});
+    }, 150);
+  }
+  // Sliders the user is actively dragging. The 1 Hz status poll must not
+  // overwrite these mid-edit (it would snap the thumb back and drop ~15% of
+  // inputs), so we track pointer drags and skip syncing a busy slider.
+  const draggingSliders = new Set();
+  function sliderBusy(sid){
+    const s = document.getElementById(sid);
+    return draggingSliders.has(sid) || document.activeElement === s;
+  }
+  function offsetsEditing(){
+    // True while the user is touching any offset slider or a debounced POST
+    // of their edits is still queued.
+    return pendingPost !== null || bindings.some(([sid]) => sliderBusy(sid));
   }
   bindings.forEach(([sid, lid, field, fmt]) => {
     const s = document.getElementById(sid);
     const l = document.getElementById(lid);
+    const startEdit = () => draggingSliders.add(sid);
+    const endEdit = () => draggingSliders.delete(sid);
+    s.addEventListener('pointerdown', startEdit);
+    s.addEventListener('pointerup', endEdit);
+    s.addEventListener('pointercancel', endEdit);
     s.addEventListener('input', () => {
       const v = parseFloat(s.value);
       l.textContent = fmt(v);
@@ -373,6 +398,9 @@
     };
     Object.entries(map).forEach(([sid, [field, fmt, lid]]) => {
       const s = document.getElementById(sid); const l = document.getElementById(lid);
+      // Never yank a slider the user is currently dragging/focused — the
+      // reconciliation would fight their input.
+      if (sliderBusy(sid)) return;
       const v = offsetSnapshot[field];
       if (Math.abs(parseFloat(s.value) - v) > 1e-6) { s.value = v; }
       l.textContent = fmt(v);
@@ -445,7 +473,13 @@
       const r = await fetch(`${apiRoot}/status`);
       const s = await r.json();
       statusLast = s;
-      if (s.offsets) { offsetSnapshot = s.offsets; syncSlidersFromSnapshot(); }
+      // Don't clobber the sliders while the user is mid-edit — a debounced
+      // POST is in flight or a thumb is being dragged. Their own postOffsets
+      // reconciliation applies the clamped server values once they let go.
+      if (s.offsets && !offsetsEditing()) {
+        offsetSnapshot = s.offsets;
+        syncSlidersFromSnapshot();
+      }
       renderStatus(s);
       // Re-render target list when the active-tracking target changes so the
     // ▶ highlight on the selected row keeps up without waiting for the
@@ -551,28 +585,37 @@
   refreshStatus();
 
   // --- mini chart ---
-  const ctx = document.getElementById('lt-chart').getContext('2d');
-  const chart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [
-        {label:'az measured', data: [], borderColor:'#22c55e', pointRadius:0, tension:0.2},
-        {label:'az ref',      data: [], borderColor:'#16a34a', borderDash:[4,4], pointRadius:0, tension:0.2},
-        {label:'el measured', data: [], borderColor:'#3b82f6', pointRadius:0, tension:0.2, yAxisID:'y2'},
-        {label:'el ref',      data: [], borderColor:'#1d4ed8', borderDash:[4,4], pointRadius:0, tension:0.2, yAxisID:'y2'},
-      ],
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false, animation: false,
-      scales: {
-        y:  { position:'left',  title:{display:true,text:'az (°)'} },
-        y2: { position:'right', title:{display:true,text:'el (°)'}, grid:{drawOnChartArea:false} },
-      },
-      plugins: { legend: { labels: { font: {size:10} } } },
-    },
-  });
+  // Guarded: if Chart.js failed to load (offline field Pi with a missing
+  // vendored asset) leave `chart` null so status polling / start / stop and
+  // the offset sliders keep working instead of the page JS aborting here.
+  let chart = null;
+  try {
+    if (typeof Chart !== 'undefined') {
+      const ctx = document.getElementById('lt-chart').getContext('2d');
+      chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [
+            {label:'az measured', data: [], borderColor:'#22c55e', pointRadius:0, tension:0.2},
+            {label:'az ref',      data: [], borderColor:'#16a34a', borderDash:[4,4], pointRadius:0, tension:0.2},
+            {label:'el measured', data: [], borderColor:'#3b82f6', pointRadius:0, tension:0.2, yAxisID:'y2'},
+            {label:'el ref',      data: [], borderColor:'#1d4ed8', borderDash:[4,4], pointRadius:0, tension:0.2, yAxisID:'y2'},
+          ],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, animation: false,
+          scales: {
+            y:  { position:'left',  title:{display:true,text:'az (°)'} },
+            y2: { position:'right', title:{display:true,text:'el (°)'}, grid:{drawOnChartArea:false} },
+          },
+          plugins: { legend: { labels: { font: {size:10} } } },
+        },
+      });
+    }
+  } catch (e) { chart = null; }
   function updateChart(){
+    if (!chart) return;
     chart.data.labels = timeHist.map(t => {
       const d = new Date(t*1000);
       const hh = String(d.getHours()).padStart(2,'0');

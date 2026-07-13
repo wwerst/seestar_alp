@@ -75,8 +75,8 @@
   <div class="chart-box"><canvas id="elChart"></canvas></div>
 </div>
 
-<!-- Chart.js -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<!-- Chart.js (vendored so the page still works offline on a field Pi) -->
+<script src="/public/chart.umd.min.js"></script>
 
 <script>
 (function(){
@@ -119,6 +119,12 @@
   }
 
   function makeAxisChart(ctx, posMin, posMax, posLabel) {
+    // If Chart.js failed to load (e.g. offline and the vendored asset is
+    // missing) or construction throws, fall back to null so the
+    // polling/status loop set up below keeps running instead of the whole
+    // page JS aborting here.
+    if (typeof Chart === 'undefined') return null;
+    try {
     return new Chart(ctx, {
       type: 'line',
       data: { datasets: [
@@ -166,6 +172,7 @@
         },
       },
     });
+    } catch (e) { return null; }
   }
 
   const azChart = makeAxisChart(
@@ -358,24 +365,30 @@
     }
 
     // Az chart: use FF-derived trajectory ref + tracking error when present.
-    azChart.data.datasets[0].data = azFF.err.length > 0 ? azFF.err : azErr;
-    azChart.data.datasets[0].label = azFF.err.length > 0
-      ? 'tracking error (°)' : 'error (°)';
-    azChart.data.datasets[1].data = azFF.ref.length > 0 ? azFF.ref : azSet;
-    azChart.data.datasets[1].label = azFF.ref.length > 0
-      ? 'trajectory ref (°)' : 'setpoint (°)';
-    azChart.data.datasets[2].data = azCmd;
-    azChart.update();
+    // Guarded so a missing Chart.js doesn't kill the liveness/status update
+    // below.
+    if (azChart) {
+      azChart.data.datasets[0].data = azFF.err.length > 0 ? azFF.err : azErr;
+      azChart.data.datasets[0].label = azFF.err.length > 0
+        ? 'tracking error (°)' : 'error (°)';
+      azChart.data.datasets[1].data = azFF.ref.length > 0 ? azFF.ref : azSet;
+      azChart.data.datasets[1].label = azFF.ref.length > 0
+        ? 'trajectory ref (°)' : 'setpoint (°)';
+      azChart.data.datasets[2].data = azCmd;
+      azChart.update();
+    }
 
     // El chart: same pattern — FF-derived when present, else legacy.
-    elChart.data.datasets[0].data = elFF.err.length > 0 ? elFF.err : elErr;
-    elChart.data.datasets[0].label = elFF.err.length > 0
-      ? 'tracking error (°)' : 'error (°)';
-    elChart.data.datasets[1].data = elFF.ref.length > 0 ? elFF.ref : elSet;
-    elChart.data.datasets[1].label = elFF.ref.length > 0
-      ? 'trajectory ref (°)' : 'setpoint (°)';
-    elChart.data.datasets[2].data = elCmd;
-    elChart.update();
+    if (elChart) {
+      elChart.data.datasets[0].data = elFF.err.length > 0 ? elFF.err : elErr;
+      elChart.data.datasets[0].label = elFF.err.length > 0
+        ? 'tracking error (°)' : 'error (°)';
+      elChart.data.datasets[1].data = elFF.ref.length > 0 ? elFF.ref : elSet;
+      elChart.data.datasets[1].label = elFF.ref.length > 0
+        ? 'trajectory ref (°)' : 'setpoint (°)';
+      elChart.data.datasets[2].data = elCmd;
+      elChart.update();
+    }
 
     // Liveness status — always use the newest sample in the full payload,
     // not the windowed subset, so the pill reflects whether PositionLogger
