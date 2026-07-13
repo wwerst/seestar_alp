@@ -692,17 +692,22 @@ def test_pick_auto_calibration_targets_filters_altitude_band(monkeypatch):
         assert 60.0 <= c.el_deg <= 80.0
 
 
-def test_pick_auto_calibration_targets_returns_empty_when_obscured(monkeypatch):
-    """Empty visible list → empty result, not a crash. The REST handler
-    relies on this to surface a clear error instead of starting a
-    doomed run."""
+def test_pick_auto_calibration_targets_falls_back_to_synthetic(monkeypatch):
+    """Empty catalog → synthetic sky waypoints inside the altitude
+    window, not an empty list. The onboard plate-solver doesn't need a
+    named target, so a hands-free run proceeds even when the curated
+    catalog has nothing in the operator's visible-sky cone."""
     import device.nighttime_calibration as nc
     import scripts.trajectory.celestial_targets as ct
 
     monkeypatch.setattr(ct, "filter_visible", lambda *a, **k: [])
     monkeypatch.setattr(ct, "all_targets", lambda when, site: [])
     candidates = nc.pick_auto_calibration_targets(_site())
-    assert candidates == []
+    assert candidates
+    assert all(c.kind == "sky" for c in candidates)
+    assert all(
+        nc.AUTO_MIN_ALT_DEG <= c.el_deg <= nc.AUTO_MAX_ALT_DEG for c in candidates
+    )
 
 
 def test_auto_runner_drives_session_to_three_successes(tmp_path, monkeypatch):
