@@ -33,9 +33,37 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
-import rasterio
-from pyproj import Geod
-from rasterio.windows import Window
+
+# The geospatial stack (rasterio -> native GDAL, pyproj) is the optional
+# "terrain" extra, not a core dependency. Merely importing this module
+# (e.g. package-introspection tooling) must not crash when it's absent;
+# _require_terrain_deps() raises a clear install hint at USE time.
+try:
+    import rasterio
+    from pyproj import Geod
+    from rasterio.windows import Window
+
+    _TERRAIN_IMPORT_ERROR: ImportError | None = None
+except ImportError as _exc:  # pragma: no cover - exercised only w/o extra
+    rasterio = None  # type: ignore[assignment]
+    Geod = None  # type: ignore[assignment]
+    Window = None  # type: ignore[assignment]
+    _TERRAIN_IMPORT_ERROR = _exc
+
+
+def _require_terrain_deps() -> None:
+    """Raise a clear install hint if the optional terrain extra is missing.
+
+    Called at the top of every function that touches rasterio/pyproj so
+    the failure surfaces at use time with an actionable message rather
+    than an opaque ``NameError`` on ``None``.
+    """
+    if _TERRAIN_IMPORT_ERROR is not None:
+        raise ImportError(
+            "terrain line-of-sight requires the optional geospatial "
+            "dependencies (rasterio, pyproj); install them with "
+            "'pip install seestar_alp[terrain]'"
+        ) from _TERRAIN_IMPORT_ERROR
 
 
 # Default terrestrial-refraction coefficient. Mirrors the default on
@@ -118,6 +146,7 @@ def _great_circle_samples(
 
     Returns ``(lats, lons, dists_from_obs_m, total_path_m)``.
     """
+    _require_terrain_deps()
     if geod is None:
         geod = Geod(ellps="WGS84")
     n_interior = max(1, int(n_interior))
@@ -152,6 +181,7 @@ def _bilinear_sample_dem(
     the nearest edge cell (the caller is expected to size the DEM to
     cover the intended path).
     """
+    _require_terrain_deps()
     inv = ~dataset.transform
     # Affine inverse: (lon, lat) → (col, row) in pixel coordinates.
     # Rasterio/GIS convention: pixel (0, 0) covers the half-open
@@ -280,6 +310,7 @@ def _default_dem_provider(
     Non-``srtm1`` sources raise ``NotImplementedError`` — a Phase 2
     hook for 3DEP / LARIAC.
     """
+    _require_terrain_deps()
     if source != "srtm1":
         raise NotImplementedError(
             f"DEM source {source!r} is not available in MVP; "
@@ -314,6 +345,7 @@ def dem_lookup_elevation(
     telescope eyepiece altitude should add ``platform_height_agl +
     eye_height_agl`` themselves.
     """
+    _require_terrain_deps()
     if dem_provider is None:
         dem_provider = _default_dem_provider
     try:
@@ -379,6 +411,7 @@ def check_los(
         ``h_los >= DEM(sample)``. ``used_refraction_k`` echoes the
         applied coefficient so the caller can log it.
     """
+    _require_terrain_deps()
     if k is None:
         k = DEFAULT_K
     if dem_provider is None:
