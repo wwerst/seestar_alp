@@ -422,3 +422,173 @@ def test_time_offset_shifts_query_time(tmp_path):
     )
     assert result.exit_reason == "end_of_track"
     assert result.ticks == 0
+
+
+# --------- live / growing provider handling (finding 1) ------------------
+
+
+class _FakeReferenceProvider:
+    """Minimal provider whose valid_range() and liveness are configurable so
+    the controller's end-of-track vs stall logic can be exercised without a
+    real ADS-B feed."""
+
+    def __init__(self, t0, tail_fn, *, is_live, extrapolation_s=1.0, stale=False):
+        self._t0 = t0
+        self._tail_fn = tail_fn
+        self.is_live = is_live
+        self.extrapolation_s = extrapolation_s
+        self._stale = stale
+
+    def valid_range(self):
+        return (self._t0, self._tail_fn())
+
+    def sample(self, t):
+        from device.reference_provider import ReferenceSample
+
+        return ReferenceSample(
+            t_unix=float(t),
+            az_cum_deg=0.0,
+            el_deg=45.0,
+            v_az_degs=0.0,
+            v_el_degs=0.0,
+            a_az_degs2=0.0,
+            a_el_degs2=0.0,
+            stale=self._stale,
+            extrapolated=self._stale,
+        )
+
+
+def test_track_growing_live_provider_does_not_end_early(monkeypatch):
+    """Regression: a live provider whose valid_range() tail advances with
+    wall-clock time must not trip 'end_of_track' one extrapolation horizon
+    after start. The controller must re-read valid_range() every tick."""
+    import device.streaming_controller as sc
+
+    # Deterministic regardless of time of day / sun position.
+    monkeypatch.setattr(sc, "_is_sun_safe", lambda az, el: (True, ""))
+
+    provider = _FakeReferenceProvider(
+        t0=time.time() - 1.0,
+        tail_fn=time.time,  # tail keeps up with wall clock — still growing
+        is_live=True,
+        extrapolation_s=1.0,
+    )
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=45.0)
+
+    result = track(cli, provider, dry_run=True, tick_dt=0.5, max_duration_s=2.0)
+
+    # With the fix it runs the full window and times out. The pre-fix bug
+    # read the tail once and exited 'end_of_track' after ~1 horizon.
+    assert result.exit_reason == "timeout", (result.exit_reason, result.errors)
+    assert result.ticks >= 3
+
+
+def test_track_live_provider_stall_exits_stall(monkeypatch):
+    """A live provider whose buffer stops advancing (frozen valid_range())
+    exits 'stall', not a false 'end_of_track'."""
+    import device.streaming_controller as sc
+
+    monkeypatch.setattr(sc, "_is_sun_safe", lambda az, el: (True, ""))
+
+    t0 = time.time() - 0.1
+    frozen_tail = t0 + 0.2
+    provider = _FakeReferenceProvider(
+        t0=t0,
+        tail_fn=lambda: frozen_tail,  # tail never advances → stalled buffer
+        is_live=True,
+        extrapolation_s=1.0,
+        stale=True,
+    )
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=45.0)
+
+    # Disable the stale-streak exit so the horizon-based stall path is the
+    # one under test.
+    result = track(
+        cli,
+        provider,
+        dry_run=True,
+        tick_dt=0.5,
+        max_duration_s=5.0,
+        stale_tolerance_ticks=1000,
+    )
+    assert result.exit_reason == "stall", (result.exit_reason, result.errors)
+
+
+def test_track_static_provider_horizon_is_end_of_track(monkeypatch):
+    """A non-live provider that runs past its extrapolation horizon still
+    exits cleanly as 'end_of_track' (not 'stall')."""
+    import device.streaming_controller as sc
+
+    monkeypatch.setattr(sc, "_is_sun_safe", lambda az, el: (True, ""))
+
+    t0 = time.time() - 0.1
+    provider = _FakeReferenceProvider(
+        t0=t0,
+        tail_fn=lambda: t0 + 0.2,
+        is_live=False,  # static
+        extrapolation_s=1.0,
+    )
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=45.0)
+
+    result = track(cli, provider, dry_run=True, tick_dt=0.5, max_duration_s=5.0)
+    assert result.exit_reason == "end_of_track", (result.exit_reason, result.errors)
+
+
+def test_per_tick_sun_check_uses_calibrated_sky_frame(monkeypatch):
+    """The runtime sun net must check the *sky* pointing: with a yawed mount
+    frame the reference's mount az is rotated into sky az before is_sun_safe,
+    instead of being fed in raw."""
+    import device.streaming_controller as sc
+    from device.streaming_controller import _mount_azel_to_sky
+    from device.target_frame import MountFrame
+
+    yaw_deg = 30.0
+    yaw_frame = MountFrame.from_euler_deg(yaw_deg=yaw_deg, pitch_deg=0.0, roll_deg=0.0)
+
+    captured: list[tuple[float, float]] = []
+
+    def _capture(az, el):
+        captured.append((az, el))
+        return (True, "")
+
+    monkeypatch.setattr(sc, "_is_sun_safe", _capture)
+
+    class _FrameProvider:
+        mount_frame = yaw_frame
+        extrapolation_s = 5.0
+        is_live = False
+
+        def valid_range(self):
+            now = time.time()
+            return (now - 1.0, now + 10.0)
+
+        def sample(self, t):
+            from device.reference_provider import ReferenceSample
+
+            return ReferenceSample(
+                t_unix=float(t),
+                az_cum_deg=0.0,
+                el_deg=0.0,
+                v_az_degs=0.0,
+                v_el_degs=0.0,
+                a_az_degs2=0.0,
+                a_el_degs2=0.0,
+                stale=False,
+                extrapolated=False,
+            )
+
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=0.0)
+
+    track(cli, _FrameProvider(), dry_run=True, tick_dt=0.5, max_duration_s=0.9)
+
+    assert captured, "sun check was never called"
+    exp_az, exp_el = _mount_azel_to_sky(yaw_frame, 0.0, 0.0)
+    got_az, got_el = captured[0]
+    assert abs(got_az - exp_az) < 1e-6
+    assert abs(got_el - exp_el) < 1e-6
+    # And it must NOT be the raw mount az (0°) — the yaw offset shifts it.
+    assert abs(got_az - 0.0) > 1.0

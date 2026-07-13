@@ -22,12 +22,13 @@ front-end overlay.
 
 from __future__ import annotations
 
+import logging
 import math
 import signal
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 from astropy.coordinates import EarthLocation
@@ -44,6 +45,9 @@ from device.velocity_controller import (
     speed_move,
     wrap_pm180,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 TICK_DT_S = 0.5
@@ -276,6 +280,15 @@ def track(
     t0_wall = time.monotonic()
     prov_t0, prov_t1 = provider.valid_range()
 
+    # The per-tick sun-avoidance net checks the *sky* pointing, so it needs
+    # to un-rotate the reference (which is expressed in the mount frame) back
+    # through the provider's calibrated MountFrame. Uncalibrated/identity
+    # frames leave the values unchanged, so a missing frame degrades to the
+    # previous conservative "mount az/el treated as sky" behavior.
+    sun_mount_frame = getattr(provider, "mount_frame", None)
+    if sun_mount_frame is None:
+        sun_mount_frame = getattr(provider, "_mount_frame", None)
+
     # Measure initial position so cumulative-az tracker is anchored.
     try:
         alt0, az0_wrapped, _fw_t0 = measure_altaz_timed(
@@ -441,9 +454,26 @@ def track(
 
             # 2. Sample provider at latency-compensated time (+ user time offset).
             t_query = time.time() + latency_s + off.time_offset_s
-            if t_query > prov_t1 + provider.__dict__.get("extrapolation_s", 1.0):
-                # Past extrapolation horizon — a graceful end-of-track.
-                exit_reason = "end_of_track"
+            # Re-read the range every tick: a live provider's buffer grows
+            # between ticks, so a range captured once before the loop would
+            # spuriously trip end-of-track ~one extrapolation horizon after
+            # start. getattr (not __dict__.get) so a class-level
+            # extrapolation_s is honored, not silently defaulted.
+            prov_t0, prov_t1 = provider.valid_range()
+            horizon_s = getattr(provider, "extrapolation_s", 1.0)
+            if t_query > prov_t1 + horizon_s:
+                # Past the extrapolation horizon. For a finite/static provider
+                # this is the clean end of the recorded track. For a live
+                # provider whose buffer simply stopped advancing it is a
+                # stall — surface that instead of a false completion.
+                if getattr(provider, "is_live", False):
+                    exit_reason = "stall"
+                    errors.append(
+                        f"live provider buffer stalled: t_query={t_query:.3f} past "
+                        f"tail={prov_t1:.3f} + horizon={horizon_s:.1f}s"
+                    )
+                else:
+                    exit_reason = "end_of_track"
                 break
             try:
                 ref = provider.sample(t_query)
@@ -525,10 +555,21 @@ def track(
             #     just catches trajectories whose provider output rolls
             #     into the cone mid-run so we abort before the mount
             #     commits to the slew.
-            sun_safe, sun_reason = _is_sun_safe(
-                ref.az_cum_deg % 360.0,
-                float(ref.el_deg),
-            )
+            if sun_mount_frame is not None:
+                try:
+                    sun_az, sun_el = _mount_azel_to_sky(
+                        sun_mount_frame, ref.az_cum_deg % 360.0, float(ref.el_deg)
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "mount->sky transform for sun check failed (%s); "
+                        "falling back to mount az/el",
+                        exc,
+                    )
+                    sun_az, sun_el = ref.az_cum_deg % 360.0, float(ref.el_deg)
+            else:
+                sun_az, sun_el = ref.az_cum_deg % 360.0, float(ref.el_deg)
+            sun_safe, sun_reason = _is_sun_safe(sun_az, sun_el)
             if not sun_safe:
                 exit_reason = "sun_avoidance"
                 errors.append(sun_reason)
@@ -665,6 +706,30 @@ def _clip_scalar(x: float, lo: float, hi: float) -> float:
     if x > hi:
         return hi
     return x
+
+
+def _mount_azel_to_sky(
+    mount_frame: Any, az_deg: float, el_deg: float
+) -> tuple[float, float]:
+    """Rotate a mount-frame (az, el) into topocentric sky (az, el).
+
+    ``MountFrame.topo_to_mount`` rotates topocentric ENU into the mount
+    frame; being a rotation it is orthonormal, so its transpose inverts it.
+    An identity frame (uncalibrated) returns the input unchanged, which is
+    exactly the conservative fallback the sun-safety net used before.
+    """
+    r = np.asarray(mount_frame.topo_to_mount, dtype=float)
+    az = math.radians(az_deg)
+    el = math.radians(el_deg)
+    # Mount-ENU unit vector, matching MountFrame.ecef_to_mount_azel's
+    # az = atan2(east, north), el = arcsin(up) convention.
+    east = math.cos(el) * math.sin(az)
+    north = math.cos(el) * math.cos(az)
+    up = math.sin(el)
+    topo = r.T @ np.array([east, north, up], dtype=float)
+    sky_az = (math.degrees(math.atan2(float(topo[0]), float(topo[1]))) + 360.0) % 360.0
+    sky_el = math.degrees(math.asin(max(-1.0, min(1.0, float(topo[2])))))
+    return sky_az, sky_el
 
 
 def _build_result(

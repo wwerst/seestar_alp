@@ -126,3 +126,12 @@ def test_rejects_too_few_samples(tmp_path):
     mf = MountFrame.from_identity_enu()
     with pytest.raises(ValueError):
         JsonlECEFProvider(path, mf)
+
+
+def test_jsonl_provider_is_not_live(fixture_path):
+    """The file-backed provider is static/finite, so the streaming controller
+    treats hitting the extrapolation horizon as a clean end-of-track rather
+    than a live-buffer stall."""
+    mf = MountFrame.from_identity_enu()
+    p = JsonlECEFProvider(fixture_path, mf)
+    assert p.is_live is False

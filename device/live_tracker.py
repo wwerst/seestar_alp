@@ -20,6 +20,7 @@ Scope:
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -34,6 +35,7 @@ from astropy.coordinates import EarthLocation
 
 from device.alpaca_client import AlpacaClient
 from device.config import Config
+from device.geometry import unwrap_az_series
 from device.plant_limits import AzimuthLimits, CumulativeAzTracker
 from device.reference_provider import (
     DEFAULT_EXTRAPOLATION_S,
@@ -44,6 +46,7 @@ from device.reference_provider import (
 from device.streaming_controller import (
     OffsetSnapshot,
     TickInfo,
+    pre_check,
     track,
 )
 from device.target_frame import MountFrame
@@ -65,6 +68,20 @@ from scripts.trajectory.observer import (
     ecef_array_to_topo,
     lla_to_ecef,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+class PreCheckFailed(ValueError):
+    """Raised when a live-track trajectory fails its feasibility pre-check.
+
+    The message is a human-readable reason (elevation-band or cable-wrap
+    hard-stop violation). ``front/app.py`` catches
+    ``device.live_tracker.PreCheckFailed`` and maps it to an HTTP 400 so the
+    UI can surface the reason instead of silently commanding an infeasible
+    slew.
+    """
 
 
 # ---------- bounds ----------------------------------------------------
@@ -248,7 +265,13 @@ class _LiveBuffer:
 
     def append(self, t_unix: float, ecef_xyz: tuple[float, float, float]) -> None:
         with self._lock:
-            if self._samples and self._samples[-1].t_unix == t_unix:
+            # Keep the buffer strictly monotonic in t_unix. Samples are now
+            # backdated by the feed's per-aircraft position age (seen_pos),
+            # so re-polling a stale position yields the same (or an earlier)
+            # timestamp — drop those. np.interp and the unwrap downstream
+            # assume a sorted, non-duplicated time axis, so an equal/backdated
+            # stamp must not be appended.
+            if self._samples and t_unix <= self._samples[-1].t_unix:
                 return
             self._samples.append(_LiveSample(t_unix=t_unix, ecef=ecef_xyz))
             self._gen += 1
@@ -286,6 +309,12 @@ class LiveADSBProvider:
     extrapolation has no derivative-of-derivative to swing around, so
     rebuilds produce sub-degree discontinuities even at low sample rates.
     """
+
+    # Live/growing provider: its valid_range() extends as new ADS-B samples
+    # arrive. The streaming controller uses this to treat hitting the
+    # extrapolation horizon as a stall (buffer stopped advancing) rather than
+    # a clean end-of-track.
+    is_live = True
 
     def __init__(
         self,
@@ -343,11 +372,20 @@ class LiveADSBProvider:
             self._a_el = np.asarray(traj["a_el_degs2"], dtype=float)
         else:
             # Too few samples for rate smoothing; still build a usable
-            # linear-interp table with forward-diff velocities.
+            # linear-interp table with forward-diff velocities. Use the
+            # guarded device.geometry.unwrap_az_series so a single non-finite
+            # az reading (degenerate ECEF->ENU) is rejected at the boundary
+            # instead of silently poisoning the whole interpolation table.
             az, el, _slant = self._mount_frame.ecef_array_to_mount(ecef)
-            from scripts.trajectory.observer import unwrap_az_series
-
-            az_cum = unwrap_az_series(az)
+            try:
+                az_cum = np.asarray(unwrap_az_series(az.tolist()), dtype=float)
+            except ValueError as exc:
+                logger.warning(
+                    "LiveADSBProvider._rebuild: unwrap_az_series rejected a "
+                    "non-finite az sample (%s); skipping this rebuild",
+                    exc,
+                )
+                return
             self._t_arr = np.asarray(t, dtype=float)
             self._az_cum = az_cum
             self._el = el
@@ -600,7 +638,16 @@ class TargetCatalog:
                 self._live_stop.wait(timeout=wait)
 
     def _poll_once(self) -> bool:
-        """Returns True if data was received, False on failure (for backoff)."""
+        """Poll adsb.fi once and fold the result into the live buffers.
+
+        Returns True on a successful fetch+parse — including an empty but
+        valid response (no aircraft currently overhead). Returns False only
+        on a genuine fetch failure (``poll_once_adsbfi`` returns ``None`` on
+        HTTP/JSON errors), which is what drives the caller's exponential
+        backoff. Falling through the success path used to return ``None``,
+        so every good poll looked like a failure and backed the poller off
+        from 5 s to 60 s.
+        """
         site = self._site_lazy()
         # 100 km ≈ 54 nm radius around the observer. adsb.fi's endpoint
         # takes a radius in nautical miles, not km.
@@ -610,7 +657,8 @@ class TargetCatalog:
             site.lon_deg,
             dist_nm=54.0,
         )
-        if not ac_list:
+        if ac_list is None:
+            # Genuine fetch failure (HTTP error / bad JSON) → back off.
             return False
         t_now = time.time()
         for ac in ac_list:
@@ -626,6 +674,20 @@ class TargetCatalog:
             icao24, callsign, s = parsed
             if s.alt_m > MAX_ALT_M:
                 continue
+            # Backdate the sample by the feed's reported position age so the
+            # buffer timestamp reflects when the aircraft was actually there,
+            # not when we polled. adsb.fi's seen_pos runs 2-15 s on a busy
+            # feed; ignoring it makes the mount trail the target by degrees.
+            raw_seen = ac.get("seen_pos")
+            try:
+                seen_pos = float(raw_seen) if raw_seen is not None else None
+            except (TypeError, ValueError):
+                seen_pos = None
+            t_sample = (
+                t_now - seen_pos
+                if (seen_pos is not None and seen_pos >= 0.0)
+                else t_now
+            )
             ecef = tuple(float(x) for x in lla_to_ecef(s.lat, s.lon, s.alt_m))
             with self._live_lock:
                 buf = self._live_buffers.get(icao24)
@@ -634,7 +696,7 @@ class TargetCatalog:
                     self._live_buffers[icao24] = buf
                 elif callsign and not buf.callsign:
                     buf.callsign = callsign
-            buf.append(t_now, ecef)
+            buf.append(t_sample, ecef)
             # Cache instantaneous geometry for ranking + UI display.
             try:
                 arr = np.asarray([ecef], dtype=float)
@@ -661,8 +723,12 @@ class TargetCatalog:
                     buf.current_velocity_mps = float(s.velocity_mps)
                 if s.heading_deg is not None:
                     buf.current_heading_deg = float(s.heading_deg)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("live geometry cache update failed: %s", exc)
+        # Successful fetch+parse (an empty ac_list is still a success — the
+        # sky was simply clear). Signal success so the poller does not back
+        # off on a healthy but quiet feed.
+        return True
 
     @staticmethod
     def _extract_ground_aircraft(
@@ -965,7 +1031,14 @@ class LiveTrackSession:
             self._phase = "stopped"
         return True
 
-    def _auto_slew(self, cli, loc) -> None:
+    def _auto_slew(
+        self,
+        cli,
+        loc,
+        *,
+        az_limits: AzimuthLimits | None = None,
+        az_tracker: CumulativeAzTracker | None = None,
+    ) -> None:
         """Point the mount at the target's current sky position before
         engaging the streaming loop. Two steps:
 
@@ -992,6 +1065,12 @@ class LiveTrackSession:
         interrupted (no `stop_signal` parameter), so worst-case latency
         is one in-flight move (~10 s on a big unstow) rather than the
         full pre-slew duration.
+
+        `az_limits` + `az_tracker` are threaded into every pre-slew
+        `move_to_ff` so its cumulative-aware planner keeps the path inside
+        the ±450° cable-wrap hard stop. Without them `move_to_ff` plans in
+        wrapped az and can drive across the hard stop while un-stowing or
+        acquiring the target.
         """
         with self._lock:
             self._phase = "pre_slew"
@@ -1016,6 +1095,16 @@ class LiveTrackSession:
             with self._lock:
                 self._errors.append(f"pre-slew measure_altaz failed: {exc}")
             return
+
+        # Anchor the cumulative-az tracker to the encoder reading before any
+        # cumulative-aware move_to_ff runs. move_to_ff reads its starting
+        # cumulative az from az_tracker.cum_az_deg; an unanchored (fresh)
+        # tracker would report 0 and desync the plan from the real mount.
+        if az_tracker is not None:
+            try:
+                az_tracker.update(cur_az_wrapped)
+            except Exception as exc:
+                logger.debug("pre-slew az_tracker anchor failed: %s", exc)
 
         # --- 2. Unstow if below -30° elevation (scenery mode cannot reliably
         #       command gotos from the -90° mechanical floor).
@@ -1044,6 +1133,8 @@ class LiveTrackSession:
                     loc=loc,
                     tag="[unstow]",
                     position_logger=self._position_logger,
+                    az_limits=az_limits,
+                    az_tracker=az_tracker,
                     el_min_deg=-85.0,
                     el_max_deg=85.0,
                     arrive_tolerance_deg=1.0,
@@ -1094,6 +1185,11 @@ class LiveTrackSession:
                 self._errors.append(sun_reason)
                 self._exit_reason = "sun_avoidance"
                 self._phase = "refused"
+            # Terminal: signal stop so nothing downstream re-enters the
+            # tracking loop and clobbers this refusal. `_run` also detects
+            # the already-set exit_reason and returns without overwriting
+            # phase/exit_reason.
+            self._stop_evt.set()
             if self._position_logger is not None:
                 try:
                     self._position_logger.mark_event(
@@ -1129,6 +1225,8 @@ class LiveTrackSession:
                 loc=loc,
                 tag="[pre_slew]",
                 position_logger=self._position_logger,
+                az_limits=az_limits,
+                az_tracker=az_tracker,
                 el_min_deg=-30.0,
                 el_max_deg=85.0,
                 arrive_tolerance_deg=0.8,
@@ -1153,6 +1251,28 @@ class LiveTrackSession:
                     f"pre-slew did not converge (final az={new_az:+.2f}° "
                     f"el={new_el:+.2f}°)"
                 )
+
+    def _resolve_az_limits(self) -> AzimuthLimits | None:
+        """Session cable-wrap limits: the caller-supplied ones, else the
+        persisted plant limits. Returns None if neither is available (the CLI
+        prints the same warning — cable-wrap enforcement is simply off)."""
+        if self._az_limits is not None:
+            return self._az_limits
+        try:
+            return AzimuthLimits.load()
+        except Exception as exc:
+            logger.debug("AzimuthLimits.load() failed: %s", exc)
+            return None
+
+    def pre_check_feasibility(self) -> "Any":  # noqa: F821 (PreCheckResult)
+        """Walk the provider trajectory and report whether it is trackable.
+
+        Mirrors the CLI track path's pre-flight: verifies the whole planned
+        trajectory stays inside the elevation band and the cable-wrap range
+        before any motion is commanded. Raised as PreCheckFailed by
+        LiveTrackManager.start when infeasible.
+        """
+        return pre_check(self._provider, az_limits=self._resolve_az_limits())
 
     def _run(self) -> None:
         cli = AlpacaClient(self._alpaca_host, self._alpaca_port, self.telescope_id)
@@ -1183,6 +1303,10 @@ class LiveTrackSession:
                 self._errors.append(f"PositionLogger start failed: {exc}")
             self._position_logger = None
 
+        # Resolve cable-wrap limits once; the pre-slew and the streaming loop
+        # both enforce the same hard stops.
+        az_limits = self._resolve_az_limits()
+
         try:
             tracker: CumulativeAzTracker | None = None
             try:
@@ -1194,7 +1318,15 @@ class LiveTrackSession:
                 if self._stop_evt.is_set():
                     pass
                 else:
-                    self._auto_slew(cli, loc)
+                    self._auto_slew(cli, loc, az_limits=az_limits, az_tracker=tracker)
+
+            # A terminal pre-slew outcome (e.g. sun refusal) has already set
+            # exit_reason/phase; do not fall through into track() and clobber
+            # them.
+            with self._lock:
+                already_terminal = self._exit_reason is not None
+            if already_terminal:
+                return
 
             # If stop was requested during pre-slew (either detected by a
             # checkpoint inside _auto_slew, or arriving after it returned),
@@ -1213,7 +1345,7 @@ class LiveTrackSession:
                 result = track(
                     cli,
                     self._provider,
-                    az_limits=self._az_limits,
+                    az_limits=az_limits,
                     az_tracker=tracker,
                     position_logger=self._position_logger,
                     stop_signal=self._stop_evt,
@@ -1242,6 +1374,35 @@ class LiveTrackSession:
                     self._position_logger.stop()
                 except Exception:
                     pass
+            # Direct motor stop bypassing the lockout-aware wrapper. track()'s
+            # own finally issues speed_move(cli, 0, 0), but SunSafetyMonitor
+            # refuses speed_move while an emergency lockout is held — so the
+            # exit stop is swallowed and the last tick's command keeps running
+            # until its firmware dur_sec TTL expires. Command scope_speed_move
+            # directly so the motor halts on session exit regardless of
+            # lockout state. Mirrors CalibrateMotionSession._run.
+            # Exception: while the monitor's emergency jog-away is executing,
+            # this raw stop would cancel it and strand the mount inside the
+            # sun cone; the jog's own firmware dur_sec bounds the motion, so
+            # skipping is safe.
+            if not self.dry_run:
+                from device.sun_safety import sun_safety_jog_in_progress
+
+                if sun_safety_jog_in_progress():
+                    logger.warning(
+                        "session-exit motor stop skipped: sun-safety jog in progress"
+                    )
+                else:
+                    try:
+                        cli.method_sync(
+                            "scope_speed_move",
+                            {"speed": 0, "angle": 0, "dur_sec": 1},
+                        )
+                    except Exception:
+                        with self._lock:
+                            self._errors.append(
+                                "outer motor-stop on session exit failed"
+                            )
 
 
 # ---------- LiveTrackManager -----------------------------------------
@@ -1295,6 +1456,47 @@ class LiveTrackManager:
                     )
             except ImportError:
                 pass
+            # Refuse if a visibility-map run owns this mount.
+            try:
+                from device.visibility_mapper import get_visibility_manager
+
+                if get_visibility_manager().is_running(tid):
+                    raise RuntimeError(
+                        f"telescope {tid} is running a visibility map; stop it first"
+                    )
+            except ImportError:
+                pass
+            # Refuse if a nighttime auto-run owns this mount. The auto manager
+            # may not expose is_running() yet (added in tandem), so fall back
+            # to get()/is_alive().
+            try:
+                from device.nighttime_calibration import get_nighttime_auto_manager
+
+                auto_mgr = get_nighttime_auto_manager()
+                if hasattr(auto_mgr, "is_running"):
+                    auto_running = auto_mgr.is_running(tid)
+                else:
+                    runner = auto_mgr.get(tid)
+                    auto_running = runner is not None and runner.is_alive()
+                if auto_running:
+                    raise RuntimeError(
+                        f"telescope {tid} has a nighttime auto-run in flight; "
+                        "stop it first"
+                    )
+            except ImportError:
+                pass
+            # Feasibility gate: refuse a trajectory that would leave the
+            # elevation band or cross the cable-wrap hard stop before any
+            # motion is commanded. front/app.py maps PreCheckFailed → HTTP
+            # 400. Guarded by getattr so non-session test doubles skip it.
+            check = getattr(session, "pre_check_feasibility", None)
+            if callable(check):
+                pre = check()
+                if pre is not None and not pre.feasible:
+                    reason = "; ".join(pre.notes) or "trajectory infeasible"
+                    raise PreCheckFailed(
+                        f"telescope {tid} track pre-check failed: {reason}"
+                    )
             with self._lock:
                 existing = self._sessions.get(tid)
                 if existing is not None and existing.is_alive():
