@@ -818,9 +818,11 @@ def pick_auto_calibration_targets(
     around windows are supported (``min`` > ``max`` reads as a band
     crossing 0°).
 
-    Falls back to an empty list when the catalog is fully obscured by
-    altitude/sun/moon constraints — caller should surface a clear
-    message rather than start a doomed run.
+    Falls back to synthetic az/el waypoints (see
+    :func:`pick_synthetic_waypoints`) when no cataloged target survives
+    the altitude/azimuth/magnitude filters — the onboard plate-solver
+    doesn't need a named target, so the hands-free run can still
+    proceed inside the operator's declared sky window.
     """
     from scripts.trajectory.celestial_targets import (
         all_targets,
@@ -1075,16 +1077,22 @@ class NighttimeAutoRunner:
                     self._mark_state(state, "ok", None)
                 else:
                     self._mark_state(state, "fail", reason)
+            # Snapshot before taking the lock: _count_successes() acquires
+            # the same non-reentrant lock, so calling it inside the block
+            # below deadlocks the runner thread (and then every status()
+            # poller) forever. Safe here — the loop is done, so this
+            # thread is the only writer of candidate states.
+            n_ok = self._count_successes()
             with self._lock:
                 if self._stop_evt.is_set():
                     self._phase = "cancelled"
-                elif self._count_successes() >= self.n_success_target:
+                elif n_ok >= self.n_success_target:
                     self._phase = "done"
                 else:
                     self._phase = "failed"
                     if self._error is None:
                         self._error = (
-                            f"only {self._count_successes()} successful sighting(s) "
+                            f"only {n_ok} successful sighting(s) "
                             f"after {len(self._states)} candidates"
                         )
                 self._current_idx = None
