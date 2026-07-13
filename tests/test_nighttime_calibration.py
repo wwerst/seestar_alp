@@ -629,6 +629,92 @@ def test_radec_to_topocentric_azel_roundtrip():
     assert -90.0 <= el <= 90.0
 
 
+def test_radec_to_topocentric_applies_refraction():
+    """The transform must return the *apparent* elevation (refraction
+    applied), not the airless geometric one — otherwise the rotation fit
+    is biased against the mount, which points at the apparent position.
+
+    Refraction lifts apparent elevation above the airless value; at
+    ~55–70° the lift is sub-arcminute-to-~arcminute. We locate a target
+    that is high right now (by scanning RA at a dec that transits ~70°
+    above the site) and compare the module's output against a pressure=0
+    (airless) AltAz.
+    """
+    from astropy import units as u
+    from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+    from astropy.time import Time
+
+    site = _site()
+    t = time.time()
+    loc = EarthLocation.from_geodetic(
+        lon=site.lon_deg * u.deg,
+        lat=site.lat_deg * u.deg,
+        height=site.alt_m * u.m,
+    )
+    aa_airless = AltAz(obstime=Time(t, format="unix"), location=loc)  # pressure=0
+    dec = site.lat_deg - 20.0  # transits ~70° above the horizon
+    # Find the RA that is highest right now (nearest the meridian).
+    best_ra, best_el = None, -90.0
+    for ra in range(0, 360, 5):
+        sky = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+        el = float(sky.transform_to(aa_airless).alt.deg)
+        if el > best_el:
+            best_el, best_ra = el, ra
+    assert best_el > 50.0, "expected a high target now for a meaningful test"
+
+    _, el_apparent = radec_to_topocentric_azel(float(best_ra), dec, t, site)
+    # Apparent (refracted) elevation must sit above the airless one, by a
+    # small but non-zero, physically-bounded amount.
+    assert el_apparent > best_el
+    lift_arcmin = (el_apparent - best_el) * 60.0
+    assert 0.0 < lift_arcmin < 2.0, f"refraction lift {lift_arcmin:.3f}' out of range"
+
+
+def test_refit_failure_clears_stale_solution(tmp_path, monkeypatch):
+    """If a refit raises, the previous solution must be dropped so a
+    later apply() can't persist a stale rotation stamped with the (now
+    larger) n_sightings. apply() then refuses with 'no solution'."""
+    import device.nighttime_calibration as nc
+
+    monkeypatch.setattr(
+        nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec)
+    )
+    canned = {}
+    captures = []
+    for i, (az, el) in enumerate([(60.0, 35.0), (180.0, 45.0), (300.0, 35.0)]):
+        img = tmp_path / f"img{i}.jpg"
+        img.write_text("dummy")
+        canned[str(img)] = SolveResult(
+            ra_deg=az,
+            dec_deg=el,
+            fov_x_deg=1.27,
+            fov_y_deg=0.71,
+            position_angle_deg=0.0,
+        )
+        captures.append((img, az, el))
+    session = _make_session(tmp_path, FakePlateSolver(canned))
+    for img, az, el in captures:
+        session.capture_sighting(img, az, el)
+        assert _wait_for(lambda: session.status().pending is None, timeout_s=5.0)
+    # Good fit is present.
+    assert session.status().fit is not None
+    assert session.status().n_accepted == 3
+
+    # Now make the next refit blow up and drive a refit.
+    def _boom(*_a, **_kw):
+        raise RuntimeError("synthetic solver failure")
+
+    monkeypatch.setattr(nc, "solve_rotation_from_pairs", _boom)
+    session._refit_locked()
+
+    st = session.status()
+    assert st.fit is None, "stale solution must be cleared on refit failure"
+    assert st.n_accepted == 3  # sightings themselves are untouched
+    # apply() must refuse rather than persist a stale rotation.
+    with pytest.raises(ValueError, match="no solution"):
+        session.apply()
+
+
 # ---------- auto-calibration ----------------------------------------
 
 

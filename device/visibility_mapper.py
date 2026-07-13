@@ -91,6 +91,12 @@ CANDIDATE_CAP = 200
 # at start (so the file exists for the UI) and once at stop.
 PERSIST_INTERVAL_S = 5.0
 
+# Minimum fraction of the current grid's cells that must match a saved
+# snapshot cell by stable key before a HEALPix resume is accepted. Below
+# this the grids are too misaligned (different site/time dropped a
+# different set of below-horizon pixels) to trust, so we start fresh.
+RESUME_MIN_KEY_FRACTION = 0.5
+
 MIN_RUN_BEFORE_USER_STOP_S = 5 * 60.0
 CONVERGENCE_ELAPSED_S = 30 * 60.0
 CONVERGENCE_MEDIAN_ENTROPY_NATS = 0.08
@@ -152,6 +158,39 @@ def prior_for_alt(alt_deg: float) -> tuple[float, float]:
     if alt_deg >= 20.0:
         return _PRIOR_MID
     return _PRIOR_LOW
+
+
+def _cell_key(cell) -> Optional[str]:
+    """Stable per-cell identity for snapshot matching: rounded RA/Dec.
+
+    RA/Dec pin a HEALPix cell to a fixed patch of sky, independent of the
+    per-session horizon cut that renumbers the array index. Returns
+    ``None`` for cells without equatorial coordinates (alt/az band grids),
+    which the caller restores by index instead.
+    """
+    if cell.ra_deg is None or cell.dec_deg is None:
+        return None
+    return f"{round(float(cell.ra_deg), 3)},{round(float(cell.dec_deg), 3)}"
+
+
+def _cell_key_from_saved(cd: dict) -> Optional[str]:
+    """Recover a cell's stable key from a persisted cell dict.
+
+    Prefers the explicit ``key`` field; falls back to deriving it from a
+    saved ``ra_deg``/``dec_deg`` so snapshots written before the key field
+    existed still align.
+    """
+    k = cd.get("key")
+    if isinstance(k, str):
+        return k
+    ra = cd.get("ra_deg")
+    dec = cd.get("dec_deg")
+    if ra is None or dec is None:
+        return None
+    try:
+        return f"{round(float(ra), 3)},{round(float(dec), 3)}"
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------- callback types ------------------------------------------
@@ -288,22 +327,66 @@ class VisibilityMapper:
             # Schema mismatch — different grid implementation, drop.
             return
         cells = snap.get("cells")
-        if not isinstance(cells, list) or len(cells) != self._n:
+        if not isinstance(cells, list):
+            return
+        if self.grid.kind == "healpix":
+            # HEALPix drops below-horizon pixels, and which survive depends
+            # on the session's site/time — so array index is NOT stable.
+            self._restore_cells_by_key(cells)
+        else:
+            # alt/az band grids keep every cell (index is stable), so an
+            # index-keyed restore lands each posterior on the same sky.
+            self._restore_cells_by_index(cells)
+
+    def _restore_cells_by_index(self, cells: list) -> None:
+        if len(cells) != self._n:
             return
         for i, cd in enumerate(cells):
             if not isinstance(cd, dict):
                 continue
-            try:
-                self._alpha[i] = float(cd.get("alpha", self._prior_alpha[i]))
-                self._beta[i] = float(cd.get("beta", self._prior_beta[i]))
-                self._failure_count[i] = int(cd.get("failure_count", 0))
-                # Reset timestamps so a resume doesn't immediately
-                # re-trigger the recent-failure exclusion: the user
-                # has had to come back, so the 10-min clock starts fresh.
-                self._last_obs_at[i] = -math.inf
-                self._last_failure_at[i] = -math.inf
-            except (TypeError, ValueError):
+            self._restore_one_cell(i, cd)
+
+    def _restore_cells_by_key(self, cells: list) -> None:
+        saved: dict[str, dict] = {}
+        for cd in cells:
+            if not isinstance(cd, dict):
                 continue
+            key = _cell_key_from_saved(cd)
+            if key is not None:
+                saved[key] = cd
+        current_keys = [_cell_key(c) for c in self.grid.cells]
+        n_match = sum(1 for k in current_keys if k is not None and k in saved)
+        if n_match < RESUME_MIN_KEY_FRACTION * self._n:
+            # Grids don't align — restoring anything risks pasting a cell's
+            # posterior onto a different patch of sky. Start fresh.
+            logger.info(
+                "visibility map resume refused for telescope %s: only %d/%d "
+                "healpix cells align by RA/Dec key (site/time changed since the "
+                "snapshot); starting fresh from priors.",
+                self.telescope_id,
+                n_match,
+                self._n,
+            )
+            return
+        for i, key in enumerate(current_keys):
+            if key is None:
+                continue
+            cd = saved.get(key)
+            if cd is not None:
+                self._restore_one_cell(i, cd)
+
+    def _restore_one_cell(self, i: int, cd: dict) -> None:
+        try:
+            self._alpha[i] = float(cd.get("alpha", self._prior_alpha[i]))
+            self._beta[i] = float(cd.get("beta", self._prior_beta[i]))
+            self._failure_count[i] = int(cd.get("failure_count", 0))
+            # Reset timestamps so a resume doesn't immediately re-trigger
+            # the recent-failure exclusion: the user has had to come back,
+            # so the 10-min clock starts fresh.
+            self._last_obs_at[i] = -math.inf
+            self._last_failure_at[i] = -math.inf
+        except (TypeError, ValueError):
+            return
 
     def _persist(self) -> None:
         """Force a snapshot write. Use ``_maybe_persist`` from the loop."""
@@ -314,18 +397,25 @@ class VisibilityMapper:
             return
         with self._lock:
             elapsed = self._elapsed_s_locked()
-            cells = [
-                {
-                    "idx": int(i),
-                    "az_deg": float(self._az[i]),
-                    "alt_deg": float(self._alt[i]),
-                    "alpha": float(self._alpha[i]),
-                    "beta": float(self._beta[i]),
-                    "failure_count": int(self._failure_count[i]),
-                    "n_obs": int(self._n_observations_at[i]),
-                }
-                for i in range(self._n)
-            ]
+            cells = []
+            for i in range(self._n):
+                c = self.grid.cells[i]
+                cells.append(
+                    {
+                        "idx": int(i),
+                        "az_deg": float(self._az[i]),
+                        "alt_deg": float(self._alt[i]),
+                        # Stable identity (HEALPix) so a resume matches cells
+                        # by sky position, not by the renumbered array index.
+                        "ra_deg": (None if c.ra_deg is None else float(c.ra_deg)),
+                        "dec_deg": (None if c.dec_deg is None else float(c.dec_deg)),
+                        "key": _cell_key(c),
+                        "alpha": float(self._alpha[i]),
+                        "beta": float(self._beta[i]),
+                        "failure_count": int(self._failure_count[i]),
+                        "n_obs": int(self._n_observations_at[i]),
+                    }
+                )
             grid_kind = self.grid.kind
             min_alt = self.options.min_alt_deg
             started = self._started_at or 0.0
@@ -936,14 +1026,29 @@ class VisibilityMapManager:
 
     def start(self, mapper: VisibilityMapper) -> VisibilityMapper:
         tid = int(mapper.telescope_id)
-        with self._lock:
-            existing = self._mappers.get(tid)
-            if existing is not None and existing.is_active():
-                raise RuntimeError(
-                    f"telescope {tid} already has a visibility-map run in progress"
-                )
-            self._mappers[tid] = mapper
-        mapper.start()
+        # The mapper drives the mount (slews to each sampled cell), so it
+        # must not run concurrently with any other mount-driving manager.
+        # Hold the shared per-telescope start-lock across the cross-check +
+        # thread-spawn + registry-write so a concurrent start on the same
+        # scope can't slip past the check. Mirrors LiveTrackManager.start;
+        # live-track adds the reciprocal check against this manager.
+        from device._scope_start_lock import (
+            get_scope_start_lock,
+            raise_if_scope_busy,
+        )
+
+        with get_scope_start_lock(tid):
+            raise_if_scope_busy(tid, "a visibility map run", check_visibility=False)
+            with self._lock:
+                existing = self._mappers.get(tid)
+                if existing is not None and existing.is_active():
+                    raise RuntimeError(
+                        f"telescope {tid} already has a visibility-map run in progress"
+                    )
+                # Spawn the worker before publishing the mapper so a
+                # concurrent stop() can't read a not-yet-started mapper.
+                mapper.start()
+                self._mappers[tid] = mapper
         return mapper
 
     def stop(

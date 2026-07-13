@@ -90,15 +90,58 @@ def test_atomic_write_with_custom_encoder(tmp_path):
     assert json.loads(p.read_text()) == {"q": [1, 2, 3]}
 
 
-def test_atomic_write_cleans_stale_tmp_from_prior_crash(tmp_path):
-    """A leftover ``.tmp`` from a prior crashed run is removed before
-    the new write — otherwise the new ``open(..., 'w')`` would silently
-    overwrite a tmp from an unrelated context."""
+def test_atomic_write_ignores_unrelated_stale_tmp(tmp_path):
+    """A leftover ``.tmp`` from a prior crashed run is harmless: the new
+    write uses a *unique* temp (mkstemp) and still produces the correct
+    destination. Unique temps are what let two concurrent writers of the
+    same file avoid clobbering each other, so we no longer touch an
+    arbitrary sibling ``<path>.tmp``."""
     p = tmp_path / "out.json"
     stale = p.with_suffix(p.suffix + ".tmp")
     stale.write_text('{"stale": true}')
     assert stale.exists()
     write_atomic_json(p, {"fresh": True})
     assert json.loads(p.read_text()) == {"fresh": True}
-    # Tmp was cleaned up after rename.
-    assert not stale.exists()
+
+
+def test_atomic_write_leaves_no_temp_on_success(tmp_path):
+    """A successful write consumes its unique temp via os.replace — no
+    ``<name>.*.tmp`` files linger in the destination directory."""
+    p = tmp_path / "out.json"
+    write_atomic_json(p, {"v": 1})
+    write_atomic_json(p, {"v": 2})
+    leftovers = list(tmp_path.glob("out.json.*.tmp"))
+    assert leftovers == [], f"leaked temp files: {leftovers}"
+
+
+def test_atomic_write_concurrent_writers_no_clobber(tmp_path):
+    """Two threads hammering the same destination must not crash or leave
+    a truncated file: with a fixed sibling ``.tmp`` the writers would race
+    on os.replace / clobber each other's temp; with a unique temp each
+    rename is independent and the final file is always one whole payload."""
+    import threading
+
+    p = tmp_path / "out.json"
+    errors: list[Exception] = []
+
+    def writer(val: int) -> None:
+        try:
+            for _ in range(60):
+                write_atomic_json(p, {"v": val})
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=writer, args=(1,))
+    t2 = threading.Thread(target=writer, args=(2,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors, f"concurrent writers raised: {errors}"
+    # Destination is a complete, valid JSON doc (never truncated), and is
+    # one of the two writers' payloads.
+    data = json.loads(p.read_text())
+    assert data in ({"v": 1}, {"v": 2})
+    # No unique temps leaked once both writers finished.
+    assert list(tmp_path.glob("out.json.*.tmp")) == []

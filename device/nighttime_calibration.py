@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Callable
 
 from device._atomic_json import write_atomic_json
+from device.geometry import angular_separation_deg
 from device.plate_solver import (
     PlateSolver,
     PlateSolverFailed,
@@ -133,10 +134,19 @@ def radec_to_topocentric_azel(
     t_unix: float,
     site: ObserverSite,
 ) -> tuple[float, float]:
-    """Convert ICRS (RA, Dec) → topocentric (az, el) for the site at the
-    given UTC time. Uses astropy's AltAz transform — handles precession,
-    nutation, atmospheric refraction (default sea-level NIST conditions),
-    and aberration.
+    """Convert ICRS (RA, Dec) → topocentric **apparent** (az, el) for the
+    site at the given UTC time. Uses astropy's AltAz transform — handles
+    precession, nutation, aberration, and atmospheric refraction.
+
+    Refraction matters: astropy applies it only when the AltAz frame is
+    given a non-zero ``pressure`` (its default is 0 → an *airless*,
+    geometric elevation). The mount points at the apparent position and
+    the daytime/landmark path fits apparent el, so we must return the
+    apparent el here too, otherwise the rotation fit is biased by the
+    refraction offset (~arcminute near 60–80° elevation, growing rapidly
+    toward the horizon). Pressure is derived from the site altitude via a
+    standard-atmosphere scaling of 1013.25 hPa; temperature and
+    observing wavelength use sensible visible-band defaults.
 
     Wrapped here so tests can monkey-patch this single function rather
     than mocking astropy's machinery.
@@ -150,8 +160,20 @@ def radec_to_topocentric_azel(
         lat=site.lat_deg * u.deg,
         height=site.alt_m * u.m,
     )
+    # Standard-atmosphere pressure at the site altitude (scale height
+    # ~8400 m). This is what enables astropy's refraction model.
+    pressure_hpa = 1013.25 * math.exp(-float(site.alt_m) / 8400.0)
     sky = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
-    altaz = sky.transform_to(AltAz(obstime=Time(t_unix, format="unix"), location=loc))
+    altaz = sky.transform_to(
+        AltAz(
+            obstime=Time(t_unix, format="unix"),
+            location=loc,
+            pressure=pressure_hpa * u.hPa,
+            temperature=10.0 * u.deg_C,
+            relative_humidity=0.0,
+            obswl=0.55 * u.micron,
+        )
+    )
     return float(altaz.az.deg), float(altaz.alt.deg)
 
 
@@ -486,6 +508,10 @@ class NighttimeCalibrationSession:
         except Exception as exc:
             with self._lock:
                 self._errors.append(f"refit failed: {exc}")
+                # Drop the previous solution so a subsequent apply() cannot
+                # persist a stale rotation stamped with the (now larger)
+                # n_sightings. apply() refuses when _solution is None.
+                self._solution = None
             return
         with self._lock:
             self._solution = sol
@@ -565,24 +591,32 @@ class NighttimeCalibrationManager:
         self, session: NighttimeCalibrationSession
     ) -> NighttimeCalibrationSession:
         tid = int(session.telescope_id)
-        # Refuse if the live tracker is driving the same mount.
-        try:
-            from device.live_tracker import get_manager as _get_tracker_mgr
+        # Hold the shared per-telescope start-lock across the whole
+        # cross-check + registry-write sequence so this can't race a
+        # concurrent LiveTrackManager.start (or any other mount-driving
+        # manager) on the same scope. Without it the two managers only
+        # lock their own registries → TOCTOU.
+        from device._scope_start_lock import get_scope_start_lock
 
-            tracker = _get_tracker_mgr().get(tid)
-            if tracker is not None and tracker.is_alive():
-                raise RuntimeError(
-                    f"telescope {tid} is live-tracking; stop the tracker first"
-                )
-        except ImportError:
-            pass
-        with self._lock:
-            existing = self._sessions.get(tid)
-            if existing is not None and existing.is_active():
-                raise RuntimeError(
-                    f"telescope {tid} is already in nighttime calibration mode"
-                )
-            self._sessions[tid] = session
+        with get_scope_start_lock(tid):
+            # Refuse if the live tracker is driving the same mount.
+            try:
+                from device.live_tracker import get_manager as _get_tracker_mgr
+
+                tracker = _get_tracker_mgr().get(tid)
+                if tracker is not None and tracker.is_alive():
+                    raise RuntimeError(
+                        f"telescope {tid} is live-tracking; stop the tracker first"
+                    )
+            except ImportError:
+                pass
+            with self._lock:
+                existing = self._sessions.get(tid)
+                if existing is not None and existing.is_active():
+                    raise RuntimeError(
+                        f"telescope {tid} is already in nighttime calibration mode"
+                    )
+                self._sessions[tid] = session
         return session
 
     def stop(self, telescope_id: int) -> NighttimeStatus | None:
@@ -700,22 +734,6 @@ class AutoRunStatus:
     current_idx: int | None
     candidates: list[dict] = field(default_factory=list)
     error: str | None = None
-
-
-def _angular_distance_deg(
-    az1_deg: float, el1_deg: float, az2_deg: float, el2_deg: float
-) -> float:
-    """Local copy of the celestial-targets helper so this module stays
-    importable in tests that don't pull in ephem."""
-    a_az = math.radians(az1_deg)
-    a_el = math.radians(el1_deg)
-    b_az = math.radians(az2_deg)
-    b_el = math.radians(el2_deg)
-    cos_sep = math.sin(a_el) * math.sin(b_el) + math.cos(a_el) * math.cos(
-        b_el
-    ) * math.cos(a_az - b_az)
-    cos_sep = max(-1.0, min(1.0, cos_sep))
-    return math.degrees(math.acos(cos_sep))
 
 
 def _az_in_window(
@@ -872,7 +890,7 @@ def pick_auto_calibration_targets(
         best_score = -1.0
         for i, (_, az, el) in enumerate(remaining):
             min_dist = min(
-                _angular_distance_deg(az, el, paz, pel) for (_, paz, pel) in picked
+                angular_separation_deg(az, el, paz, pel) for (_, paz, pel) in picked
             )
             if min_dist > best_score:
                 best_score = min_dist
@@ -1177,16 +1195,37 @@ class NighttimeAutoManager:
         with self._lock:
             return self._runners.get(int(telescope_id))
 
+    def is_running(self, telescope_id: int) -> bool:
+        r = self.get(telescope_id)
+        return r is not None and r.is_alive()
+
     def start(
         self, telescope_id: int, runner: NighttimeAutoRunner
     ) -> NighttimeAutoRunner:
         tid = int(telescope_id)
-        with self._lock:
-            existing = self._runners.get(tid)
-            if existing is not None and existing.is_alive():
-                raise RuntimeError(f"telescope {tid} already has an auto-run in flight")
-            self._runners[tid] = runner
-        runner.start()
+        # The auto-runner drives the mount (slews between waypoints), so it
+        # must not run concurrently with any other mount-driving manager.
+        # Hold the shared per-telescope start-lock across the cross-check +
+        # thread-spawn + registry-write so a concurrent start on the same
+        # scope can't slip past the check. Mirrors LiveTrackManager.start;
+        # live-track adds the reciprocal check against this manager.
+        from device._scope_start_lock import (
+            get_scope_start_lock,
+            raise_if_scope_busy,
+        )
+
+        with get_scope_start_lock(tid):
+            raise_if_scope_busy(tid, "a nighttime auto-run", check_nighttime_auto=False)
+            with self._lock:
+                existing = self._runners.get(tid)
+                if existing is not None and existing.is_alive():
+                    raise RuntimeError(
+                        f"telescope {tid} already has an auto-run in flight"
+                    )
+                # Spawn the thread before publishing the runner so a
+                # concurrent stop() can't read a not-yet-started runner.
+                runner.start()
+                self._runners[tid] = runner
         return runner
 
     def stop(self, telescope_id: int) -> AutoRunStatus | None:
@@ -1214,4 +1253,4 @@ def get_nighttime_auto_manager() -> NighttimeAutoManager:
 
 
 # Silence unused-import warnings.
-_ = (math, SolveResult)
+_ = (SolveResult,)

@@ -38,6 +38,7 @@ hardening.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
@@ -56,6 +57,9 @@ from device.streaming_controller import (
 )
 from device.velocity_controller import PositionLogger
 from scripts.trajectory.observer import build_site
+
+
+logger = logging.getLogger(__name__)
 
 
 # Default convergence threshold for ``is_settled`` checks. Half of the
@@ -513,15 +517,28 @@ class CalibrateMotionSession:
                     except Exception:
                         pass
         finally:
+            # Skip the raw stop while the sun-safety emergency jog is
+            # executing: it would cancel the jog-away and strand the mount
+            # inside the cone. The jog's firmware dur_sec bounds the motion,
+            # so skipping cannot leave the motor running.
             if not self.dry_run:
-                try:
-                    cli.method_sync(
-                        "scope_speed_move",
-                        {"speed": 0, "angle": 0, "dur_sec": 1},
+                from device.sun_safety import sun_safety_jog_in_progress
+
+                if sun_safety_jog_in_progress():
+                    logger.warning(
+                        "session-exit motor stop skipped: sun-safety jog in progress"
                     )
-                except Exception:
-                    with self._lock:
-                        self._errors.append("outer motor-stop on session exit failed")
+                else:
+                    try:
+                        cli.method_sync(
+                            "scope_speed_move",
+                            {"speed": 0, "angle": 0, "dur_sec": 1},
+                        )
+                    except Exception:
+                        with self._lock:
+                            self._errors.append(
+                                "outer motor-stop on session exit failed"
+                            )
 
 
 # ---------- CalibrateMotionManager ------------------------------------
