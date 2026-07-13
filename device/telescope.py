@@ -1917,7 +1917,18 @@ class moveaxis:
         ### RANGE CHECK AS NEEDED ###         # Raise Alpaca InvalidValueException with details!
         try:
             # -----------------------------
-            seestar_dev[devnum].move_scope(axis, rate)
+            # move_scope enforces the sun-avoidance pre-flight + emergency
+            # lockout and returns False when it refuses the jog. Surface that
+            # as an ASCOM InvalidOperationException instead of a silent no-op.
+            if seestar_dev[devnum].move_scope(axis, rate) is False:
+                resp.text = MethodResponse(
+                    req,
+                    InvalidOperationException(
+                        "MoveAxis refused: sun-avoidance pre-flight or "
+                        "emergency lockout active (or the mount is slewing)."
+                    ),
+                ).json
+                return
             # -----------------------------
             resp.text = MethodResponse(req).json
         except Exception as ex:

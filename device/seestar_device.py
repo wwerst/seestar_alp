@@ -139,6 +139,13 @@ class Seestar:
         }
         self.lock = threading.RLock()
         self._plate_solve_sync_lock = threading.Lock()
+        # Serializes cmdid allocation + socket send so two concurrent callers
+        # can't hand out the same id or interleave bytes on the wire. Held
+        # only across the send, never across the response wait. Reentrant:
+        # send_message recovers from socket errors via reconnect(), whose
+        # auth handshake sends on this same thread — a plain Lock would
+        # self-deadlock there.
+        self._send_lock = threading.RLock()
         self.is_cur_scheduler_item_working: bool = False
 
         self.event_state: dict[str, Any] = {}
@@ -623,18 +630,20 @@ class Seestar:
             time.sleep(0.1)
 
     def json_message(self, instruction: str, **kwargs):
-        data = {"id": self.cmdid, "method": instruction, **kwargs}
-        self.cmdid += 1
-        json_data = json.dumps(data)
-        self.send_message(json_data + "\r\n")
+        with self._send_lock:
+            data = {"id": self.cmdid, "method": instruction, **kwargs}
+            self.cmdid += 1
+            json_data = json.dumps(data)
+            self.send_message(json_data + "\r\n")
 
     def send_message_param(self, data: MessageParams) -> int:
         data = self.transform_message_for_verify(data)
-        cur_cmdid = data.get("id") or self.cmdid
-        data["id"] = cur_cmdid
-        self.cmdid += 1  # can this overflow?  not in JSON...
-        json_data = json.dumps(data)
-        self.send_message(json_data + "\r\n")
+        with self._send_lock:
+            cur_cmdid = data.get("id") or self.cmdid
+            data["id"] = cur_cmdid
+            self.cmdid += 1  # can this overflow?  not in JSON...
+            json_data = json.dumps(data)
+            self.send_message(json_data + "\r\n")
         return cur_cmdid
 
     def should_inject_verify(self) -> bool:
@@ -1036,6 +1045,52 @@ class Seestar:
         }
         return self.send_message_param_sync(data)
 
+    def _move_scope_sun_safe(self) -> bool:
+        """Pre-flight sun-avoidance for manual (ASCOM MoveAxis) jogs.
+
+        Reads the current encoder pointing (`scope_get_horiz_coord`) and
+        refuses the move when it lies inside the sun cone. Encoder (az, el)
+        approximates sky (az, el): exact after rotation calibration,
+        conservative otherwise — the same convention as the other pre-flight
+        sites (`_slew_to_ra_dec`, `live_tracker._pre_slew`). Returns True to
+        proceed, False to refuse.
+
+        Fail-safe policy mirrors `_slew_to_ra_dec`: a definite unsafe verdict
+        (or an is_sun_safe error) refuses; a genuinely-missing encoder reading
+        falls through (the SunSafetyMonitor is the runtime backstop).
+        """
+        try:
+            resp = self.send_message_param_sync({"method": "scope_get_horiz_coord"})
+            result = resp.get("result") if isinstance(resp, dict) else None
+            alt_deg = float(result[0])
+            az_deg = float(result[1])
+        except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+            self.logger.info(
+                "move_scope sun pre-flight skipped (no horiz coord reading)"
+            )
+            return True
+        if not (math.isfinite(alt_deg) and math.isfinite(az_deg)):
+            self.logger.info(
+                "move_scope sun pre-flight skipped (non-finite horiz coord)"
+            )
+            return True
+        try:
+            from device.sun_safety import is_sun_safe as _is_sun_safe
+
+            sun_safe, sun_reason = _is_sun_safe(az_deg % 360.0, alt_deg)
+        except Exception as exc:
+            self.logger.warning("move_scope refused: is_sun_safe raised: %s", exc)
+            return False
+        if not sun_safe:
+            self.logger.warning(
+                "move_scope refused (az=%.1f° alt=%.1f°): %s",
+                az_deg,
+                alt_deg,
+                sun_reason,
+            )
+            return False
+        return True
+
     # {"method":"scope_speed_move","params":{"speed":4000,"angle":270,"dur_sec":10}}
     def move_scope(self, in_angle: int, in_speed: int, in_dur=3):
         self.logger.debug(
@@ -1048,6 +1103,26 @@ class Seestar:
         if self.is_goto():
             self.logger.warning("Failed to move scope: mount is in goto routine.")
             return False
+
+        # Sun-safety: refuse manual jogs while the SunSafetyMonitor holds the
+        # emergency lockout (it owns the mount during an active jog-away), and
+        # refuse when the current pointing is inside the sun-avoidance cone.
+        # The goto path (`_slew_to_ra_dec`) and the velocity_controller
+        # speed_move wrapper apply the same guard. A stop (speed 0) must
+        # always pass: refusing it would keep the motor running on the last
+        # command — the opposite of what the guard protects against (ASCOM
+        # MoveAxis(rate=0) is the standard stop gesture).
+        if in_speed != 0:
+            from device.sun_safety import sun_safety_is_locked_out
+
+            if sun_safety_is_locked_out():
+                self.logger.warning(
+                    "Failed to move scope: sun-safety emergency lockout active."
+                )
+                return False
+            if not self._move_scope_sun_safe():
+                return False
+
         data: MessageParams = {
             "method": "scope_speed_move",
             "params": {"speed": in_speed, "angle": in_angle, "dur_sec": in_dur},

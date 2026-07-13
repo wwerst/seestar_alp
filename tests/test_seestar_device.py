@@ -1973,3 +1973,201 @@ def test_request_plate_solve_sync_single_flight_serializes(monkeypatch, seestar)
     # and 2). Without the lock, t2's handler would catch tag=1 too and
     # we'd see [1, 1].
     assert tags == [1, 2], f"expected distinct results per caller, got {results}"
+
+
+# --- P1: ASCOM MoveAxis (move_scope) sun-safety pre-flight + lockout -------
+
+
+def _horiz_coord_sync(sent, alt=33.0, az=180.0):
+    """Return a send_message_param_sync double that answers
+    scope_get_horiz_coord with [alt, az] and records every payload."""
+
+    def _sync(payload):
+        sent.append(payload)
+        if payload["method"] == "scope_get_horiz_coord":
+            return {"result": [alt, az]}
+        return {"result": "ok"}
+
+    return _sync
+
+
+def test_move_scope_refuses_when_sun_lockout_active(seestar):
+    """MoveAxis must refuse while the SunSafetyMonitor holds the emergency
+    lockout — no encoder read, no scope_speed_move."""
+    from device.sun_safety import (
+        SunSafetyMonitor,
+        get_sun_monitor,
+        set_sun_monitor,
+    )
+
+    prev = get_sun_monitor()
+    m = SunSafetyMonitor(
+        altaz_reader=lambda: None,
+        jog_command=lambda *_a: None,
+        lat_deg=33.96,
+        lon_deg=-118.46,
+    )
+    m._emergency_lockout.set()
+    set_sun_monitor(m)
+    sent = []
+    seestar.send_message_param_sync = lambda p: sent.append(p) or {"result": "ok"}
+    try:
+        assert seestar.move_scope(10, 100) is False
+        assert sent == [], "locked out: firmware must not be touched at all"
+    finally:
+        set_sun_monitor(prev)
+
+
+def test_move_scope_refuses_inside_sun_cone(monkeypatch, seestar):
+    """MoveAxis converts the current encoder pointing to sky (az, el) and
+    refuses (no scope_speed_move) when it is inside the sun cone."""
+    from device import sun_safety as ss
+    from device.sun_safety import get_sun_monitor, set_sun_monitor
+
+    prev = get_sun_monitor()
+    set_sun_monitor(None)
+    sent = []
+    seestar.send_message_param_sync = _horiz_coord_sync(sent)
+    monkeypatch.setattr(
+        ss, "is_sun_safe", lambda *a, **k: (False, "sun_avoidance: forced")
+    )
+    try:
+        assert seestar.move_scope(10, 100) is False
+        assert any(p["method"] == "scope_get_horiz_coord" for p in sent)
+        assert not any(p["method"] == "scope_speed_move" for p in sent)
+    finally:
+        set_sun_monitor(prev)
+
+
+def test_move_scope_proceeds_when_sun_safe(monkeypatch, seestar):
+    from device import sun_safety as ss
+    from device.sun_safety import get_sun_monitor, set_sun_monitor
+
+    prev = get_sun_monitor()
+    set_sun_monitor(None)
+    sent = []
+    seestar.send_message_param_sync = _horiz_coord_sync(sent)
+    monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **k: (True, ""))
+    try:
+        assert seestar.move_scope(10, 100) is True
+        assert any(p["method"] == "scope_speed_move" for p in sent)
+    finally:
+        set_sun_monitor(prev)
+
+
+def test_move_scope_refuses_when_is_sun_safe_raises(monkeypatch, seestar):
+    """Fail-safe: an is_sun_safe exception (e.g. ephem blew up) refuses the
+    jog rather than letting it through."""
+    from device import sun_safety as ss
+    from device.sun_safety import get_sun_monitor, set_sun_monitor
+
+    prev = get_sun_monitor()
+    set_sun_monitor(None)
+    sent = []
+    seestar.send_message_param_sync = _horiz_coord_sync(sent)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("ephem exploded")
+
+    monkeypatch.setattr(ss, "is_sun_safe", _boom)
+    try:
+        assert seestar.move_scope(10, 100) is False
+        assert not any(p["method"] == "scope_speed_move" for p in sent)
+    finally:
+        set_sun_monitor(prev)
+
+
+def test_move_scope_falls_through_when_horiz_coord_unavailable(seestar):
+    """When the encoder pointing can't be read (no 'result'), the pre-flight
+    falls through and the jog goes out — the SunSafetyMonitor is the runtime
+    backstop, matching the _slew_to_ra_dec sentinel path."""
+    from device.sun_safety import get_sun_monitor, set_sun_monitor
+
+    prev = get_sun_monitor()
+    set_sun_monitor(None)
+    sent = []
+    seestar.send_message_param_sync = lambda p: sent.append(p) or {"ok": True}
+    try:
+        assert seestar.move_scope(10, 100) is True
+        assert any(p["method"] == "scope_speed_move" for p in sent)
+    finally:
+        set_sun_monitor(prev)
+
+
+# --- P1: send lock serializes cmdid allocation + socket send --------------
+
+
+def test_send_message_param_assigns_unique_ids_under_concurrency(seestar):
+    """Two concurrent senders must never receive the same cmdid: the send
+    lock covers id-allocation + send atomically."""
+    import threading
+
+    seestar.firmware_ver_int = 2000  # no verify injection at this fw
+    send_lock = threading.Lock()
+
+    def fake_send(_payload):
+        # Serialize the recording only; the cmdid race, if any, already
+        # happened before send_message is called.
+        with send_lock:
+            return True
+
+    seestar.send_message = fake_send
+
+    ids: list[int] = []
+    ids_lock = threading.Lock()
+
+    def worker():
+        cid = seestar.send_message_param({"method": "scope_get_equ_coord"})
+        with ids_lock:
+            ids.append(cid)
+
+    threads = [threading.Thread(target=worker) for _ in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    assert len(ids) == 50
+    assert len(set(ids)) == 50, "cmdids must be unique under concurrent senders"
+
+
+# ---------- audit-fix regressions: send lock + move_scope sun guards ------
+
+
+def test_send_lock_is_reentrant(seestar):
+    """send_message recovers from socket errors by reconnecting; the
+    reconnect auth handshake sends on this same thread while _send_lock is
+    already held. A plain Lock self-deadlocks there, so the lock must allow
+    same-thread reacquisition."""
+    with seestar._send_lock:
+        assert seestar._send_lock.acquire(timeout=1.0)
+        seestar._send_lock.release()
+
+
+def test_move_scope_zero_speed_stop_bypasses_sun_guards(seestar, monkeypatch):
+    """ASCOM MoveAxis(rate=0) is the standard stop gesture: it must pass
+    even during an emergency lockout or inside the sun cone, otherwise the
+    motor keeps running on the last command."""
+    import device.sun_safety as ss
+
+    sent = []
+    monkeypatch.setattr(seestar, "is_goto", lambda: False)
+    monkeypatch.setattr(
+        seestar, "send_message_param_sync", lambda data: sent.append(data) or {}
+    )
+    monkeypatch.setattr(ss, "sun_safety_is_locked_out", lambda: True)
+    assert seestar.move_scope(0, 0, 1) is True
+    assert sent and sent[0]["params"]["speed"] == 0
+
+
+def test_move_scope_nonzero_speed_refused_during_lockout(seestar, monkeypatch):
+    import device.sun_safety as ss
+
+    sent = []
+    monkeypatch.setattr(seestar, "is_goto", lambda: False)
+    monkeypatch.setattr(
+        seestar, "send_message_param_sync", lambda data: sent.append(data) or {}
+    )
+    monkeypatch.setattr(ss, "sun_safety_is_locked_out", lambda: True)
+    assert seestar.move_scope(90, 100, 1) is False
+    assert sent == []

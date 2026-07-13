@@ -7,10 +7,12 @@ Flask server). At boot it:
 - Instantiates the `LiveTrackManager` singleton (cheap — no threads).
 - Instantiates the `TargetCatalog` with `live_enabled=True` (cheap —
   the adsb.fi poller is deferred to the first `list_live()` call).
-- Starts a `SunSafetyMonitor` whose altaz_reader talks to the ALP
-  device server via AlpacaClient + astropy, and whose jog_command
-  bypasses the lockout-aware `speed_move` wrapper by hitting
-  `cli.method_sync('scope_speed_move', ...)` directly.
+- Starts a `SunSafetyMonitor` whose altaz_reader senses the mount's
+  pointing from the raw motor encoder (`scope_get_horiz_coord` via
+  AlpacaClient — stays sighted during daytime, pre-alignment work),
+  and whose jog_command bypasses the lockout-aware `speed_move`
+  wrapper by hitting `cli.method_sync('scope_speed_move', ...)`
+  directly.
 
 The goal: the tracker infrastructure is always loaded so the
 sun-safety guard is authoritative, but it stays quiescent (no
@@ -95,42 +97,22 @@ class LiveTrackerMain:
 def _make_altaz_reader() -> _ss.AltazReader:
     """Build a callable that reads the first configured scope's sky
     (az, alt). Returns None on any failure so the monitor skips a
-    tick rather than crashing."""
+    tick rather than crashing.
 
-    def _read() -> Optional[tuple[float, float]]:
-        try:
-            from astropy.coordinates import AltAz, EarthLocation, SkyCoord
-            from astropy.time import Time
-            import astropy.units as u
-            from device.alpaca_client import AlpacaClient
+    Senses from the raw motor encoder (``scope_get_horiz_coord``) via
+    :func:`device.sun_safety.make_scope_altaz_reader` — NOT from firmware
+    RA/Dec, which reads (0, 0) until the first plate-solve alignment and
+    left the monitor blind during exactly the daytime, pre-alignment
+    window where sun protection matters most."""
 
-            tid = _primary_telescope_id()
-            cli = AlpacaClient("127.0.0.1", int(Config.port), tid)
-            resp = cli.method_sync("scope_get_equ_coord")
-            if not isinstance(resp, dict) or "result" not in resp:
-                return None
-            result = resp["result"]
-            ra_h = float(result.get("ra", 0.0))
-            dec_d = float(result.get("dec", 0.0))
-            # Heuristic: firmware reports (0, 0) before plate-solve
-            # alignment. A real session that has never been aligned
-            # parks at ra=0,dec=0 sometimes — treat that as "don't
-            # trust" so we don't spuriously trip the monitor.
-            if abs(ra_h) < 1e-6 and abs(dec_d) < 1e-6:
-                return None
-            loc = EarthLocation.from_geodetic(
-                lat=Config.init_lat * u.deg,
-                lon=Config.init_long * u.deg,
-            )
-            altaz = SkyCoord(
-                ra=ra_h * u.hour, dec=dec_d * u.deg, frame="icrs"
-            ).transform_to(AltAz(obstime=Time.now(), location=loc))
-            return float(altaz.az.deg) % 360.0, float(altaz.alt.deg)
-        except Exception:
-            logger.debug("altaz_reader failed", exc_info=True)
-            return None
+    def _method_sync(method: str, params: Optional[dict] = None) -> object:
+        from device.alpaca_client import AlpacaClient
 
-    return _read
+        tid = _primary_telescope_id()
+        cli = AlpacaClient("127.0.0.1", int(Config.port), tid)
+        return cli.method_sync(method, params)
+
+    return _ss.make_scope_altaz_reader(_method_sync)
 
 
 def _make_jog_command() -> _ss.RawJogCommand:
@@ -152,21 +134,39 @@ def _make_jog_command() -> _ss.RawJogCommand:
 
 
 def _abort_active_sessions() -> None:
-    """Stop live-tracker + calibration sessions on every configured
-    scope. Runs inside the monitor's trigger sequence; exceptions are
-    caught at the monitor level."""
+    """Stop every mount-driving session on every configured scope: live
+    tracker, rotation calibration, calibrate-motion, nighttime calibration
+    (session + hands-free auto-runner), and the sky-visibility mapper.
+    Covering all of them matters — any survivor re-slews right after the
+    monitor's jog and re-trips it in a loop. Runs inside the monitor's
+    trigger sequence; exceptions are caught per-manager so one failing
+    teardown can't shield the rest."""
+    import device.calibrate_motion as _cm
+    import device.nighttime_calibration as _nc
     import device.rotation_calibration as _rc
+    import device.visibility_mapper as _vm
 
     mgr = _lt.get_manager()
+    stops = (
+        ("live_tracker", lambda tid: mgr.stop(tid)),
+        ("rotation_calibration", lambda tid: _rc.get_calibration_manager().stop(tid)),
+        ("calibrate_motion", lambda tid: _cm.get_calibrate_motion_manager().stop(tid)),
+        ("nighttime_calibration", lambda tid: _nc.get_nighttime_manager().stop(tid)),
+        ("nighttime_auto", lambda tid: _nc.get_nighttime_auto_manager().stop(tid)),
+        # force=True: the mapper's 5-minute minimum-runtime gate must not
+        # delay an emergency abort.
+        (
+            "visibility_mapper",
+            lambda tid: _vm.get_visibility_manager().stop(tid, force=True),
+        ),
+    )
     for dev in getattr(Config, "seestars", []) or []:
-        try:
-            mgr.stop(int(dev["device_num"]))
-        except Exception:
-            logger.debug("mgr.stop raised for %s", dev, exc_info=True)
-        try:
-            _rc.get_calibration_manager().stop(int(dev["device_num"]))
-        except Exception:
-            logger.debug("calibration stop raised for %s", dev, exc_info=True)
+        tid = int(dev["device_num"])
+        for name, stop in stops:
+            try:
+                stop(tid)
+            except Exception:
+                logger.debug("%s stop raised for %s", name, dev, exc_info=True)
 
 
 def _primary_telescope_id() -> int:
