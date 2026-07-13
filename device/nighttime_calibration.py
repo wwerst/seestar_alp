@@ -870,8 +870,7 @@ def pick_auto_calibration_targets(
         best_score = -1.0
         for i, (_, az, el) in enumerate(remaining):
             min_dist = min(
-                _angular_distance_deg(az, el, paz, pel)
-                for (_, paz, pel) in picked
+                _angular_distance_deg(az, el, paz, pel) for (_, paz, pel) in picked
             )
             if min_dist > best_score:
                 best_score = min_dist
@@ -1117,9 +1116,7 @@ class NighttimeAutoRunner:
                 reason = "fail"
                 if last_failed is not None:
                     reason = str(
-                        last_failed.get("error")
-                        or last_failed.get("status")
-                        or "fail"
+                        last_failed.get("error") or last_failed.get("status") or "fail"
                     )
                 return "fail", reason
             time.sleep(self.poll_interval_s)
@@ -1179,9 +1176,7 @@ class NighttimeAutoManager:
         with self._lock:
             existing = self._runners.get(tid)
             if existing is not None and existing.is_alive():
-                raise RuntimeError(
-                    f"telescope {tid} already has an auto-run in flight"
-                )
+                raise RuntimeError(f"telescope {tid} already has an auto-run in flight")
             self._runners[tid] = runner
         runner.start()
         return runner

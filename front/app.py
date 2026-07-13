@@ -6220,9 +6220,7 @@ def _make_nighttime_auto_slew_func(telescope_id: int, timeout_s: float = 120.0):
     from device.sun_safety import is_sun_safe
 
     def slew(az_deg: float, alt_deg: float) -> bool:
-        ra_hours, dec_deg = _azel_to_radec_for_telescope(
-            az_deg, alt_deg, telescope_id
-        )
+        ra_hours, dec_deg = _azel_to_radec_for_telescope(az_deg, alt_deg, telescope_id)
         sun_safe, reason = is_sun_safe(az_deg % 360.0, alt_deg)
         if not sun_safe:
             logger.info(
@@ -6248,14 +6246,10 @@ def _make_nighttime_auto_slew_func(telescope_id: int, timeout_s: float = 120.0):
 
             mm = get_calibrate_motion_manager().get(int(telescope_id))
             if mm is not None and mm.is_alive():
-                logger.info(
-                    "auto-calibrate: stopping motion session before slew"
-                )
+                logger.info("auto-calibrate: stopping motion session before slew")
                 mm.stop(timeout=2.0)
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "auto-calibrate: pre-slew motion-stop failed: %s", exc
-            )
+            logger.warning("auto-calibrate: pre-slew motion-stop failed: %s", exc)
 
         done = _threading.Event()
         holder: dict = {}
@@ -6271,9 +6265,7 @@ def _make_nighttime_auto_slew_func(telescope_id: int, timeout_s: float = 120.0):
                 done.set()
             elif state in ("fail", "cancel"):
                 holder["ok"] = False
-                holder["err"] = (
-                    sender.get("error") or f"scope_goto state={state}"
-                )
+                holder["err"] = sender.get("error") or f"scope_goto state={state}"
                 done.set()
 
         dev.eventbus.connect(_on_event)
@@ -6285,9 +6277,7 @@ def _make_nighttime_auto_slew_func(telescope_id: int, timeout_s: float = 120.0):
                 # Firmware refused the goto outright (e.g. equipment-
                 # busy). Surface as a failure so the runner records it
                 # and moves on.
-                logger.warning(
-                    "auto-calibrate: scope_goto refused: %s", ack
-                )
+                logger.warning("auto-calibrate: scope_goto refused: %s", ack)
                 return False
             if not done.wait(timeout=float(timeout_s)):
                 logger.warning(
@@ -6379,9 +6369,7 @@ def _make_nighttime_auto_prepare_func(telescope_id: int, exposure_ms: int = 0):
                     int(telescope_id),
                     {
                         "method": "set_setting",
-                        "params": {
-                            "exp_ms": {"continuous": int(exposure_ms)}
-                        },
+                        "params": {"exp_ms": {"continuous": int(exposure_ms)}},
                     },
                 )
                 logger.info(

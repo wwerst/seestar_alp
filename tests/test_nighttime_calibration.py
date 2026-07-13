@@ -644,7 +644,9 @@ def test_pick_auto_calibration_targets_filters_altitude_band(monkeypatch):
     fake_targets = [
         CelestialTarget(name="LowStar", kind="star", ra_hours=0, dec_deg=0, vmag=2.0),
         CelestialTarget(name="HighStar", kind="star", ra_hours=0, dec_deg=0, vmag=2.0),
-        CelestialTarget(name="ZenithStar", kind="star", ra_hours=0, dec_deg=0, vmag=2.0),
+        CelestialTarget(
+            name="ZenithStar", kind="star", ra_hours=0, dec_deg=0, vmag=2.0
+        ),
         CelestialTarget(name="EastStar", kind="star", ra_hours=0, dec_deg=0, vmag=2.0),
         CelestialTarget(name="WestStar", kind="star", ra_hours=0, dec_deg=0, vmag=2.0),
     ]
@@ -713,7 +715,9 @@ def test_auto_runner_drives_session_to_three_successes(tmp_path, monkeypatch):
         NighttimeAutoRunner,
     )
 
-    monkeypatch.setattr(nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec))
+    monkeypatch.setattr(
+        nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec)
+    )
     candidates = [
         AutoCandidate(label="A", az_deg=10.0, el_deg=70.0),
         AutoCandidate(label="B", az_deg=180.0, el_deg=72.0),
@@ -721,7 +725,10 @@ def test_auto_runner_drives_session_to_three_successes(tmp_path, monkeypatch):
     ]
     canned = {
         "": SolveResult(
-            ra_deg=10.0, dec_deg=70.0, fov_x_deg=1.27, fov_y_deg=0.71,
+            ra_deg=10.0,
+            dec_deg=70.0,
+            fov_x_deg=1.27,
+            fov_y_deg=0.71,
             position_angle_deg=0.0,
         )
     }
@@ -758,7 +765,10 @@ def test_auto_runner_records_slew_refusal(tmp_path):
     ]
     canned = {
         "": SolveResult(
-            ra_deg=180.0, dec_deg=72.0, fov_x_deg=1.27, fov_y_deg=0.71,
+            ra_deg=180.0,
+            dec_deg=72.0,
+            fov_x_deg=1.27,
+            fov_y_deg=0.71,
             position_angle_deg=0.0,
         )
     }
@@ -801,11 +811,18 @@ def test_auto_runner_stops_on_cancel(tmp_path, monkeypatch):
     import device.nighttime_calibration as nc
     from device.nighttime_calibration import AutoCandidate, NighttimeAutoRunner
 
-    monkeypatch.setattr(nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec))
-    candidates = [AutoCandidate(label=f"T{i}", az_deg=i * 60.0, el_deg=70.0) for i in range(5)]
+    monkeypatch.setattr(
+        nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec)
+    )
+    candidates = [
+        AutoCandidate(label=f"T{i}", az_deg=i * 60.0, el_deg=70.0) for i in range(5)
+    ]
     canned = {
         "": SolveResult(
-            ra_deg=10.0, dec_deg=70.0, fov_x_deg=1.27, fov_y_deg=0.71,
+            ra_deg=10.0,
+            dec_deg=70.0,
+            fov_x_deg=1.27,
+            fov_y_deg=0.71,
             position_angle_deg=0.0,
         )
     }
@@ -849,7 +866,9 @@ def test_auto_manager_refuses_concurrent_runs(tmp_path, monkeypatch):
         NighttimeAutoRunner,
     )
 
-    monkeypatch.setattr(nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec))
+    monkeypatch.setattr(
+        nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec)
+    )
     session = _make_session(tmp_path, FakePlateSolver())
     block = threading.Event()
 
