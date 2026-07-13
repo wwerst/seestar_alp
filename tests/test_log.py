@@ -48,14 +48,20 @@ def test_init_logging_creates_rotating_handler_and_disables_stdout(monkeypatch):
     root_logger = FakeRootLogger(stdout_handler)
     file_handler = FakeHandler()
 
-    monkeypatch.setattr(log_mod, "logger", None)
-    monkeypatch.setattr(log_mod.logging, "basicConfig", lambda **kwargs: None)
-    monkeypatch.setattr(log_mod.logging, "getLogger", lambda: root_logger)
-    monkeypatch.setattr(
-        log_mod.logging.handlers,
-        "RotatingFileHandler",
-        lambda *args, **kwargs: file_handler,
+    # Replace the logging module as seen by device.log instead of patching the
+    # real logging module: pytest's own logging plugin calls logging.getLogger()
+    # between test phases, and a patched global getLogger crashes it before
+    # monkeypatch can undo the patch, poisoning the rest of the session.
+    fake_logging = SimpleNamespace(
+        basicConfig=lambda **kwargs: None,
+        getLogger=lambda: root_logger,
+        Formatter=logging.Formatter,
+        handlers=SimpleNamespace(
+            RotatingFileHandler=lambda *args, **kwargs: file_handler
+        ),
     )
+    monkeypatch.setattr(log_mod, "logger", None)
+    monkeypatch.setattr(log_mod, "logging", fake_logging)
     monkeypatch.setattr(
         log_mod,
         "Config",
@@ -80,7 +86,7 @@ def test_reinit_logging_updates_logger_and_handler_levels(monkeypatch):
     h2 = FakeHandler()
     fake_logger = FakeRootLogger(h1)
     fake_logger.handlers.append(h2)
-    log_mod.logger = fake_logger
+    monkeypatch.setattr(log_mod, "logger", fake_logger)
     monkeypatch.setattr(log_mod, "Config", SimpleNamespace(log_level=logging.DEBUG))
 
     out = log_mod.reinit_logging()
@@ -90,7 +96,7 @@ def test_reinit_logging_updates_logger_and_handler_levels(monkeypatch):
     assert h2.level == logging.DEBUG
 
 
-def test_get_logger_returns_global_logger():
+def test_get_logger_returns_global_logger(monkeypatch):
     fake = FakeRootLogger(FakeHandler())
-    log_mod.logger = fake
+    monkeypatch.setattr(log_mod, "logger", fake)
     assert log_mod.get_logger() is fake
