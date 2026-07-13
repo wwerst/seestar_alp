@@ -2,6 +2,7 @@
 persistence."""
 
 import json
+import math
 
 import pytest
 
@@ -16,6 +17,45 @@ def test_tracker_update_integrates_deltas():
     assert t.update(179.0) == pytest.approx(179.0)
     cum = t.update(-179.0)
     assert cum == pytest.approx(181.0)
+
+
+def test_tracker_update_rejects_non_finite_first_reading():
+    # A NaN as the very first (anchoring) reading must raise, leaving the
+    # tracker uninitialized rather than anchored to NaN.
+    t = CumulativeAzTracker()
+    with pytest.raises(ValueError, match="non-finite"):
+        t.update(float("nan"))
+    assert t._initialized is False
+    assert t.cum_az_deg == 0.0
+
+
+def test_tracker_update_rejects_non_finite_does_not_poison():
+    # One bad encoder reading must NOT poison cum_az permanently.
+    t = CumulativeAzTracker()
+    t.update(10.0)  # anchor
+    assert t.cum_az_deg == 10.0
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="non-finite"):
+            t.update(bad)
+        assert math.isfinite(t.cum_az_deg)
+        assert t.cum_az_deg == 10.0
+    # Good readings still integrate afterward.
+    assert t.update(12.0) == pytest.approx(12.0)
+
+
+def test_load_or_fresh_rejects_non_finite_saved_state(tmp_path, capsys):
+    # A persisted NaN cum_az (Python's json emits/accepts NaN by default)
+    # must fall back to a fresh tracker, not reload the poison.
+    path = str(tmp_path / "state.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"cum_az_deg": float("nan"), "wrapped_az_deg": 0.0, "initialized": True},
+            f,
+        )
+    t = CumulativeAzTracker.load_or_fresh(current_wrapped_az_deg=0.0, path=path)
+    assert t._initialized is False
+    assert t.cum_az_deg == 0.0
+    assert "failed to load" in capsys.readouterr().err
 
 
 def test_tracker_reset():

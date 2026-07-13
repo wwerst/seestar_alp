@@ -113,6 +113,116 @@ def test_v0_handoff_to_target_forward():
     assert _max_abs([p.vel for p in traj.points]) <= V_MAX + 1e-3
 
 
+def _within_caps(traj, v_max, a_max):
+    return (
+        _max_abs([p.vel for p in traj.points]) <= v_max + 1e-6
+        and _max_abs([p.acc for p in traj.points]) <= a_max + 1e-6
+    )
+
+
+def test_v0_opposing_direction_terminates_at_rest():
+    # v0 = -4°/s (moving away from a +25° target). The profile must brake,
+    # reverse, and land exactly on +25° with v=0.
+    traj = trapezoidal_profile(
+        p0=0.0,
+        v0=-4.0,
+        p_target=25.0,
+        v_max=V_MAX,
+        a_max=A_MAX,
+        tick_dt=TICK,
+    )
+    assert traj.points[0].vel == -4.0
+    end = traj.points[-1]
+    assert abs(end.pos - 25.0) < 1e-6, f"end pos = {end.pos}"
+    assert abs(end.vel) < 1e-6, f"end vel = {end.vel}"
+    assert _within_caps(traj, V_MAX, A_MAX)
+
+
+def test_v0_too_fast_for_short_move_overshoots_and_returns():
+    # v0 = 5°/s into a 1° move: min stopping distance (25/20 = 1.25°) exceeds
+    # the target, so the profile overshoots then returns — still ending at
+    # v=0 exactly on target (not snapping a nonzero terminal velocity).
+    traj = trapezoidal_profile(
+        p0=0.0,
+        v0=5.0,
+        p_target=1.0,
+        v_max=V_MAX,
+        a_max=A_MAX,
+        tick_dt=TICK,
+    )
+    end = traj.points[-1]
+    assert abs(end.pos - 1.0) < 1e-6, f"end pos = {end.pos}"
+    assert abs(end.vel) < 1e-6, f"end vel = {end.vel}"
+    # It really did overshoot past the target before coming back.
+    assert _max_abs([p.pos for p in traj.points]) > 1.1
+    assert _within_caps(traj, V_MAX, A_MAX)
+
+
+def test_v0_over_v_max_is_shed_first():
+    # v0 above v_max must be braked into the cap before cruising; the
+    # terminal velocity is still 0 on target and the profile never
+    # accelerates beyond the initial over-speed.
+    traj = trapezoidal_profile(
+        p0=0.0,
+        v0=9.0,
+        p_target=80.0,
+        v_max=V_MAX,
+        a_max=A_MAX,
+        tick_dt=TICK,
+    )
+    end = traj.points[-1]
+    assert abs(end.pos - 80.0) < 1e-6, f"end pos = {end.pos}"
+    assert abs(end.vel) < 1e-6
+    assert traj.points[0].vel == 9.0
+    # No sample exceeds the initial over-speed (excess is shed, not added).
+    assert _max_abs([p.vel for p in traj.points]) <= 9.0 + 1e-6
+    # The plan settles to the cap: a cruise segment sits at v_max.
+    assert any(abs(abs(p.vel) - V_MAX) < 1e-2 for p in traj.points)
+    assert _max_abs([p.acc for p in traj.points]) <= A_MAX + 1e-6
+
+
+def test_v0_nonzero_cumulative_target_not_rewrapped():
+    # Regression for the wrap_pm180 recompute: with wrap_target=False and an
+    # opposing v0 that triggers a brake phase, the remaining displacement
+    # must NOT be re-wrapped into ±180°. p0=170, target=410 (cumulative
+    # delta +240°); a naive wrap_pm180(p_target - p_cur) after braking would
+    # collapse +240 to ~-120 and terminate near +50 instead of +410.
+    traj = trapezoidal_profile(
+        p0=170.0,
+        v0=-3.0,
+        p_target=410.0,
+        v_max=V_MAX,
+        a_max=A_MAX,
+        tick_dt=TICK,
+        wrap_target=False,
+    )
+    end = traj.points[-1]
+    assert abs(end.pos - 410.0) < 1e-6, f"end pos = {end.pos}, expected 410"
+    assert abs(end.vel) < 1e-6
+    assert _within_caps(traj, V_MAX, A_MAX)
+
+
+def test_path_crosses_forbidden_multiwrap():
+    # Finding #3: signed-arc coverage across the full |delta|, correct for
+    # |delta| > 180 where the single-window wrap silently missed crossings.
+    from device.trajectory import _path_crosses_forbidden
+
+    # Long CW path of +270°: a forbidden bearing 200° along travel is inside
+    # the arc. The old single-window wrap put this at wrap_pm180(200)=-160
+    # and reported "no crossing".
+    assert _path_crosses_forbidden(0.0, 270.0, 200.0) is True
+    # Forbidden beyond the endpoint is not crossed.
+    assert _path_crosses_forbidden(0.0, 270.0, 300.0) is False
+    # Endpoint-equal doesn't count (stops before the forbidden angle).
+    assert _path_crosses_forbidden(0.0, 270.0, 270.0) is False
+    # CCW long path of -270°: forbidden 200° along CCW travel is inside.
+    assert _path_crosses_forbidden(0.0, -270.0, -200.0) is True
+    # The start bearing itself is not an interior crossing on a <360 arc...
+    assert _path_crosses_forbidden(0.0, 270.0, 0.0) is False
+    # ...but a >360° arc returns to the start bearing and does cross it.
+    assert _path_crosses_forbidden(0.0, 400.0, 0.0) is True
+
+
 def test_wrap_around_path_short_way():
     # From +170 to -170 — short path is +20° across the wrap boundary,
     # long path is -340°. Planner should pick short.

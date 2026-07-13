@@ -172,3 +172,126 @@ def test_set_tracking_silent_on_success():
     cli = _FakeCli()
     set_tracking(cli, False)
     assert cli.calls == [("scope_set_track_state", False)]
+
+
+# --- Finding #4: measure_altaz_timed guards non-finite encoder readings ---
+
+
+class _HorizCli:
+    """Client that returns a scripted sequence of scope_get_horiz_coord
+    payloads (cycling on the last one)."""
+
+    def __init__(self, payloads):
+        self._payloads = list(payloads)
+        self.calls = 0
+
+    def method_sync(self, method, params=None):
+        assert method == "scope_get_horiz_coord"
+        idx = min(self.calls, len(self._payloads) - 1)
+        self.calls += 1
+        return self._payloads[idx]
+
+
+def test_measure_altaz_timed_finite_ok():
+    from device.velocity_controller import measure_altaz_timed
+
+    cli = _HorizCli([{"result": [12.0, 190.0], "Timestamp": 3.5}])
+    alt, az, fw_t = measure_altaz_timed(cli, loc=None)
+    assert alt == 12.0
+    assert az == pytest.approx(-170.0)  # 190° wrapped into [-180, +180)
+    assert fw_t == 3.5
+
+
+def test_measure_altaz_timed_retries_then_raises_on_non_finite():
+    from device.velocity_controller import measure_altaz_timed
+
+    cli = _HorizCli([{"result": [float("nan"), 0.0]}])
+    with pytest.raises(RuntimeError, match="unexpected payload"):
+        measure_altaz_timed(cli, loc=None)
+    assert cli.calls == 2  # one retry before raising
+
+
+def test_measure_altaz_timed_recovers_on_retry():
+    from device.velocity_controller import measure_altaz_timed
+
+    cli = _HorizCli(
+        [
+            {"result": [float("inf"), 0.0]},  # first sample non-finite
+            {"result": [10.0, 20.0], "Timestamp": 1.0},  # retry is good
+        ]
+    )
+    alt, az, fw_t = measure_altaz_timed(cli, loc=None)
+    assert alt == 10.0
+    assert az == pytest.approx(20.0)
+    assert fw_t == 1.0
+    assert cli.calls == 2
+
+
+# --- Finding #1: unwind_azimuth drives cumulative az to center -----------
+
+
+def test_unwind_azimuth_drives_cumulative_to_center(monkeypatch):
+    """From a wound-up cum=+300°, unwind must plan toward cumulative 0 —
+    NOT the +360° that pick_cum_target's shorter-wrapped path would choose
+    (which winds further toward the hard stop)."""
+    from device import velocity_controller as vc
+    from device.plant_limits import (
+        AzimuthLimits,
+        CumulativeAzTracker,
+        pick_cum_target,
+    )
+
+    limits = AzimuthLimits(
+        ccw_hard_stop_cum_deg=-450.0,
+        cw_hard_stop_cum_deg=+450.0,
+        padding_deg=15.0,
+    )
+    wrapped_now = vc.wrap_pm180(300.0)  # -60.0
+    tracker = CumulativeAzTracker()
+    tracker.reset(cum_az_deg=+300.0, wrapped_az_deg=wrapped_now)
+
+    captured: dict = {}
+
+    def fake_move_to_ff(cli, **kwargs):
+        captured.update(kwargs)
+        return 0.0, 0.0, {"final_residual_deg": 0.0}
+
+    monkeypatch.setattr(vc, "move_to_ff", fake_move_to_ff)
+
+    cli = _HorizCli([{"result": [5.0, wrapped_now], "Timestamp": 0.0}])
+    vc.unwind_azimuth(
+        cli, loc=None, az_tracker=tracker, az_limits=limits, threshold_deg=180.0
+    )
+
+    # The plan is forced to cumulative 0, bypassing pick_cum_target.
+    assert captured["force_cum_az_target"] == 0.0
+    # Elevation is held where it is (an az unwind must not move el).
+    assert captured["target_el_deg"] == 5.0
+    assert captured["cur_el_deg"] == 5.0
+    # Sanity: the old wrapped-target path WOULD have wound further out.
+    wrapped_target = vc.wrap_pm180(wrapped_now - tracker.cum_az_deg)
+    buggy = pick_cum_target(tracker.cum_az_deg, wrapped_now, wrapped_target, limits)
+    assert buggy == pytest.approx(360.0)  # toward the hard stop, not 0
+
+
+def test_unwind_azimuth_noop_within_threshold(monkeypatch):
+    # Already near center: no motion planned, informational stats returned.
+    from device import velocity_controller as vc
+    from device.plant_limits import AzimuthLimits, CumulativeAzTracker
+
+    def fail_move_to_ff(*args, **kwargs):
+        raise AssertionError("no motion expected when within threshold")
+
+    monkeypatch.setattr(vc, "move_to_ff", fail_move_to_ff)
+
+    limits = AzimuthLimits(
+        ccw_hard_stop_cum_deg=-450.0, cw_hard_stop_cum_deg=+450.0, padding_deg=15.0
+    )
+    tracker = CumulativeAzTracker()
+    tracker.reset(cum_az_deg=+30.0, wrapped_az_deg=30.0)
+
+    _, _, stats = vc.unwind_azimuth(
+        cli=None, loc=None, az_tracker=tracker, az_limits=limits, threshold_deg=180.0
+    )
+    assert stats["controller"] == "unwind_noop"
+    assert stats["commands_issued"] == 0

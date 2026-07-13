@@ -43,6 +43,16 @@ from astropy import units as u
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord
 from astropy.time import Time
 
+# Canonical angle helpers live in device.geometry (geometry.py was copied
+# out of this module). Re-exported here so the many callers that still do
+# `from device.velocity_controller import wrap_pm180, unwrap_az_series`
+# keep working.
+from device.geometry import (
+    angular_separation_deg,
+    unwrap_az_series,  # noqa: F401 — re-exported for external importers
+    wrap_pm180,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +100,9 @@ VC_STUCK_MIN_S = 2.0
 VC_STUCK_MOVE_FRAC = 0.2
 VC_MAX_HALVINGS = 4
 VC_DEFAULT_TIMEOUT_S = 120
-VC_TAU_S = 0.348  # first-order τ for the plant model. Used by:
-# (1) move_azimuth_to_ff / move_elevation_to_ff
-#     / move_to_ff for velocity feedforward
-#     v_cmd = v_ref + τ·a_ref + FB;
-# (2) legacy move_azimuth_to_pd deadbeat
-#     predictor.
+VC_TAU_S = 0.348  # first-order τ for the plant model. Used by
+# move_azimuth_to_ff / move_elevation_to_ff / move_to_ff
+# for velocity feedforward v_cmd = v_ref + τ·a_ref + FB.
 # Phase 1 fit (fw-timestamped step_response data,
 # 20 bursts, trimmed to motor_active window):
 # tau=0.348s, k_dc=0.996, train pos-RMSE 0.70°.
@@ -118,48 +125,6 @@ FallbackGotoFn = Callable[[MountClient, float, float, EarthLocation], bool]
 # ---------------------------------------------------------------------------
 # Small utilities
 # ---------------------------------------------------------------------------
-
-
-def wrap_pm180(deg: float) -> float:
-    """Wrap an angle in degrees into the half-open interval [-180, +180).
-
-    -180 is inclusive, +180 wraps back to -180 — same convention as Python's
-    modulo on [0, 360).
-    """
-    return ((deg + 180.0) % 360.0) - 180.0
-
-
-def unwrap_az_series(wrapped_samples: list[float]) -> list[float]:
-    """Given an azimuth sample series wrapped to [-180, +180), return an
-    unwrapped cumulative series suitable for fitting.
-
-    Each per-step delta is interpreted modulo 360 via wrap_pm180: if two
-    adjacent wrapped samples differ by more than 180, the true motion is
-    assumed to be the shorter path (< 180). This is safe as long as the
-    true per-sample delta is bounded below ±180 — at the S50's 6°/s
-    firmware cap and sample intervals up to 30 s the implicit bound is
-    ~180° per 30 s, which the caller must respect.
-
-    The first element is returned as-is; subsequent elements accumulate
-    wrap_pm180(sample[i] - sample[i-1]).
-
-    Raises ``ValueError`` on any non-finite sample (NaN / Inf). Without
-    this guard a single bad reading silently propagates NaN across the
-    whole tail of the series and corrupts every downstream consumer
-    (``CumulativeAzTracker``, fit_auto_level, JSON persistence). Reject
-    at the boundary so the caller sees the failure.
-    """
-    if not wrapped_samples:
-        return []
-    out: list[float] = []
-    for i, v in enumerate(wrapped_samples):
-        if not math.isfinite(v):
-            raise ValueError(f"unwrap_az_series: non-finite sample at index {i}: {v!r}")
-    out.append(wrapped_samples[0])
-    for i in range(1, len(wrapped_samples)):
-        d = wrap_pm180(wrapped_samples[i] - wrapped_samples[i - 1])
-        out.append(out[-1] + d)
-    return out
 
 
 def _rate_to_speed(rate_degs: float) -> int:
@@ -274,14 +239,23 @@ def measure_altaz_timed(
     `loc` is kept in the signature for backward compat but unused.
 
     Returns `(alt, az, firmware_t)`. `az` is wrapped to `[-180, +180)`.
-    On a malformed response, retry once before raising — single-sample
-    glitches shouldn't tear down a multi-second trajectory.
+    On a malformed OR non-finite response, retry once before raising —
+    single-sample glitches shouldn't tear down a multi-second trajectory,
+    but a NaN/Inf encoder reading must never propagate into the control law
+    or the cumulative-az tracker (where it would poison state permanently).
     """
     del loc  # intentionally unused; raw encoder values are location-agnostic
 
     def _call_once():
         resp = cli.method_sync("scope_get_horiz_coord")
         if not isinstance(resp, dict) or "result" not in resp:
+            return None, resp
+        try:
+            alt = float(resp["result"][0])
+            az = float(resp["result"][1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None, resp
+        if not (math.isfinite(alt) and math.isfinite(az)):
             return None, resp
         return resp, resp
 
@@ -323,263 +297,6 @@ def set_tracking(cli: MountClient, enabled: bool) -> None:
         cli.method_sync("scope_set_track_state", enabled)
     except Exception as exc:
         logger.warning("set_tracking(%s) failed: %s", enabled, exc)
-
-
-# ---------------------------------------------------------------------------
-# Main control function
-# ---------------------------------------------------------------------------
-
-
-def move_azimuth_to_velocity(
-    cli: MountClient,
-    target_az_deg: float,
-    cur_az_deg: float,
-    loc: EarthLocation,
-    target_alt_deg: float,
-    tag: str = "",
-    arrive_tolerance_deg: float = 0.5,
-    position_logger: Any = None,
-    timeout_s: float = VC_DEFAULT_TIMEOUT_S,
-    kp: float = VC_KP,
-    kd: float = VC_KD,
-    max_rate_degs: float = VC_MAX_RATE_DEGS,
-    loop_dt_s: float = VC_LOOP_DT_S,
-    min_speed: int = VC_MIN_SPEED,
-    fine_min_speed: int = VC_FINE_MIN_SPEED,
-    fine_threshold_factor: float = VC_FINE_THRESHOLD_FACTOR,
-    max_halvings: int = VC_MAX_HALVINGS,
-    stuck_min_s: float = VC_STUCK_MIN_S,
-    stuck_move_frac: float = VC_STUCK_MOVE_FRAC,
-    use_predictor: bool = VC_USE_PREDICTOR,
-    tau_s: float = VC_TAU_S,
-    fallback_goto_fn: Optional[FallbackGotoFn] = None,
-) -> tuple[float, float, dict]:
-    """Drive the azimuth axis to `target_az_deg` via scope_speed_move.
-
-    At each tick (nominally every loop_dt_s):
-      1. Measure position (RA/Dec → alt/az, wrap az).
-      2. Compute error and derivative (measured_rate from Δpos/Δt).
-      3. Either: one-step feedforward (predictor) OR pure PD.
-      4. Clamp desired rate to rate_ceiling; convert to (speed, angle).
-      5. Issue scope_speed_move(speed, angle, dur_sec=VC_CMD_DUR_S).
-
-    Arrival: two consecutive ticks with |error| <= arrive_tolerance_deg and
-    motor stopped.
-
-    Stuck detection: if we've been commanding motion but position barely
-    moved over a rolling window, halve the rate ceiling. Up to
-    max_halvings halvings, then invoke fallback_goto_fn (if provided).
-
-    Returns (measured_alt, measured_az, stats).
-    """
-    stats = {
-        "commands_issued": 0,
-        "rate_ceiling_halvings": 0,
-        "stuck_bail": False,
-        "fallback_goto_used": False,
-        "elapsed_s": 0.0,
-        "iterations": 0,
-        "sign_flips": 0,
-        "loop_dt_mean_s": 0.0,
-        "loop_dt_max_s": 0.0,
-        "final_residual_deg": None,
-    }
-
-    rate_ceiling = max_rate_degs
-    last_speed = 0
-    last_angle = 0
-    last_az = cur_az_deg
-    last_t: Optional[float] = None
-    last_error_sign = 0
-    loop_dts: list[float] = []
-    stuck_since_t: Optional[float] = None
-    stuck_since_az = cur_az_deg
-
-    def _issue(speed: int, angle: int, event: str) -> None:
-        nonlocal last_speed, last_angle
-        speed_move(cli, speed, angle, VC_CMD_DUR_S)
-        last_speed = speed
-        last_angle = angle
-        stats["commands_issued"] += 1
-        if position_logger is not None:
-            position_logger.mark_event(
-                event,
-                speed=speed,
-                angle=angle,
-                dur_sec=VC_CMD_DUR_S,
-            )
-
-    t0 = time.monotonic()
-    fallback_reason: Optional[str] = None
-    consecutive_within_tol = 0
-
-    if position_logger is not None:
-        position_logger.set_phase("vc_move")
-
-    while True:
-        tick_start = time.monotonic()
-        elapsed = tick_start - t0
-        stats["elapsed_s"] = elapsed
-        stats["iterations"] += 1
-        if elapsed > timeout_s:
-            fallback_reason = f"velocity loop timed out after {elapsed:.1f}s"
-            break
-
-        measured_alt, measured_az = measure_altaz(cli, loc)
-        now = time.monotonic()
-        error = wrap_pm180(target_az_deg - measured_az)
-
-        if last_t is not None:
-            dt = now - last_t
-            loop_dts.append(dt)
-            signed_move = wrap_pm180(measured_az - last_az)
-            measured_rate = signed_move / dt if dt > 0 else 0.0
-        else:
-            dt = 0.0
-            measured_rate = 0.0
-        last_az = measured_az
-        last_t = now
-
-        cur_sign = 1 if error > 0 else (-1 if error < 0 else 0)
-        if cur_sign != 0 and last_error_sign != 0 and cur_sign != last_error_sign:
-            stats["sign_flips"] += 1
-        if cur_sign != 0:
-            last_error_sign = cur_sign
-
-        if abs(error) <= arrive_tolerance_deg:
-            consecutive_within_tol += 1
-            if last_speed != 0:
-                _issue(0, 0, "vc_stop")
-            if consecutive_within_tol >= 2:
-                stats["final_residual_deg"] = error
-                if loop_dts:
-                    stats["loop_dt_mean_s"] = sum(loop_dts) / len(loop_dts)
-                    stats["loop_dt_max_s"] = max(loop_dts)
-                return measured_alt, measured_az, stats
-            time.sleep(loop_dt_s)
-            continue
-        else:
-            consecutive_within_tol = 0
-
-        # Stuck detection.
-        if last_speed >= fine_min_speed:
-            if stuck_since_t is None:
-                stuck_since_t = time.monotonic()
-                stuck_since_az = measured_az
-            else:
-                window = time.monotonic() - stuck_since_t
-                window_moved = abs(wrap_pm180(measured_az - stuck_since_az))
-                expected = (last_speed / SPEED_PER_DEG_PER_SEC) * window
-                if window >= stuck_min_s and window_moved < max(
-                    0.3,
-                    stuck_move_frac * expected,
-                ):
-                    if stats["rate_ceiling_halvings"] < max_halvings:
-                        new_ceiling = max(
-                            min_speed / SPEED_PER_DEG_PER_SEC,
-                            rate_ceiling / 2,
-                        )
-                        print(
-                            f"{tag} vc: stuck (moved {window_moved:.2f}° vs "
-                            f"expected ~{expected:.1f}° over {window:.1f}s); "
-                            f"halving rate ceiling {rate_ceiling:.2f} → "
-                            f"{new_ceiling:.2f}°/s",
-                            flush=True,
-                        )
-                        if position_logger is not None:
-                            position_logger.mark_event(
-                                "vc_stuck_halve",
-                                old_ceiling=rate_ceiling,
-                                new_ceiling=new_ceiling,
-                                window_moved=window_moved,
-                                window_s=round(window, 3),
-                            )
-                        rate_ceiling = new_ceiling
-                        stats["rate_ceiling_halvings"] += 1
-                        stuck_since_t = time.monotonic()
-                        stuck_since_az = measured_az
-                    else:
-                        fallback_reason = (
-                            f"velocity loop stuck at floor rate "
-                            f"{rate_ceiling:.2f}°/s "
-                            f"(moved {window_moved:.2f}° in {window:.1f}s)"
-                        )
-                        stats["stuck_bail"] = True
-                        break
-        else:
-            stuck_since_t = None
-            stuck_since_az = measured_az
-
-        # Control law: predictor OR pure PD.
-        if use_predictor and dt > 0 and last_t is not None:
-            G = tau_s * (1.0 - math.exp(-dt / tau_s))
-            denom = dt - G
-            if denom > 1e-3:
-                desired_rate = (error - measured_rate * G) / denom
-            else:
-                desired_rate = kp * error - kd * measured_rate
-        else:
-            desired_rate = kp * error - kd * measured_rate
-        desired_rate = max(-rate_ceiling, min(rate_ceiling, desired_rate))
-        new_angle = 0 if desired_rate >= 0 else 180
-
-        floor_speed = (
-            fine_min_speed
-            if abs(error) <= fine_threshold_factor * arrive_tolerance_deg
-            else min_speed
-        )
-        raw_speed = _rate_to_speed(desired_rate)
-        new_speed = max(floor_speed, raw_speed) if raw_speed > 0 else 0
-
-        print(
-            f"{tag} vc iter={stats['iterations']} dt={dt:.2f}s: "
-            f"error={error:+.3f}° measured_az={measured_az:+.3f}° "
-            f"measured_rate={measured_rate:+.2f}°/s "
-            f"cmd speed={new_speed} angle={new_angle} "
-            f"(desired_rate={desired_rate:+.2f}°/s, "
-            f"ceiling={rate_ceiling:.2f})",
-            flush=True,
-        )
-        _issue(new_speed if new_speed > 0 else 0, new_angle, "vc_issue")
-        # Deadline-based pacing: loop_dt_s is a MINIMUM tick period, not a
-        # fixed delay. When RPCs already take longer than loop_dt_s (the
-        # common case: two ~500 ms Alpaca round-trips = ~1 s per tick), this
-        # sleep is zero and we iterate as fast as the HTTP proxy allows.
-        remaining = loop_dt_s - (time.monotonic() - tick_start)
-        if remaining > 0:
-            time.sleep(remaining)
-
-    if loop_dts:
-        stats["loop_dt_mean_s"] = sum(loop_dts) / len(loop_dts)
-        stats["loop_dt_max_s"] = max(loop_dts)
-
-    if last_speed != 0:
-        _issue(0, 0, "vc_stop")
-        wait_for_mount_idle(cli, timeout_s=3.0)
-
-    if fallback_reason is not None:
-        print(f"{tag} FALLBACK: {fallback_reason}", flush=True)
-        if fallback_goto_fn is not None:
-            stats["fallback_goto_used"] = True
-            if position_logger is not None:
-                position_logger.set_phase("vc_fallback_goto")
-                position_logger.mark_event("vc_fallback_issue", reason=fallback_reason)
-            ok = bool(fallback_goto_fn(cli, target_az_deg, target_alt_deg, loc))
-            if ok:
-                print(f"{tag} fallback: iscope arrived", flush=True)
-            else:
-                print(f"{tag} WARNING: fallback goto did not arrive", flush=True)
-            measured_alt, measured_az = measure_altaz(cli, loc)
-            stats["final_residual_deg"] = wrap_pm180(target_az_deg - measured_az)
-            return measured_alt, measured_az, stats
-        else:
-            # No fallback available — return whatever we got.
-            stats["final_residual_deg"] = error
-            return measured_alt, measured_az, stats
-
-    measured_alt, measured_az = measure_altaz(cli, loc)
-    stats["final_residual_deg"] = wrap_pm180(target_az_deg - measured_az)
-    return measured_alt, measured_az, stats
 
 
 # ---------------------------------------------------------------------------
@@ -943,11 +660,11 @@ def move_azimuth_to_ff(
         and stats["final_residual_deg"] is not None
         and abs(stats["final_residual_deg"]) > fallback_residual_deg
     ):
-        print(
-            f"{tag} FF: final residual "
-            f"{stats['final_residual_deg']:+.3f}° exceeds "
-            f"{fallback_residual_deg}° — falling back to iscope",
-            flush=True,
+        logger.info(
+            "%s FF: final residual %+.3f° exceeds %s° — falling back to iscope",
+            tag,
+            stats["final_residual_deg"],
+            fallback_residual_deg,
         )
         stats["fallback_goto_used"] = True
         if position_logger is not None:
@@ -955,7 +672,7 @@ def move_azimuth_to_ff(
             position_logger.mark_event("ff_fallback_issue")
         ok = bool(fallback_goto_fn(cli, target_az_deg, target_alt_deg, loc))
         if ok:
-            print(f"{tag} FF: fallback iscope arrived", flush=True)
+            logger.info("%s FF: fallback iscope arrived", tag)
         measured_alt, measured_az = measure_altaz(cli, loc)
         stats["final_residual_deg"] = wrap_pm180(target_az_deg - measured_az)
 
@@ -1048,8 +765,12 @@ def unwind_azimuth(
     have ~full headroom. When already within `threshold_deg` of center,
     no motion is issued and an informational stats dict is returned.
 
-    Uses `move_azimuth_to_with_correction` to do the actual motion so
-    the closed-loop FF+FB controller handles convergence.
+    Drives cumulative az to 0 **explicitly** via `move_to_ff(...,
+    force_cum_az_target=0.0)` — the same mechanism `goto_origin` uses to
+    recenter. Going through the wrapped-target path (`pick_cum_target`)
+    would pick the shorter *wrapped* delta, which from a wound-up state
+    (e.g. cum=+300°) lands at ±360° — winding *further* toward a hard stop
+    instead of unwinding. Forcing the cumulative target sidesteps that.
     """
     cum_cur = az_tracker.cum_az_deg
     if abs(cum_cur) <= threshold_deg:
@@ -1072,28 +793,31 @@ def unwind_azimuth(
                 "wall_time_s": 0.0,
             },
         )
-    # Measure to anchor the tracker + get a wrapped-cur for picking the target.
-    _, wrapped_cur, _ = measure_altaz_timed(cli, loc)
+    # Measure to anchor the tracker + read current el so we hold it steady.
+    alt_cur, wrapped_cur, _ = measure_altaz_timed(cli, loc)
     az_tracker.update(wrapped_cur)
-    # We want cumulative to end up at 0 (cable midpoint). The equivalent
-    # wrapped target is:
+    # Wrapped az that corresponds to cumulative 0 — used only for residual
+    # reporting; the actual planning target is forced to cum=0 below.
     target_wrapped = wrap_pm180(wrapped_cur - az_tracker.cum_az_deg)
-    print(
-        f"{tag} unwind: cum={az_tracker.cum_az_deg:+.3f}° -> wrapped "
-        f"target={target_wrapped:+.3f}° (drive back to cable center)",
-        flush=True,
+    logger.info(
+        "%s unwind: cum=%+.3f° -> drive cumulative az to 0 "
+        "(wrapped target %+.3f°, cable center)",
+        tag,
+        az_tracker.cum_az_deg,
+        target_wrapped,
     )
-    return move_azimuth_to_with_correction(
+    return move_to_ff(
         cli,
         target_az_deg=target_wrapped,
+        target_el_deg=alt_cur,  # hold elevation where it is
         cur_az_deg=wrapped_cur,
+        cur_el_deg=alt_cur,
         loc=loc,
-        target_alt_deg=0.0,  # unused when fallback_goto_fn is None
         tag=tag,
         position_logger=position_logger,
         az_limits=az_limits,
         az_tracker=az_tracker,
-        fallback_goto_fn=None,  # do not iscope-fallback during unwind
+        force_cum_az_target=0.0,
         **move_kwargs,
     )
 
@@ -1790,10 +1514,14 @@ def goto_origin(
         stop_cum_ref = az_limits.cw_hard_stop_cum_deg
         stop_wrapped_ref = az_limits.cw_hard_stop_wrapped_deg
 
-    print(
-        f"{tag} before: az={az_before:+.3f}  el={alt_before:+.3f}  "
-        f"(d_ccw={d_ccw:.1f}°, d_cw={d_cw:.1f}° — picking {chosen.upper()})",
-        flush=True,
+    logger.info(
+        "%s before: az=%+.3f  el=%+.3f  (d_ccw=%.1f°, d_cw=%.1f° — picking %s)",
+        tag,
+        az_before,
+        alt_before,
+        d_ccw,
+        d_cw,
+        chosen.upper(),
     )
 
     if position_logger is not None:
@@ -1862,12 +1590,17 @@ def goto_origin(
     drift_from_ref = wrap_pm180(az_at_stop - stop_wrapped_ref)
     t_stage1_elapsed = time.monotonic() - t_stage1_start
 
-    print(
-        f"{tag} stalled {chosen.upper()} at az={az_at_stop:+.3f}  "
-        f"(expected ~{stop_wrapped_ref:+.3f}, drift {drift_from_ref:+.3f}°)  "
-        f"motion={motion_total:.1f}°  bursts={bursts_issued}  "
-        f"t={t_stage1_elapsed:.1f}s",
-        flush=True,
+    logger.info(
+        "%s stalled %s at az=%+.3f  (expected ~%+.3f, drift %+.3f°)  "
+        "motion=%.1f°  bursts=%d  t=%.1fs",
+        tag,
+        chosen.upper(),
+        az_at_stop,
+        stop_wrapped_ref,
+        drift_from_ref,
+        motion_total,
+        bursts_issued,
+        t_stage1_elapsed,
     )
 
     if position_logger is not None:
@@ -1885,10 +1618,11 @@ def goto_origin(
     tracker.reset(cum_az_deg=stop_cum_ref, wrapped_az_deg=az_at_stop)
     alt_at_stop, _, _ = measure_altaz_timed(cli, loc)
 
-    print(
-        f"{tag} unwind: tracker cum={stop_cum_ref:+.1f} -> 0  "
-        f"(delta {-stop_cum_ref:+.1f}°)",
-        flush=True,
+    logger.info(
+        "%s unwind: tracker cum=%+.1f -> 0  (delta %+.1f°)",
+        tag,
+        stop_cum_ref,
+        -stop_cum_ref,
     )
 
     meas_alt, meas_az, stats = move_to_ff(
@@ -1935,17 +1669,6 @@ def goto_origin(
 # ---------------------------------------------------------------------------
 
 
-def radec_to_altaz(
-    ra_h: float,
-    dec_deg: float,
-    loc: EarthLocation,
-    t: Time,
-) -> tuple[float, float]:
-    c = SkyCoord(ra=ra_h * u.hourangle, dec=dec_deg * u.deg)
-    altaz = c.transform_to(AltAz(obstime=t, location=loc))
-    return float(altaz.alt.deg), float(altaz.az.deg)
-
-
 def altaz_to_radec(
     alt_deg: float,
     az_deg: float,
@@ -1969,18 +1692,12 @@ def angular_distance_deg(
 ) -> float:
     """Great-circle angular distance (degrees) between two RA/Dec points.
 
-    RA in hours, Dec in degrees. Uses the spherical law of cosines, clamped
-    to guard against floating-point drift pushing |cos| slightly past 1.
+    RA in hours, Dec in degrees. Thin wrapper over
+    ``device.geometry.angular_separation_deg`` — the same spherical
+    law-of-cosines math on the same sphere; RA hours are scaled to degrees
+    at the boundary and Dec maps to the latitude/elevation argument.
     """
-    ra1 = math.radians(ra1_h * 15.0)
-    ra2 = math.radians(ra2_h * 15.0)
-    d1 = math.radians(dec1_d)
-    d2 = math.radians(dec2_d)
-    cos_d = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(
-        ra1 - ra2
-    )
-    cos_d = max(-1.0, min(1.0, cos_d))
-    return math.degrees(math.acos(cos_d))
+    return angular_separation_deg(ra1_h * 15.0, dec1_d, ra2_h * 15.0, dec2_d)
 
 
 # ---------------------------------------------------------------------------
@@ -2103,7 +1820,7 @@ def iscope_fallback_goto(
     """Standard iscope-goto fallback for the velocity loop.
 
     Matches `FallbackGotoFn` — pass it directly as `fallback_goto_fn=` to
-    `move_azimuth_to_velocity`. Uses the default 3°/60 s tolerance.
+    `move_azimuth_to_ff`. Uses the default 3°/60 s tolerance.
     """
     tgt_ra, tgt_dec = issue_slew(cli, target_az_deg, target_alt_deg, loc)
     ok, _dist, _ = wait_until_near_target(
