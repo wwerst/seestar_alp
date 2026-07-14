@@ -46,6 +46,7 @@ from device.reference_provider import (
 from device.streaming_controller import (
     OffsetSnapshot,
     TickInfo,
+    _mount_azel_to_sky,
     pre_check,
     track,
 )
@@ -1170,16 +1171,35 @@ class LiveTrackSession:
         target_az_wrapped = ((first.az_cum_deg + 180.0) % 360.0) - 180.0
         target_el = max(-30.0, min(85.0, first.el_deg))
 
-        # Pre-flight sun-avoidance check. Uses the target mount-frame
-        # (az, el) as an approximation of sky (az, el) — accurate after
-        # rotation calibration, conservative otherwise since we refuse
-        # a wider neighborhood than strictly needed.
+        # Pre-flight sun-avoidance check. The provider's (az, el) is in the
+        # mount frame; sun-safety is defined in the sky (topocentric) frame.
+        # For an identity/uncalibrated frame the two coincide, so treating
+        # mount az/el as sky is exact there — but once the frame carries a
+        # real rotation calibration (topo_to_mount != I) the raw mount az/el
+        # is the WRONG sky direction. Un-rotate mount->sky first, exactly as
+        # the per-tick net in streaming_controller.track does, so the refusal
+        # keys off the true sky pointing in both cases.
         from device.sun_safety import is_sun_safe as _is_sun_safe
 
-        sun_safe, sun_reason = _is_sun_safe(
-            target_az_wrapped % 360.0,
-            float(target_el),
-        )
+        sun_mount_frame = getattr(self._provider, "mount_frame", None)
+        if sun_mount_frame is None:
+            sun_mount_frame = getattr(self._provider, "_mount_frame", None)
+        if sun_mount_frame is not None:
+            try:
+                sun_check_az, sun_check_el = _mount_azel_to_sky(
+                    sun_mount_frame, target_az_wrapped % 360.0, float(target_el)
+                )
+            except Exception as exc:
+                logger.debug(
+                    "pre-slew mount->sky transform failed (%s); "
+                    "falling back to mount az/el",
+                    exc,
+                )
+                sun_check_az, sun_check_el = target_az_wrapped % 360.0, float(target_el)
+        else:
+            sun_check_az, sun_check_el = target_az_wrapped % 360.0, float(target_el)
+
+        sun_safe, sun_reason = _is_sun_safe(sun_check_az, sun_check_el)
         if not sun_safe:
             with self._lock:
                 self._errors.append(sun_reason)
@@ -1265,14 +1285,106 @@ class LiveTrackSession:
             return None
 
     def pre_check_feasibility(self) -> "Any":  # noqa: F821 (PreCheckResult)
-        """Walk the provider trajectory and report whether it is trackable.
+        """Frame-independent pre-launch feasibility gate.
 
-        Mirrors the CLI track path's pre-flight: verifies the whole planned
-        trajectory stays inside the elevation band and the cable-wrap range
-        before any motion is commanded. Raised as PreCheckFailed by
-        LiveTrackManager.start when infeasible.
+        Verifies the whole planned trajectory stays inside the elevation
+        band (and reports FF/rate saturation) before any motion is
+        commanded. Raised as PreCheckFailed by LiveTrackManager.start when
+        infeasible.
+
+        Cable-wrap enforcement is deliberately NOT done here: the provider's
+        ``az_cum_deg`` is topocentric and only reconciles with the mount's
+        cumulative encoder budget once the runtime anchor offset is applied
+        (see ``streaming_controller.track``). Comparing the raw az_cum
+        against the cable budget before that anchor is known produces both
+        false rejects and false accepts, so the cable-wrap check is deferred
+        to the session thread (``_runtime_cable_wrap_check``), which runs it
+        against the measured anchor.
         """
-        return pre_check(self._provider, az_limits=self._resolve_az_limits())
+        return pre_check(self._provider, az_limits=None)
+
+    def _runtime_cable_wrap_check(
+        self,
+        cli,
+        loc,
+        tracker: CumulativeAzTracker,
+        az_limits: AzimuthLimits | None,
+    ) -> bool:
+        """Deferred cable-wrap feasibility gate, run once the mount's
+        cumulative-az anchor can be measured.
+
+        ``pre_check_feasibility`` intentionally skips cable-wrap enforcement
+        because the provider's topocentric az_cum does not share the mount's
+        cumulative encoder datum until the runtime anchor offset is applied.
+        Here we measure that anchor (``cur_cum_az``) and walk the whole
+        trajectory with ``starting_cum_az_deg=cur_cum_az`` so a track that
+        would cross the ±cable-wrap hard stop from the mount's current
+        wound-up state is refused before the loop commits to it.
+
+        Returns True if the session must abort (records
+        ``exit_reason='cable_wrap'`` and sets the stop event); False to
+        proceed.
+        """
+        if az_limits is None:
+            return False
+        # Fail CLOSED: origin/main refused infeasible tracks synchronously
+        # before any motion; deferring the gate must not turn a transient
+        # measurement error into an unchecked launch. (The in-track
+        # contains_cum check remains the last-resort backstop.)
+        try:
+            _cur_el, cur_az_wrapped, _fw_t = measure_altaz_timed(cli, loc)
+            cur_cum_az = tracker.update(cur_az_wrapped)
+            # pre_check anchors the walk at the trajectory's FIRST sample,
+            # but track() will anchor at the sample nearest NOW. Translate
+            # the starting datum so "now" maps to the measured cur_cum_az —
+            # otherwise a provider whose valid range starts in the past
+            # (live ADS-B buffers) is evaluated at a shifted datum. The
+            # already-elapsed portion of the walk is then merely
+            # conservative (it is never driven).
+            t0, _t1 = self._provider.valid_range()
+            az_cum_start = self._provider.sample(t0).az_cum_deg
+            az_cum_now = self._provider.sample(
+                min(max(time.time(), t0), _t1)
+            ).az_cum_deg
+            starting_cum = cur_cum_az - (az_cum_now - az_cum_start)
+            pre = pre_check(
+                self._provider,
+                az_limits=az_limits,
+                starting_cum_az_deg=starting_cum,
+            )
+        except Exception as exc:
+            reason = f"cable-wrap feasibility could not be verified: {exc}"
+            logger.warning("runtime cable-wrap check failed closed: %s", reason)
+            with self._lock:
+                self._errors.append(reason)
+                self._exit_reason = "cable_wrap_unverified"
+                self._phase = "refused"
+            self._stop_evt.set()
+            return True
+        if pre.cable_wrap_violations > 0:
+            reason = (
+                f"trajectory crosses the cable-wrap hard stop "
+                f"({pre.cable_wrap_violations} tick(s)) from "
+                f"cum_az={cur_cum_az:+.1f}° "
+                f"[usable {az_limits.usable_ccw_cum_deg:+.1f}, "
+                f"{az_limits.usable_cw_cum_deg:+.1f}]"
+            )
+            with self._lock:
+                self._errors.append(f"cable-wrap pre-check failed: {reason}")
+                self._exit_reason = "cable_wrap"
+                self._phase = "refused"
+            self._stop_evt.set()
+            if self._position_logger is not None:
+                try:
+                    self._position_logger.mark_event(
+                        "cable_wrap_pre_check_refused",
+                        cur_cum_az_deg=cur_cum_az,
+                        cable_wrap_violations=pre.cable_wrap_violations,
+                    )
+                except Exception:
+                    pass
+            return True
+        return False
 
     def _run(self) -> None:
         cli = AlpacaClient(self._alpaca_host, self._alpaca_port, self.telescope_id)
@@ -1338,6 +1450,14 @@ class LiveTrackSession:
                     self._phase = "stopped"
                 return
 
+            # Deferred cable-wrap feasibility: now that the mount's
+            # cumulative-az anchor can be measured, refuse a trajectory that
+            # would cross the cable-wrap hard stop from the current wound
+            # state. The pre-launch gate (pre_check_feasibility) only enforces
+            # the frame-independent elevation band.
+            if self._runtime_cable_wrap_check(cli, loc, tracker, az_limits):
+                return
+
             with self._lock:
                 self._phase = "track"
 
@@ -1388,7 +1508,7 @@ class LiveTrackSession:
             if not self.dry_run:
                 from device.sun_safety import sun_safety_jog_in_progress
 
-                if sun_safety_jog_in_progress():
+                if sun_safety_jog_in_progress(self.telescope_id):
                     logger.warning(
                         "session-exit motor stop skipped: sun-safety jog in progress"
                     )
@@ -1485,10 +1605,29 @@ class LiveTrackManager:
                     )
             except ImportError:
                 pass
+            # Refuse if an interactive nighttime calibration session owns this
+            # mount. It slews to reference stars while the operator nudges the
+            # scope; a concurrent live-track would fight it for the mount. This
+            # mirrors NighttimeCalibrationManager.start, which already refuses
+            # to start while the tracker is running — closing the interactive
+            # nighttime <-> live-track exclusion so it holds in both directions.
+            try:
+                from device.nighttime_calibration import get_nighttime_manager
+
+                if get_nighttime_manager().is_running(tid):
+                    raise RuntimeError(
+                        f"telescope {tid} is in interactive nighttime calibration; "
+                        "stop it first"
+                    )
+            except ImportError:
+                pass
             # Feasibility gate: refuse a trajectory that would leave the
-            # elevation band or cross the cable-wrap hard stop before any
-            # motion is commanded. front/app.py maps PreCheckFailed → HTTP
-            # 400. Guarded by getattr so non-session test doubles skip it.
+            # elevation band (or saturate the FF rate) before any motion is
+            # commanded. front/app.py maps PreCheckFailed → HTTP 400. Cable-wrap
+            # is deliberately NOT enforced here — it is deferred to the session
+            # thread (_runtime_cable_wrap_check), which walks the trajectory
+            # against the mount's measured cum-az anchor. Guarded by getattr so
+            # non-session test doubles skip it.
             check = getattr(session, "pre_check_feasibility", None)
             if callable(check):
                 pre = check()

@@ -952,3 +952,54 @@ def test_sun_safety_jog_in_progress_helper():
         assert ss.sun_safety_jog_in_progress() is True
     finally:
         ss.set_sun_monitor(prev)
+
+
+def test_jog_in_progress_is_scoped_to_the_jogged_telescope():
+    """The monitor jogs exactly one scope; a jog on the primary must not
+    suppress motor stops on OTHER mounts. Unknown ids match conservatively."""
+    import time as _time
+
+    from device import sun_safety as ss
+
+    m = SunSafetyMonitor(
+        altaz_reader=lambda: None,
+        jog_command=lambda *a: None,
+        lat_deg=33.96,
+        lon_deg=-118.46,
+        jog_telescope_id=1,
+    )
+    prev = ss.get_sun_monitor()
+    ss.set_sun_monitor(m)
+    try:
+        with m._lock:
+            m._jog_until_ts = _time.time() + 5.0
+        assert ss.sun_safety_jog_in_progress(1) is True
+        assert ss.sun_safety_jog_in_progress(2) is False, (
+            "stop on a different mount must not be suppressed"
+        )
+        assert ss.sun_safety_jog_in_progress(None) is True  # unknown caller
+    finally:
+        ss.set_sun_monitor(prev)
+
+
+def test_jog_in_progress_unknown_jog_scope_matches_all():
+    """Without a configured jog_telescope_id the window conservatively
+    matches every telescope (pre-scoping behavior)."""
+    import time as _time
+
+    from device import sun_safety as ss
+
+    m = SunSafetyMonitor(
+        altaz_reader=lambda: None,
+        jog_command=lambda *a: None,
+        lat_deg=33.96,
+        lon_deg=-118.46,
+    )
+    prev = ss.get_sun_monitor()
+    ss.set_sun_monitor(m)
+    try:
+        with m._lock:
+            m._jog_until_ts = _time.time() + 5.0
+        assert ss.sun_safety_jog_in_progress(7) is True
+    finally:
+        ss.set_sun_monitor(prev)

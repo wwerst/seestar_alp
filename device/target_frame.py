@@ -31,10 +31,10 @@ from pathlib import Path
 
 import numpy as np
 
+from device.geometry import unwrap_az_series
 from scripts.trajectory.observer import (
     ObserverSite,
     build_site,
-    unwrap_az_series,
 )
 
 
@@ -236,7 +236,12 @@ class MountFrame:
         if len(t) < 4:
             raise ValueError(f"need ≥4 samples for v/a derivation; got {len(t)}")
         az_wrapped, el, slant = self.ecef_array_to_mount(ecef_xyz)
-        az_cum = unwrap_az_series(az_wrapped)
+        # Guard at the ingestion boundary: the canonical device.geometry
+        # unwrap_az_series raises ValueError on any non-finite az (produced
+        # by a NaN/Inf ECEF sample) so one bad reading is rejected here
+        # instead of silently poisoning az_cum and the whole derived v/a
+        # table for the rest of the session (int(round(NaN)) aborts later).
+        az_cum = np.asarray(unwrap_az_series(az_wrapped.tolist()), dtype=float)
         v_az = _smoothed_derivative(az_cum, t)
         v_el = _smoothed_derivative(el, t)
         a_az = _smoothed_derivative(v_az, t)

@@ -215,8 +215,14 @@
   let status = { active: false };
   let cellPolling = null;
   let statusPolling = null;
+  let slowStatusPolling = null;
   let sse = null;
   let overlays = new Map(); // name → {points, options}
+  // SSE-surfaced errors (system_error / slew_refused). Kept client-side so a
+  // sun-safety slew refusal — which the mapper records as a refusal, not an
+  // error, so it never lands in status.errors — stays visible across the
+  // status refreshes that rewrite the error box.
+  let clientErrors = [];
 
   function fmtElapsed(s) {
     if (s == null) return '—';
@@ -438,30 +444,57 @@
     } else {
       stopBox.style.display = 'none';
     }
-    // Errors.
-    const errBox = document.getElementById('svm-errors');
-    if (Array.isArray(status.errors) && status.errors.length) {
-      errBox.style.display = '';
-      errBox.textContent = status.errors.slice(-5).join('\n');
-    } else {
-      errBox.style.display = 'none';
-    }
+    // Errors. Rendered from the mapper's authoritative list plus any
+    // SSE-surfaced client errors (see renderErrors / clientErrors).
+    renderErrors();
     // Route the live-update transport off the run state. Every status update
     // flows through here, so this is the single place that decides whether we
     // need SSE, fallback polling, or nothing at all.
     syncTransports();
   }
 
+  function renderErrors() {
+    // Combine the mapper's authoritative error list with the client-side
+    // buffer of SSE-surfaced errors/refusals so both survive a status refresh
+    // (a slew_refused never appears in status.errors).
+    const errBox = document.getElementById('svm-errors');
+    const base = Array.isArray(status.errors) ? status.errors : [];
+    const all = base.concat(clientErrors);
+    if (all.length) {
+      errBox.style.display = '';
+      errBox.textContent = all.slice(-5).join('\n');
+    } else {
+      errBox.style.display = 'none';
+    }
+  }
+
+  function pushClientError(line) {
+    clientErrors.push(line);
+    // Bound the buffer so a long refusal/error storm can't grow it unbounded.
+    if (clientErrors.length > 20) clientErrors = clientErrors.slice(-20);
+    renderErrors();
+  }
+
   function syncTransports() {
-    // SSE is the primary channel while a run is active; the 2s/5s polling
-    // loops are only a fallback for when SSE drops (see onopen/onerror). When
-    // the run goes idle we tear everything down so we stop hammering the
-    // single-threaded server for a run that isn't happening.
+    // SSE is the primary channel while a run is active; the fast 2s/5s polling
+    // loops are only a fallback for when SSE drops (see onopen/onerror). A
+    // separate low-rate status-only poll runs the whole time a run is active
+    // (see startSlowStatusPoll). When the run goes idle we tear everything
+    // down so we stop hammering the single-threaded server for a run that
+    // isn't happening.
     if (status.active) {
       if (!sse) startSse();
+      // Low-rate status-only refresh. The mapper emits no periodic status
+      // event and onmessage only re-reads status on init/complete, so without
+      // this the elapsed/ETA/quality/Stop-countdown fields freeze for up to
+      // the 300s SSE cap. This is the deliberate exception to onopen's
+      // stopPolling(): it keeps running while SSE is healthy; the fast 2s/5s
+      // fallback loops stay off until SSE actually drops.
+      startSlowStatusPoll();
     } else {
       if (sse) { try { sse.close(); } catch (e) { /* swallow */ } sse = null; }
       stopPolling();
+      stopSlowStatusPoll();
     }
   }
 
@@ -514,6 +547,10 @@
         try {
           const data = JSON.parse(msg.data);
           if (data.type === 'init' && data.status) {
+            // A fresh run starts a fresh error slate — errors from a prior
+            // run must not linger as if they were current.
+            clientErrors = [];
+            renderErrors();
             applyStatus(data.status);
             return;
           }
@@ -528,6 +565,27 @@
             try { sse && sse.close(); } catch (e) { /* swallow */ }
             sse = null;
             stopPolling();
+            stopSlowStatusPoll();
+            return;
+          }
+          if (data.type === 'system_error') {
+            const stage = data.stage || 'unknown';
+            pushClientError(
+              `system error (${stage})` + (data.error ? `: ${data.error}` : '')
+            );
+            // A run-affecting error is a notable state change; pull fresh
+            // status now instead of waiting for the slow poll.
+            fetchStatus();
+            return;
+          }
+          if (data.type === 'slew_refused') {
+            // Sun-safety (or other) slew refusal. The mapper records it as a
+            // refusal — not an error — so it never shows up in status.errors;
+            // surface it here or it is lost entirely.
+            const az = (typeof data.az === 'number') ? data.az.toFixed(1) : '—';
+            const alt = (typeof data.alt === 'number') ? data.alt.toFixed(1) : '—';
+            pushClientError(`slew refused (sun safety) @ az ${az}° / alt ${alt}°`);
+            fetchStatus();
             return;
           }
         } catch (e) { /* swallow */ }
@@ -556,6 +614,18 @@
     if (cellPolling) clearInterval(cellPolling);
     statusPolling = null;
     cellPolling = null;
+  }
+
+  function startSlowStatusPoll() {
+    if (slowStatusPolling) return;  // idempotent — one slow loop at a time
+    // Status-only, low rate. Deliberately survives sse.onopen's stopPolling()
+    // so the status panel stays live while SSE is healthy.
+    slowStatusPolling = setInterval(fetchStatus, 8000);
+  }
+
+  function stopSlowStatusPoll() {
+    if (slowStatusPolling) clearInterval(slowStatusPolling);
+    slowStatusPolling = null;
   }
 
   startBtn.addEventListener('click', async () => {

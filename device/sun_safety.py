@@ -330,10 +330,17 @@ class SunSafetyMonitor:
         tick_interval_active_s: float = 2.0,
         tick_interval_dormant_s: float = 60.0,
         enabled: bool = True,
+        jog_telescope_id: Optional[int] = None,
     ) -> None:
         self._altaz_reader = altaz_reader
         self._jog_command = jog_command
         self._abort_active = abort_active
+        # Which telescope the jog_command drives (the monitor senses and
+        # jogs a single scope). None = unknown -> jog-window queries match
+        # every telescope (conservative).
+        self._jog_telescope_id = (
+            int(jog_telescope_id) if jog_telescope_id is not None else None
+        )
         self._lat_deg = lat_deg
         self._lon_deg = lon_deg
 
@@ -642,16 +649,27 @@ class SunSafetyMonitor:
         )
         return sep, angle
 
-    def is_jog_in_progress(self) -> bool:
+    def is_jog_in_progress(self, telescope_id: Optional[int] = None) -> bool:
         """True while an emergency jog command is executing on the mount.
 
         Session-exit direct motor-stops (which deliberately bypass the
         lockout-aware wrapper) consult this so they don't cancel the
         in-flight jog — the jog's own firmware dur_sec bounds it, so
         skipping the stop cannot leave the motor running.
+
+        The monitor jogs exactly one scope (``jog_telescope_id``). Pass the
+        telescope the stop targets so a jog on the primary does not suppress
+        motor stops on OTHER mounts; ``None`` (caller's scope unknown) and an
+        unknown jog scope both match conservatively.
         """
         with self._lock:
-            return time.time() < self._jog_until_ts
+            if time.time() >= self._jog_until_ts:
+                return False
+            return (
+                telescope_id is None
+                or self._jog_telescope_id is None
+                or int(telescope_id) == self._jog_telescope_id
+            )
 
 
 def make_scope_altaz_reader(method_sync: Callable[..., object]) -> AltazReader:
@@ -728,15 +746,17 @@ def sun_safety_is_locked_out() -> bool:
     return bool(m is not None and m.is_locked_out())
 
 
-def sun_safety_jog_in_progress() -> bool:
+def sun_safety_jog_in_progress(telescope_id: Optional[int] = None) -> bool:
     """True while the monitor's emergency jog is executing on the mount.
 
     Session-exit direct motor-stops consult this before issuing their raw
-    ``scope_speed_move(speed=0)`` so they don't cancel the jog-away. Returns
-    False when no monitor is installed. Never raises.
+    ``scope_speed_move(speed=0)`` so they don't cancel the jog-away. Pass
+    the telescope id the stop targets — the jog only ever drives the
+    monitor's scope, and a stop on a different mount must not be
+    suppressed. Returns False when no monitor is installed. Never raises.
     """
     m = get_sun_monitor()
-    return bool(m is not None and m.is_jog_in_progress())
+    return bool(m is not None and m.is_jog_in_progress(telescope_id))
 
 
 __all__ = [

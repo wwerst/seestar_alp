@@ -16,6 +16,7 @@ import pytest
 from device.target_frame import MountFrame
 from scripts.trajectory.observer import (
     lla_to_ecef,
+    unwrap_az_series,
 )
 
 
@@ -144,6 +145,60 @@ def test_trajectory_rejects_short_input():
     mf = MountFrame.from_identity_enu()
     with pytest.raises(ValueError):
         mf.ecef_traj_to_mount(np.zeros((3, 3)), np.zeros(3))
+
+
+# --------------- M1: non-finite ingestion guard --------------------
+
+
+def _straight_flight_ecef(mf: MountFrame, n: int = 6):
+    """Build (ecef_arr, t) for a target flying east 5 km north, 3 km up."""
+    site = mf.site
+    t = 1_700_000_000.0 + np.arange(n) * 1.0
+    east = 100.0 * (t - t[0])
+    ecef_list = []
+    for e in east:
+        lat, lon = _offset_latlon(site.lat_deg, site.lon_deg, 5000.0, float(e))
+        ecef_list.append(lla_to_ecef(lat, lon, site.alt_m + 3000.0))
+    return np.array(ecef_list), t
+
+
+def test_ecef_traj_to_mount_rejects_non_finite_sample():
+    """M1: a single non-finite ECEF sample must be rejected at the ingestion
+    boundary (ValueError) instead of silently poisoning the whole az_cum /
+    v_az / a_az table with NaN — which later aborts a session at
+    int(round(NaN)). ecef_traj_to_mount now routes az unwrapping through the
+    guarded device.geometry.unwrap_az_series."""
+    mf = MountFrame.from_identity_enu()
+    ecef_arr, t = _straight_flight_ecef(mf, n=6)
+
+    # Sanity: the clean array yields a fully finite table (guard only fires
+    # on the bad sample, it doesn't reject good trajectories).
+    traj = mf.ecef_traj_to_mount(ecef_arr, t)
+    assert np.all(np.isfinite(traj["az_cum_deg"]))
+
+    # Corrupt one ECEF coordinate → the derived az is NaN → unwrap rejects it.
+    bad = ecef_arr.copy()
+    bad[3, 0] = np.nan
+    with pytest.raises(ValueError):
+        mf.ecef_traj_to_mount(bad, t)
+
+
+def test_observer_unwrap_az_series_is_guarded_reexport():
+    """M1: scripts.trajectory.observer.unwrap_az_series is now a thin wrapper
+    over the guarded device.geometry implementation. It keeps its numpy
+    in/out contract for the trajectory callers, but a non-finite sample is
+    rejected at the boundary instead of poisoning the tail."""
+    out = unwrap_az_series(np.array([170.0, 175.0, -175.0, -170.0]))
+    assert isinstance(out, np.ndarray)
+    assert list(out) == pytest.approx([170.0, 175.0, 185.0, 190.0])
+    # Empty input still round-trips to an empty array.
+    assert unwrap_az_series(np.array([])).size == 0
+    # Non-finite is now rejected (the whole point of retiring the unguarded
+    # duplicate).
+    with pytest.raises(ValueError):
+        unwrap_az_series(np.array([0.0, np.nan, 10.0]))
+    with pytest.raises(ValueError):
+        unwrap_az_series(np.array([0.0, np.inf, 10.0]))
 
 
 # --------------- SE(3) origin offset --------------------------------

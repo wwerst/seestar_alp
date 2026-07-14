@@ -691,3 +691,463 @@ def test_auto_refused_when_visibility_running(monkeypatch):
             auto_mgr.start(25, _FakeAutoRunner(25))
     finally:
         vis_mgr.stop(25, force=True)
+
+
+# ---------- Calibration / CalibrateMotion / NighttimeInteractive ------
+#
+# The three interactive calibration managers (rotation CalibrationManager,
+# CalibrateMotionManager, and the interactive NighttimeCalibrationManager)
+# historically cross-checked ONLY the live tracker: a running visibility
+# map or nighttime auto-run — or each other — did not block them. They now
+# route the whole cross-check through ``raise_if_scope_busy`` so every other
+# mount-driving manager blocks them, EXCEPT the documented allowed pairs:
+#   - rotation calibration  <-> calibrate-motion   (cal delegates its motion)
+#   - nighttime interactive <-> calibrate-motion   (operator nudges via motion)
+# Both allowances are symmetric; the tests below assert refusal for every
+# non-allowed ordering and success for the two allowed pairs.
+
+
+class _FakeNighttimeInteractiveSession:
+    """Stand-in for the interactive :class:`NighttimeCalibrationSession`.
+    ``NighttimeCalibrationManager`` registers the session directly (it does
+    not call ``start()``) and reports liveness via ``is_active()``."""
+
+    def __init__(self, telescope_id: int) -> None:
+        self.telescope_id = int(telescope_id)
+        self._active = True
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._active = False
+
+    def status(self):
+        return None
+
+
+# ----- rotation calibration (CalibrationManager) -----
+
+
+def test_cal_refused_when_visibility_running(monkeypatch):
+    """visibility map running -> rotation-cal start refused."""
+    import device.rotation_calibration as rc
+    import device.visibility_mapper as vm
+    from device.rotation_calibration import CalibrationManager
+    from device.visibility_mapper import VisibilityMapManager
+
+    vis_mgr = VisibilityMapManager()
+    cal_mgr = CalibrationManager()
+    monkeypatch.setattr(vm, "_MANAGER", vis_mgr)
+    monkeypatch.setattr(rc, "_MANAGER", cal_mgr)
+    vis_mgr.start(_FakeVisibilityMapper(700))
+    try:
+        with pytest.raises(RuntimeError, match="visibility map"):
+            cal_mgr.start(_FakeCalSession(700))
+    finally:
+        vis_mgr.stop(700, force=True)
+
+
+def test_cal_refused_when_auto_running(monkeypatch):
+    """nighttime auto-run running -> rotation-cal start refused."""
+    import device.nighttime_calibration as nc
+    import device.rotation_calibration as rc
+    from device.nighttime_calibration import NighttimeAutoManager
+    from device.rotation_calibration import CalibrationManager
+
+    auto_mgr = NighttimeAutoManager()
+    cal_mgr = CalibrationManager()
+    monkeypatch.setattr(nc, "_AUTO_MANAGER", auto_mgr)
+    monkeypatch.setattr(rc, "_MANAGER", cal_mgr)
+    auto_mgr.start(701, _FakeAutoRunner(701))
+    try:
+        with pytest.raises(RuntimeError, match="auto-run"):
+            cal_mgr.start(_FakeCalSession(701))
+    finally:
+        auto_mgr.stop(701)
+
+
+def test_cal_refused_when_nighttime_interactive_running(monkeypatch):
+    """interactive nighttime calibration running -> rotation-cal refused."""
+    import device.nighttime_calibration as nc
+    import device.rotation_calibration as rc
+    from device.nighttime_calibration import NighttimeCalibrationManager
+    from device.rotation_calibration import CalibrationManager
+
+    night_mgr = NighttimeCalibrationManager()
+    cal_mgr = CalibrationManager()
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    monkeypatch.setattr(rc, "_MANAGER", cal_mgr)
+    night_mgr.start(_FakeNighttimeInteractiveSession(702))
+    try:
+        with pytest.raises(RuntimeError, match="interactive nighttime"):
+            cal_mgr.start(_FakeCalSession(702))
+    finally:
+        night_mgr.stop(702)
+
+
+def test_cal_allowed_when_motion_running(monkeypatch):
+    """Documented allowed pair: rotation calibration may start while a
+    calibrate-motion session is running (it delegates its motion to it)."""
+    import device.calibrate_motion as cm
+    import device.rotation_calibration as rc
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.rotation_calibration import CalibrationManager
+
+    motion_mgr = CalibrateMotionManager()
+    cal_mgr = CalibrationManager()
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+    monkeypatch.setattr(rc, "_MANAGER", cal_mgr)
+    motion_mgr.start(_FakeMotionSession(703))
+    try:
+        cal_mgr.start(_FakeCalSession(703))
+        assert cal_mgr.is_running(703)
+    finally:
+        cal_mgr.stop(703)
+        motion_mgr.stop(703)
+
+
+# ----- calibrate-motion (CalibrateMotionManager) -----
+
+
+def test_motion_refused_when_visibility_running(monkeypatch):
+    """visibility map running -> calibrate-motion start refused."""
+    import device.calibrate_motion as cm
+    import device.visibility_mapper as vm
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.visibility_mapper import VisibilityMapManager
+
+    vis_mgr = VisibilityMapManager()
+    motion_mgr = CalibrateMotionManager()
+    monkeypatch.setattr(vm, "_MANAGER", vis_mgr)
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+    vis_mgr.start(_FakeVisibilityMapper(710))
+    try:
+        with pytest.raises(RuntimeError, match="visibility map"):
+            motion_mgr.start(_FakeMotionSession(710))
+    finally:
+        vis_mgr.stop(710, force=True)
+
+
+def test_motion_refused_when_auto_running(monkeypatch):
+    """nighttime auto-run running -> calibrate-motion start refused."""
+    import device.calibrate_motion as cm
+    import device.nighttime_calibration as nc
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.nighttime_calibration import NighttimeAutoManager
+
+    auto_mgr = NighttimeAutoManager()
+    motion_mgr = CalibrateMotionManager()
+    monkeypatch.setattr(nc, "_AUTO_MANAGER", auto_mgr)
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+    auto_mgr.start(711, _FakeAutoRunner(711))
+    try:
+        with pytest.raises(RuntimeError, match="auto-run"):
+            motion_mgr.start(_FakeMotionSession(711))
+    finally:
+        auto_mgr.stop(711)
+
+
+def test_motion_allowed_when_cal_running(monkeypatch):
+    """Documented allowed pair (reciprocal): calibrate-motion may start
+    while a rotation CalibrationSession is running."""
+    import device.calibrate_motion as cm
+    import device.rotation_calibration as rc
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.rotation_calibration import CalibrationManager
+
+    cal_mgr = CalibrationManager()
+    motion_mgr = CalibrateMotionManager()
+    monkeypatch.setattr(rc, "_MANAGER", cal_mgr)
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+    cal_mgr.start(_FakeCalSession(712))
+    try:
+        motion_mgr.start(_FakeMotionSession(712))
+        assert motion_mgr.is_running(712)
+    finally:
+        motion_mgr.stop(712)
+        cal_mgr.stop(712)
+
+
+def test_motion_allowed_when_nighttime_interactive_running(monkeypatch):
+    """Documented allowed pair: calibrate-motion may start while the
+    interactive nighttime calibration session is running."""
+    import device.calibrate_motion as cm
+    import device.nighttime_calibration as nc
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.nighttime_calibration import NighttimeCalibrationManager
+
+    night_mgr = NighttimeCalibrationManager()
+    motion_mgr = CalibrateMotionManager()
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+    night_mgr.start(_FakeNighttimeInteractiveSession(713))
+    try:
+        motion_mgr.start(_FakeMotionSession(713))
+        assert motion_mgr.is_running(713)
+    finally:
+        motion_mgr.stop(713)
+        night_mgr.stop(713)
+
+
+# ----- interactive nighttime calibration (NighttimeCalibrationManager) -----
+
+
+def test_nighttime_interactive_refused_when_visibility_running(monkeypatch):
+    """visibility map running -> interactive nighttime-cal start refused."""
+    import device.nighttime_calibration as nc
+    import device.visibility_mapper as vm
+    from device.nighttime_calibration import NighttimeCalibrationManager
+    from device.visibility_mapper import VisibilityMapManager
+
+    vis_mgr = VisibilityMapManager()
+    night_mgr = NighttimeCalibrationManager()
+    monkeypatch.setattr(vm, "_MANAGER", vis_mgr)
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    vis_mgr.start(_FakeVisibilityMapper(720))
+    try:
+        with pytest.raises(RuntimeError, match="visibility map"):
+            night_mgr.start(_FakeNighttimeInteractiveSession(720))
+    finally:
+        vis_mgr.stop(720, force=True)
+
+
+def test_nighttime_interactive_refused_when_auto_running(monkeypatch):
+    """nighttime auto-run running -> interactive nighttime-cal refused."""
+    import device.nighttime_calibration as nc
+    from device.nighttime_calibration import (
+        NighttimeAutoManager,
+        NighttimeCalibrationManager,
+    )
+
+    auto_mgr = NighttimeAutoManager()
+    night_mgr = NighttimeCalibrationManager()
+    monkeypatch.setattr(nc, "_AUTO_MANAGER", auto_mgr)
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    auto_mgr.start(721, _FakeAutoRunner(721))
+    try:
+        with pytest.raises(RuntimeError, match="auto-run"):
+            night_mgr.start(_FakeNighttimeInteractiveSession(721))
+    finally:
+        auto_mgr.stop(721)
+
+
+def test_nighttime_interactive_refused_when_cal_running(monkeypatch):
+    """rotation calibration running -> interactive nighttime-cal refused."""
+    import device.nighttime_calibration as nc
+    import device.rotation_calibration as rc
+    from device.nighttime_calibration import NighttimeCalibrationManager
+    from device.rotation_calibration import CalibrationManager
+
+    cal_mgr = CalibrationManager()
+    night_mgr = NighttimeCalibrationManager()
+    monkeypatch.setattr(rc, "_MANAGER", cal_mgr)
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    cal_mgr.start(_FakeCalSession(722))
+    try:
+        with pytest.raises(RuntimeError, match="calibrating"):
+            night_mgr.start(_FakeNighttimeInteractiveSession(722))
+    finally:
+        cal_mgr.stop(722)
+
+
+def test_nighttime_interactive_allowed_when_motion_running(monkeypatch):
+    """Documented allowed pair: the interactive nighttime session may start
+    while a calibrate-motion session is running (it drives the nudges)."""
+    import device.calibrate_motion as cm
+    import device.nighttime_calibration as nc
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.nighttime_calibration import NighttimeCalibrationManager
+
+    motion_mgr = CalibrateMotionManager()
+    night_mgr = NighttimeCalibrationManager()
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    motion_mgr.start(_FakeMotionSession(723))
+    try:
+        night_mgr.start(_FakeNighttimeInteractiveSession(723))
+        assert night_mgr.is_running(723)
+    finally:
+        night_mgr.stop(723)
+        motion_mgr.stop(723)
+
+
+# ---------- Directed-pair matrix completion / symmetry ----------------
+#
+# The refusal tests above cover one direction of most manager pairs. The
+# exclusion web must be *symmetric*: for every non-allowed pair, "X running
+# -> Y refused" must hold in BOTH orderings. The tests below fill the
+# remaining untested directed pairs so all 30 (X, Y) orderings across the six
+# mount-driving managers are asserted.
+#
+# The load-bearing one is live-track <-> interactive nighttime calibration:
+# ``NighttimeCalibrationManager.start`` already refused to start while the
+# tracker was running, but ``LiveTrackManager.start`` hand-rolls its cross
+# checks and originally omitted the interactive-nighttime manager — so the
+# reverse ordering (interactive running -> tracker start) slipped through and
+# let two controllers drive the same mount. The live tracker now cross-checks
+# the interactive manager, and the pair of tests below pin the exclusion in
+# both directions.
+
+
+def test_nighttime_interactive_refused_when_tracker_running(monkeypatch):
+    """live-track first -> interactive nighttime-cal start refused (the
+    interactive manager cross-checks the tracker)."""
+    import device.live_tracker as lt
+    import device.nighttime_calibration as nc
+    from device.live_tracker import LiveTrackManager
+    from device.nighttime_calibration import NighttimeCalibrationManager
+
+    track_mgr = LiveTrackManager()
+    night_mgr = NighttimeCalibrationManager()
+    monkeypatch.setattr(lt, "_MANAGER", track_mgr)
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    track_mgr.start(_FakeTrackerSession(730))
+    try:
+        with pytest.raises(RuntimeError, match="live-tracking"):
+            night_mgr.start(_FakeNighttimeInteractiveSession(730))
+    finally:
+        track_mgr.stop(730)
+
+
+def test_tracker_refused_when_nighttime_interactive_running(monkeypatch):
+    """Reciprocal (regression for the missing check): interactive nighttime
+    calibration first -> live-track on the same scope must be refused. The
+    live tracker now cross-checks the interactive nighttime manager, closing
+    the interactive <-> live-track exclusion so it holds in both directions."""
+    import device.live_tracker as lt
+    import device.nighttime_calibration as nc
+    from device.live_tracker import LiveTrackManager
+    from device.nighttime_calibration import NighttimeCalibrationManager
+
+    track_mgr = LiveTrackManager()
+    night_mgr = NighttimeCalibrationManager()
+    monkeypatch.setattr(lt, "_MANAGER", track_mgr)
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    night_mgr.start(_FakeNighttimeInteractiveSession(731))
+    try:
+        with pytest.raises(RuntimeError, match="interactive nighttime"):
+            track_mgr.start(_FakeTrackerSession(731))
+    finally:
+        night_mgr.stop(731)
+
+
+def test_visibility_refused_when_cal_running(monkeypatch):
+    """rotation calibration first -> visibility map start refused (reverse of
+    test_cal_refused_when_visibility_running)."""
+    import device.rotation_calibration as rc
+    import device.visibility_mapper as vm
+    from device.rotation_calibration import CalibrationManager
+    from device.visibility_mapper import VisibilityMapManager
+
+    cal_mgr = CalibrationManager()
+    vis_mgr = VisibilityMapManager()
+    monkeypatch.setattr(rc, "_MANAGER", cal_mgr)
+    monkeypatch.setattr(vm, "_MANAGER", vis_mgr)
+    cal_mgr.start(_FakeCalSession(732))
+    try:
+        with pytest.raises(RuntimeError, match="calibrating"):
+            vis_mgr.start(_FakeVisibilityMapper(732))
+    finally:
+        cal_mgr.stop(732)
+
+
+def test_auto_refused_when_cal_running(monkeypatch):
+    """rotation calibration first -> nighttime auto-run start refused (reverse
+    of test_cal_refused_when_auto_running)."""
+    import device.nighttime_calibration as nc
+    import device.rotation_calibration as rc
+    from device.nighttime_calibration import NighttimeAutoManager
+    from device.rotation_calibration import CalibrationManager
+
+    cal_mgr = CalibrationManager()
+    auto_mgr = NighttimeAutoManager()
+    monkeypatch.setattr(rc, "_MANAGER", cal_mgr)
+    monkeypatch.setattr(nc, "_AUTO_MANAGER", auto_mgr)
+    cal_mgr.start(_FakeCalSession(733))
+    try:
+        with pytest.raises(RuntimeError, match="calibrating"):
+            auto_mgr.start(733, _FakeAutoRunner(733))
+    finally:
+        cal_mgr.stop(733)
+
+
+def test_visibility_refused_when_motion_running(monkeypatch):
+    """calibrate-motion first -> visibility map start refused (reverse of
+    test_motion_refused_when_visibility_running)."""
+    import device.calibrate_motion as cm
+    import device.visibility_mapper as vm
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.visibility_mapper import VisibilityMapManager
+
+    motion_mgr = CalibrateMotionManager()
+    vis_mgr = VisibilityMapManager()
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+    monkeypatch.setattr(vm, "_MANAGER", vis_mgr)
+    motion_mgr.start(_FakeMotionSession(734))
+    try:
+        with pytest.raises(RuntimeError, match="calibrate-motion"):
+            vis_mgr.start(_FakeVisibilityMapper(734))
+    finally:
+        motion_mgr.stop(734)
+
+
+def test_auto_refused_when_motion_running(monkeypatch):
+    """calibrate-motion first -> nighttime auto-run start refused (reverse of
+    test_motion_refused_when_auto_running)."""
+    import device.calibrate_motion as cm
+    import device.nighttime_calibration as nc
+    from device.calibrate_motion import CalibrateMotionManager
+    from device.nighttime_calibration import NighttimeAutoManager
+
+    motion_mgr = CalibrateMotionManager()
+    auto_mgr = NighttimeAutoManager()
+    monkeypatch.setattr(cm, "_MANAGER", motion_mgr)
+    monkeypatch.setattr(nc, "_AUTO_MANAGER", auto_mgr)
+    motion_mgr.start(_FakeMotionSession(735))
+    try:
+        with pytest.raises(RuntimeError, match="calibrate-motion"):
+            auto_mgr.start(735, _FakeAutoRunner(735))
+    finally:
+        motion_mgr.stop(735)
+
+
+def test_visibility_refused_when_nighttime_interactive_running(monkeypatch):
+    """interactive nighttime calibration first -> visibility map refused
+    (reverse of test_nighttime_interactive_refused_when_visibility_running)."""
+    import device.nighttime_calibration as nc
+    import device.visibility_mapper as vm
+    from device.nighttime_calibration import NighttimeCalibrationManager
+    from device.visibility_mapper import VisibilityMapManager
+
+    night_mgr = NighttimeCalibrationManager()
+    vis_mgr = VisibilityMapManager()
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    monkeypatch.setattr(vm, "_MANAGER", vis_mgr)
+    night_mgr.start(_FakeNighttimeInteractiveSession(736))
+    try:
+        with pytest.raises(RuntimeError, match="interactive nighttime"):
+            vis_mgr.start(_FakeVisibilityMapper(736))
+    finally:
+        night_mgr.stop(736)
+
+
+def test_auto_refused_when_nighttime_interactive_running(monkeypatch):
+    """interactive nighttime calibration first -> nighttime auto-run refused
+    (reverse of test_nighttime_interactive_refused_when_auto_running)."""
+    import device.nighttime_calibration as nc
+    from device.nighttime_calibration import (
+        NighttimeAutoManager,
+        NighttimeCalibrationManager,
+    )
+
+    night_mgr = NighttimeCalibrationManager()
+    auto_mgr = NighttimeAutoManager()
+    monkeypatch.setattr(nc, "_MANAGER", night_mgr)
+    monkeypatch.setattr(nc, "_AUTO_MANAGER", auto_mgr)
+    night_mgr.start(_FakeNighttimeInteractiveSession(737))
+    try:
+        with pytest.raises(RuntimeError, match="interactive nighttime"):
+            auto_mgr.start(737, _FakeAutoRunner(737))
+    finally:
+        night_mgr.stop(737)

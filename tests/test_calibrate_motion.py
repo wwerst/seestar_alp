@@ -306,6 +306,63 @@ def test_session_outer_motor_stop_bypasses_sun_safety_lockout(monkeypatch, tmp_p
     )
 
 
+def test_session_outer_motor_stop_skipped_during_sun_safety_jog(monkeypatch, tmp_path):
+    """H1: companion to the lockout-bypass test above. While the sun-safety
+    monitor's emergency jog-away is in flight, the session's outer ``finally``
+    must SKIP the raw ``scope_speed_move(0, 0, 1)`` — issuing it would cancel
+    the jog-away and strand the mount inside the sun cone. The jog's firmware
+    ``dur_sec`` bounds the motion, so skipping cannot leave the motor running.
+
+    This mirrors the identical guard in ``CalibrationSession._run``,
+    ``LiveTrackSession`` and ``velocity_controller._motor_stop_on_exit`` — all
+    four raw-stop sites must skip under an active jog window.
+    """
+    import device.streaming_controller as sc
+    from device.sun_safety import SunSafetyLocked
+
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=30.0)
+    _install_fake_cli(monkeypatch, cli)
+
+    # Prime a non-zero tick command so a successful zero-cleanup would be
+    # observable as a change to ``last_cmd``.
+    cli.method_sync(
+        "scope_speed_move",
+        {"speed": 100, "angle": 0, "dur_sec": 5},
+    )
+    assert cli.state.last_cmd == (100, 0, 5)
+
+    # Refuse every ``speed_move`` so the inner (streaming-controller) cleanup
+    # cannot zero the motor — the outer raw ``method_sync`` stop is then the
+    # only remaining path to a zero command, and the jog guard must skip it.
+    def _refused(*_a, **_kw):
+        raise SunSafetyLocked("test: lockout active")
+
+    monkeypatch.setattr(sc, "speed_move", _refused)
+    # Emergency jog-away in flight → outer raw stop must be skipped.
+    monkeypatch.setattr(
+        "device.sun_safety.sun_safety_jog_in_progress", lambda tid=None: True
+    )
+
+    session = CalibrateMotionSession(
+        telescope_id=99,
+        log_dir=tmp_path,
+        max_duration_s=5.0,
+    )
+    session.start()
+    try:
+        time.sleep(0.6)
+    finally:
+        session.stop(timeout=3.0)
+    assert not session.is_alive()
+    # Outer raw stop skipped → the primed command is untouched; in particular
+    # ``last_cmd`` is NOT the (0, 0, 1) session-exit stop.
+    assert cli.state.last_cmd == (100, 0, 5), (
+        "outer motor-stop fired during the sun-safety jog window; "
+        f"last_cmd={cli.state.last_cmd}"
+    )
+
+
 def test_is_settled_false_until_history_full(monkeypatch, tmp_path):
     cli = FakeMountClient()
     _install_fake_cli(monkeypatch, cli)

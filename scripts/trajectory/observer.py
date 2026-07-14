@@ -22,6 +22,8 @@ import numpy as np
 from astropy import units as u
 from astropy.coordinates import EarthLocation
 
+from device.geometry import unwrap_az_series as _geometry_unwrap_az_series
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
@@ -63,7 +65,8 @@ class ObserverSite:
     @property
     def ecef_xyz(self) -> np.ndarray:
         return np.array(
-            [self.ecef_x, self.ecef_y, self.ecef_z], dtype=_GEO_DTYPE,
+            [self.ecef_x, self.ecef_y, self.ecef_z],
+            dtype=_GEO_DTYPE,
         )
 
 
@@ -72,11 +75,14 @@ def _enu_rotation(lat_deg: float, lon_deg: float) -> np.ndarray:
     lam = np.radians(lon_deg)
     sp, cp = np.sin(phi), np.cos(phi)
     sl, cl = np.sin(lam), np.cos(lam)
-    return np.array([
-        [-sl,      cl,      0.0],
-        [-sp * cl, -sp * sl, cp],
-        [ cp * cl,  cp * sl, sp],
-    ], dtype=_GEO_DTYPE)
+    return np.array(
+        [
+            [-sl, cl, 0.0],
+            [-sp * cl, -sp * sl, cp],
+            [cp * cl, cp * sl, sp],
+        ],
+        dtype=_GEO_DTYPE,
+    )
 
 
 def build_site(
@@ -87,15 +93,21 @@ def build_site(
     platform_height_agl_m: float = 0.0,
 ) -> ObserverSite:
     loc = EarthLocation.from_geodetic(
-        lon=lon_deg * u.deg, lat=lat_deg * u.deg, height=alt_m * u.m,
+        lon=lon_deg * u.deg,
+        lat=lat_deg * u.deg,
+        height=alt_m * u.m,
     )
     # `geocentric` returns an astropy Quantity triple in metres (ITRS/ECEF).
     x = float(loc.geocentric[0].to(u.m).value)
     y = float(loc.geocentric[1].to(u.m).value)
     z = float(loc.geocentric[2].to(u.m).value)
     return ObserverSite(
-        lat_deg=lat_deg, lon_deg=lon_deg, alt_m=alt_m,
-        ecef_x=x, ecef_y=y, ecef_z=z,
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+        alt_m=alt_m,
+        ecef_x=x,
+        ecef_y=y,
+        ecef_z=z,
         enu_rotation=_enu_rotation(lat_deg, lon_deg),
         platform_height_agl_m=float(platform_height_agl_m),
     )
@@ -121,7 +133,8 @@ def fetch_telescope_lonlat(cli) -> tuple[float, float]:
     separately (manual entry, prior calibration, or elevation lookup).
     """
     resp = cli.method_sync(
-        "get_device_state", {"keys": ["location_lon_lat"]},
+        "get_device_state",
+        {"keys": ["location_lon_lat"]},
     )
     if not isinstance(resp, dict):
         raise RuntimeError(
@@ -130,14 +143,10 @@ def fetch_telescope_lonlat(cli) -> tuple[float, float]:
         )
     result = resp.get("result")
     if not isinstance(result, dict) or "location_lon_lat" not in result:
-        raise RuntimeError(
-            f"telescope response missing 'location_lon_lat': {resp!r}"
-        )
+        raise RuntimeError(f"telescope response missing 'location_lon_lat': {resp!r}")
     lon_lat = result["location_lon_lat"]
     if not (isinstance(lon_lat, (list, tuple)) and len(lon_lat) >= 2):
-        raise RuntimeError(
-            f"telescope 'location_lon_lat' malformed: {lon_lat!r}"
-        )
+        raise RuntimeError(f"telescope 'location_lon_lat' malformed: {lon_lat!r}")
     return float(lon_lat[1]), float(lon_lat[0])
 
 
@@ -153,11 +162,15 @@ def build_site_from_telescope(cli, alt_m: float) -> ObserverSite:
 
 
 def lla_to_ecef(
-    lat_deg: float, lon_deg: float, alt_m: float,
+    lat_deg: float,
+    lon_deg: float,
+    alt_m: float,
 ) -> tuple[float, float, float]:
     """WGS84 lat/lon/alt → ECEF (metres). Time-independent."""
     loc = EarthLocation.from_geodetic(
-        lon=lon_deg * u.deg, lat=lat_deg * u.deg, height=alt_m * u.m,
+        lon=lon_deg * u.deg,
+        lat=lat_deg * u.deg,
+        height=alt_m * u.m,
     )
     return (
         float(loc.geocentric[0].to(u.m).value),
@@ -219,8 +232,10 @@ def wrap_pm180(deg: float) -> float:
 
 
 def haversine_m(
-    lat1_deg: float, lon1_deg: float,
-    lat2_deg: float, lon2_deg: float,
+    lat1_deg: float,
+    lon1_deg: float,
+    lat2_deg: float,
+    lon2_deg: float,
 ) -> float:
     """Great-circle distance in metres between two WGS84 points.
 
@@ -234,16 +249,16 @@ def haversine_m(
     phi2 = np.radians(lat2_deg)
     dphi = np.radians(lat2_deg - lat1_deg)
     dlam = np.radians(lon2_deg - lon1_deg)
-    a = (
-        np.sin(dphi / 2.0) ** 2
-        + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2.0) ** 2
-    )
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2.0) ** 2
     c = 2.0 * np.arcsin(np.sqrt(min(1.0, float(a))))
     return float(earth_r_m * c)
 
 
 def lookup_elevation(
-    lat_deg: float, lon_deg: float, *, timeout_s: float = 4.0,
+    lat_deg: float,
+    lon_deg: float,
+    *,
+    timeout_s: float = 4.0,
 ) -> float:
     """Return the ground elevation in metres AMSL at the given
     lat/lon, via the Open-Meteo free elevation API.
@@ -275,15 +290,16 @@ def lookup_elevation(
 
 
 def unwrap_az_series(wrapped_deg: np.ndarray) -> np.ndarray:
-    """Unwrap a wrapped az sequence (any convention) into a monotone-ish
-    cumulative series. Used by replay to feed the plant-model loop with
-    positions that don't jump at the ±180° boundary."""
+    """Unwrap a wrapped az sequence into a monotone-ish cumulative series.
+
+    Thin wrapper over the canonical, guarded implementation in
+    ``device.geometry`` (single source of truth: same wrap convention, and
+    it raises ``ValueError`` on any non-finite sample so one bad reading
+    can't silently propagate NaN across the tail of the series). Kept here
+    with an ndarray in / ndarray out signature for the trajectory callers
+    that pass and expect numpy arrays.
+    """
     arr = np.asarray(wrapped_deg, dtype=float)
     if arr.size == 0:
         return arr.copy()
-    out = np.empty_like(arr)
-    out[0] = arr[0]
-    for i in range(1, arr.size):
-        delta = wrap_pm180(arr[i] - arr[i - 1])
-        out[i] = out[i - 1] + delta
-    return out
+    return np.asarray(_geometry_unwrap_az_series(arr.tolist()), dtype=float)

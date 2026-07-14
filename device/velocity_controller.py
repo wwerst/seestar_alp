@@ -172,17 +172,32 @@ def _motor_stop_on_exit(cli: MountClient) -> Iterator[None]:
     ``speed_move`` wrapper — otherwise a ``SunSafetyLocked``-mid-loop
     would also block the cleanup path, which is exactly the failure
     mode this guards against.
+
+    Exception: while the ``SunSafetyMonitor``'s emergency jog-away is
+    executing, the raw stop is skipped. The mid-loop ``SunSafetyLocked``
+    that triggers this exit is raised ~tens of ms after the monitor fires
+    its jog, so a stop issued here would truncate the jog and strand the
+    mount inside the sun cone. The jog's own firmware ``dur_sec`` bounds
+    that motion, so skipping cannot leave the motor free-running. Mirrors
+    ``LiveTrackSession._run`` / ``CalibrateMotionSession._run``.
     """
     try:
         yield
     finally:
-        try:
-            cli.method_sync(
-                "scope_speed_move",
-                {"speed": 0, "angle": 0, "dur_sec": 1},
+        from device.sun_safety import sun_safety_jog_in_progress
+
+        if sun_safety_jog_in_progress(getattr(cli, "device", None)):
+            logger.warning(
+                "motor-stop on FF tick-loop exit skipped: sun-safety jog in progress"
             )
-        except Exception:
-            logger.warning("motor-stop on FF tick-loop exit failed", exc_info=True)
+        else:
+            try:
+                cli.method_sync(
+                    "scope_speed_move",
+                    {"speed": 0, "angle": 0, "dur_sec": 1},
+                )
+            except Exception:
+                logger.warning("motor-stop on FF tick-loop exit failed", exc_info=True)
 
 
 def wait_for_mount_idle(

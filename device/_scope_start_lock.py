@@ -59,6 +59,7 @@ def raise_if_scope_busy(
     check_calibrate_motion: bool = True,
     check_visibility: bool = True,
     check_nighttime_auto: bool = True,
+    check_nighttime_interactive: bool = True,
 ) -> None:
     """Raise ``RuntimeError`` if another mount-driving manager already owns
     ``telescope_id``.
@@ -126,6 +127,17 @@ def raise_if_scope_busy(
                 raise RuntimeError(
                     f"telescope {tid} has a nighttime auto-run in flight; stop it "
                     f"before starting {new_owner}"
+                )
+        except ImportError:
+            pass
+    if check_nighttime_interactive:
+        try:
+            from device.nighttime_calibration import get_nighttime_manager
+
+            if get_nighttime_manager().is_running(tid):
+                raise RuntimeError(
+                    f"telescope {tid} is in interactive nighttime calibration; stop "
+                    f"it before starting {new_owner}"
                 )
         except ImportError:
             pass

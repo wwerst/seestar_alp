@@ -2061,6 +2061,59 @@ def test_sky_visibility_polling_is_sse_fallback_only():
     assert "fetchCells().then(fetchStatus);" in html
 
 
+def test_sky_visibility_slow_status_poll_survives_healthy_sse():
+    """A low-rate status-only poll must keep running while SSE is healthy so
+    elapsed/ETA/quality/Stop-countdown don't freeze (the mapper emits no
+    periodic status event). It is the deliberate exception to onopen's
+    stopPolling(); the fast fallback loops stay off while SSE is up."""
+    html = front_app.fetch_template("sky_visibility.html").render(
+        telescope_id=1,
+        **_minimal_context("sky_visibility", online=True),
+    )
+    # Dedicated slow-poll lifecycle, driven off the status endpoint only.
+    assert "function startSlowStatusPoll" in html
+    assert "function stopSlowStatusPoll" in html
+    assert "slowStatusPolling = setInterval(fetchStatus, 8000);" in html
+    # Started whenever a run is active; torn down when it goes idle.
+    assert "startSlowStatusPoll();" in html
+    assert "stopSlowStatusPoll();" in html
+    # Crucially, sse.onopen drops the fast fallback loops but must NOT stop the
+    # slow status poll (that is what keeps the status panel live under SSE).
+    onopen = re.search(r"sse\.onopen = \(\) => \{(.*?)\};", html, re.S)
+    assert onopen is not None
+    assert "stopPolling();" in onopen.group(1)
+    assert "stopSlowStatusPoll" not in onopen.group(1)
+
+
+def test_sky_visibility_surfaces_error_and_refusal_events():
+    """onmessage must handle system_error and slew_refused (previously dropped)
+    so a sun-safety refusal is surfaced, appending to a client-side error
+    buffer that survives status refreshes and triggering an immediate fetch."""
+    html = front_app.fetch_template("sky_visibility.html").render(
+        telescope_id=1,
+        **_minimal_context("sky_visibility", online=True),
+    )
+    # Both event types are now handled in onmessage.
+    assert "data.type === 'system_error'" in html
+    assert "data.type === 'slew_refused'" in html
+    # Persistent client-side error buffer + combined render.
+    assert "let clientErrors" in html
+    assert "function pushClientError" in html
+    assert "function renderErrors" in html
+    # renderErrors combines the mapper's status.errors with the client buffer
+    # so a slew_refused (never in status.errors) stays visible.
+    assert "base.concat(clientErrors)" in html
+    # Each handler surfaces the event and pulls fresh status immediately.
+    sys_block = re.search(r"data\.type === 'system_error'.*?return;", html, re.S)
+    assert sys_block is not None
+    assert "pushClientError" in sys_block.group(0)
+    assert "fetchStatus();" in sys_block.group(0)
+    refuse_block = re.search(r"data\.type === 'slew_refused'.*?return;", html, re.S)
+    assert refuse_block is not None
+    assert "pushClientError" in refuse_block.group(0)
+    assert "fetchStatus();" in refuse_block.group(0)
+
+
 # ---------- live_tracker slider vs status-poll race -------------------
 
 

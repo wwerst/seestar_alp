@@ -233,6 +233,64 @@ def test_slew_to_target_refuses_when_landmark_inside_sun_cone(monkeypatch, tmp_p
         session.stop()
 
 
+def test_run_finally_skips_raw_stop_during_sun_safety_jog(monkeypatch, tmp_path):
+    """The worker's ``finally`` normally issues a raw
+    ``scope_speed_move(speed=0)`` to halt lingering motion. While the
+    sun-safety monitor's emergency jog-away is executing it must skip
+    that stop — issuing it would cancel the jog-away and strand the mount
+    inside the sun cone. The jog's firmware ``dur_sec`` bounds the motion,
+    so skipping cannot leave the motor running."""
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+    monkeypatch.setattr(
+        "device.sun_safety.sun_safety_jog_in_progress", lambda tid=None: True
+    )
+
+    session = CalibrationSession(
+        telescope_id=1,
+        targets=_targets(site),
+        site=site,
+        out_path=tmp_path / "cal.json",
+    )
+    # Pre-set the stop event so ``_run`` returns straight after the first
+    # slew and drops into the ``finally`` we're exercising, no thread
+    # timing involved.
+    session._stop_evt.set()
+    session._run()
+
+    speed_moves = [p for (m, p) in cli.calls if m == "scope_speed_move"]
+    assert speed_moves == [], (
+        "worker finally issued a raw motor stop during the sun-safety jog: "
+        f"{speed_moves}"
+    )
+
+
+def test_run_finally_issues_raw_stop_when_no_jog(monkeypatch, tmp_path):
+    """Companion to the jog-skip test: with no sun-safety jog in flight the
+    worker's ``finally`` must still issue the raw
+    ``scope_speed_move(speed=0)`` so any lingering motion halts on exit."""
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+    monkeypatch.setattr(
+        "device.sun_safety.sun_safety_jog_in_progress", lambda tid=None: False
+    )
+
+    session = CalibrationSession(
+        telescope_id=1,
+        targets=_targets(site),
+        site=site,
+        out_path=tmp_path / "cal.json",
+    )
+    session._stop_evt.set()
+    session._run()
+
+    speed_moves = [p for (m, p) in cli.calls if m == "scope_speed_move"]
+    assert speed_moves, "worker finally did not issue the session-exit motor stop"
+    assert speed_moves[-1] == {"speed": 0, "angle": 0, "dur_sec": 0}
+
+
 def test_nudge_updates_target_and_encoder(monkeypatch, tmp_path):
     site = _site()
     cli = _FakeCli()

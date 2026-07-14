@@ -596,20 +596,25 @@ class NighttimeCalibrationManager:
         # concurrent LiveTrackManager.start (or any other mount-driving
         # manager) on the same scope. Without it the two managers only
         # lock their own registries → TOCTOU.
-        from device._scope_start_lock import get_scope_start_lock
+        from device._scope_start_lock import (
+            get_scope_start_lock,
+            raise_if_scope_busy,
+        )
 
         with get_scope_start_lock(tid):
-            # Refuse if the live tracker is driving the same mount.
-            try:
-                from device.live_tracker import get_manager as _get_tracker_mgr
-
-                tracker = _get_tracker_mgr().get(tid)
-                if tracker is not None and tracker.is_alive():
-                    raise RuntimeError(
-                        f"telescope {tid} is live-tracking; stop the tracker first"
-                    )
-            except ImportError:
-                pass
+            # Refuse if any other mount-driving manager owns this scope
+            # (live tracker, rotation calibration, visibility map, or
+            # nighttime auto-run). ``check_*=False`` skips our own registry
+            # (the duplicate-start check below) and the calibrate-motion
+            # session — per the module docstring the operator nudges via
+            # the motion session's continuous-control loop while this
+            # session captures sightings, so the two are allowed together.
+            raise_if_scope_busy(
+                tid,
+                "nighttime calibration",
+                check_nighttime_interactive=False,
+                check_calibrate_motion=False,
+            )
             with self._lock:
                 existing = self._sessions.get(tid)
                 if existing is not None and existing.is_active():

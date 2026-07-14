@@ -4437,11 +4437,15 @@ class LiveTrackerTrackResource:
             load_session_mount_frame,
         )
 
-        # Feasibility pre-check failures (cable-wrap / elevation-band) are
-        # raised as device.live_tracker.PreCheckFailed. Import defensively so
-        # the route still works against an older device module that predates
-        # the symbol; falling back to ValueError keeps the 400 mapping intact
-        # because PreCheckFailed subclasses ValueError.
+        # Pre-launch feasibility failures (elevation-band / FF-rate saturation)
+        # are raised as device.live_tracker.PreCheckFailed. Cable-wrap
+        # enforcement is no longer part of this synchronous gate — it is
+        # deferred to the session thread (surfaced later via status/exit_reason)
+        # because the trajectory's cable budget can only be resolved against the
+        # mount's measured cum-az anchor. Import defensively so the route still
+        # works against an older device module that predates the symbol;
+        # falling back to ValueError keeps the 400 mapping intact because
+        # PreCheckFailed subclasses ValueError.
         try:
             from device.live_tracker import PreCheckFailed
         except ImportError:
@@ -4501,9 +4505,11 @@ class LiveTrackerTrackResource:
         try:
             get_manager().start(session)
         except PreCheckFailed as exc:
-            # Infeasible trajectory (cable-wrap / elevation hard stop) —
-            # surface the reason as a 400 so the UI can show it instead of a
-            # generic 500 from an uncaught ValueError.
+            # Infeasible trajectory at launch (leaves the elevation band /
+            # saturates the FF rate) — surface the reason as a 400 so the UI can
+            # show it instead of a generic 500 from an uncaught ValueError.
+            # Cable-wrap infeasibility is not raised here (deferred to the
+            # session thread); it reports via status/exit_reason instead.
             resp.status = falcon.HTTP_400
             resp.content_type = "application/json"
             resp.text = json.dumps({"error": str(exc)})
