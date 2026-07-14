@@ -569,6 +569,68 @@ def test_send_message_param_sync_timeout(monkeypatch, seestar):
     monkeypatch.setattr("device.seestar_device.time.time", lambda: next(times))
     out = seestar.send_message_param_sync({"method": "scope_get_equ_coord"})
     assert "Error: Exceeded allotted wait time for result" in out["result"]
+    # The timeout path returns before the correlation point, so it must not
+    # pollute the RTT samples with a 10s+ outlier.
+    assert seestar.rpc_rtt_stats()["count"] == 0
+
+
+def test_rpc_rtt_stats_empty(seestar):
+    st = seestar.rpc_rtt_stats()
+    assert st == {
+        "count": 0,
+        "sample_count": 0,
+        "p50_ms": None,
+        "p95_ms": None,
+        "last_ms": None,
+    }
+
+
+def test_record_rtt_percentiles_and_last(seestar):
+    for ms in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
+        seestar._record_rtt(ms / 1000.0)
+    st = seestar.rpc_rtt_stats()
+    assert st["count"] == 10
+    assert st["sample_count"] == 10
+    assert st["last_ms"] == 100.0
+    # Nearest-rank on 10 sorted samples: p50 -> index 4 (50ms), p95 -> index 9.
+    assert st["p50_ms"] == 50.0
+    assert st["p95_ms"] == 100.0
+    assert st["p95_ms"] >= st["p50_ms"]
+
+
+def test_rtt_samples_are_bounded_but_count_is_cumulative(seestar):
+    for _ in range(250):
+        seestar._record_rtt(0.001)
+    st = seestar.rpc_rtt_stats()
+    # deque(maxlen=200) caps the rolling sample set...
+    assert st["sample_count"] == 200
+    # ...while the cumulative counter keeps counting every command.
+    assert st["count"] == 250
+
+
+def test_rpc_rtt_stats_survives_mutation_error(seestar):
+    class Boom:
+        def __iter__(self):
+            raise RuntimeError("deque mutated during iteration")
+
+    seestar._rtt_samples = Boom()
+    seestar.rtt_count_total = 7
+    st = seestar.rpc_rtt_stats()
+    assert st["sample_count"] == 0
+    assert st["p50_ms"] is None
+    assert st["count"] == 7
+
+
+def test_send_message_param_sync_records_rtt_on_success(monkeypatch, seestar):
+    # Success path: response already present -> loop exits immediately and the
+    # correlation point records exactly one RTT sample.
+    monkeypatch.setattr(seestar, "send_message_param", lambda _d: 55)
+    seestar.response_dict[55] = {"id": 55, "result": "ok"}
+    seestar.send_message_param_sync({"method": "scope_get_equ_coord"})
+    st = seestar.rpc_rtt_stats()
+    assert st["count"] == 1
+    assert st["sample_count"] == 1
+    assert st["last_ms"] is not None
 
 
 def test_get_event_state_and_is_client_master(seestar):

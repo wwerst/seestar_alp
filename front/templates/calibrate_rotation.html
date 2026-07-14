@@ -114,6 +114,16 @@
           </g>
         </svg>
       </div>
+      <!--
+        Hidden driver: refreshes the mount's view_state and (idempotently,
+        star-safely) keeps the scenery view alive so the /vid MJPEG stream
+        produces frames without first visiting a pre-fork live page. The
+        page GET already fires a one-shot scenery kick; this low-rate poll
+        flips view_state to "working" once scenery is live and re-kicks if
+        the view ever drops. 204 + hx-swap="none" → no DOM swap.
+      -->
+      <div id="cal-video-kick" hx-get="{{ root }}/live/video_kick"
+           hx-trigger="every 2s" hx-swap="none" style="display:none;"></div>
       <div class="cal-card">
         <h4>Telemetry</h4>
         <div class="cal-kpi-row">
@@ -1518,6 +1528,44 @@
       });
     } catch (e) {}
   }
+
+  // ---- keep the MJPEG stream alive --------------------------------
+  // The <img id="cal-vid"> streams from the imaging server's /vid endpoint,
+  // but that generator returns (closing the multipart response) whenever the
+  // mount's view_state is idle at connect time — e.g. before the scenery
+  // view kicked at page load has spun up. A cleanly-closed stream fires no
+  // 'error' (the last frame just freezes), so we watch img.complete: it is
+  // false only while the stream is actively delivering and flips true when
+  // the stream errors or the server closes it. Re-point src (cache-busted so
+  // the browser opens a NEW request instead of reusing the dead one) on a
+  // throttle, so a healthy stream is never interrupted and the imaging
+  // server's limited worker pool isn't churned. Pairs with the hidden
+  // /live/video_kick poll, which flips view_state to "working" once scenery
+  // is live so the reconnected /vid request actually streams.
+  (function(){
+    const vid = els.vid;
+    if (!vid) return;
+    const base = (vid.getAttribute('src') || '').split('?')[0];
+    if (!base) return;
+    let lastReconnect = 0;
+    let completeStreak = 0;
+    const RECONNECT_MS = 3000;
+    function reconnectVideo(){
+      const now = Date.now();
+      if (now - lastReconnect < RECONNECT_MS) return;
+      lastReconnect = now;
+      completeStreak = 0;
+      vid.src = base + '?t=' + now;
+    }
+    vid.addEventListener('error', reconnectVideo);
+    // Some browsers flip img.complete true transiently between multipart
+    // frames of a healthy stream; require two consecutive observations so
+    // only a genuinely-closed stream triggers the reconnect.
+    setInterval(() => {
+      completeStreak = vid.complete ? completeStreak + 1 : 0;
+      if (completeStreak >= 2) reconnectVideo();
+    }, RECONNECT_MS);
+  })();
 
   // Kick things off.
   loadSetup();

@@ -3369,6 +3369,69 @@ class LiveZoomResource(BaseResource):
         self.send_text(req, resp, telescope_id, "done")
 
 
+def _view_state_is_working(telescope_id):
+    """Return True when the mount is already in an active view.
+
+    Issues a fresh ``get_view_state`` (a pure read that cannot disturb a
+    running session) and reports whether ``View.state == "working"``. As a
+    side effect the RPC refreshes ``dev.view_state`` — which is exactly what
+    the imaging server's ``get_frame`` loop keys off to decide whether to
+    stream — so calling this is also how the fork video pages keep the
+    imaging state machine tracking reality.
+    """
+    status = method_sync("get_view_state", telescope_id, id=42)
+    view = pydash.get(status, "View")
+    if not isinstance(view, dict):
+        return False
+    return view.get("state") == "working"
+
+
+def _ensure_scenery_video(telescope_id):
+    """Idempotent, star-safe primer that makes the live MJPEG stream flow.
+
+    Refreshes ``dev.view_state`` and, only when the mount is *not* already
+    in an active view, kicks it into scenery (terrestrial) view so RTSP
+    frames start. The guard is what keeps this safe to call from a page that
+    might be open while the mount is star-imaging: an active session reports
+    ``state == "working"``, so we never issue the scenery start that would
+    tear it down. A mount already streaming scenery is likewise
+    ``"working"``, so the kick is skipped and repeated calls are no-ops.
+
+    Returns ``True`` if a scenery kick was issued, ``False`` otherwise.
+    """
+    if _view_state_is_working(telescope_id):
+        return False
+    do_action_device(
+        "method_async",
+        telescope_id,
+        {"method": "iscope_start_view", "params": {"mode": "scenery"}},
+    )
+    return True
+
+
+def _ensure_scenery_video_async(telescope_id):
+    """Run :func:`_ensure_scenery_video` in a daemon thread.
+
+    ``do_action_device`` ultimately issues a synchronous ``requests.put``
+    with ``Config.timeout``, which can block page render for the full
+    timeout when the device is slow or just became unreachable. Failures are
+    logged at debug — the page still renders and the REST endpoints surface
+    offline state separately.
+    """
+
+    def _run():
+        try:
+            _ensure_scenery_video(int(telescope_id))
+        except Exception as exc:
+            logger.debug(
+                f"ensure-scenery-video: kick failed for telescope {telescope_id}: {exc}"
+            )
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
+
+
 class LiveVideoResource(BaseResource):
     _last_render_by_telescope = {}
     _lock = threading.Lock()
@@ -3446,6 +3509,39 @@ class LiveVideoResource(BaseResource):
         self.send_text(
             req, resp, telescope_id, f"LiveVideoResource.on_post return {output}"
         )
+
+
+class LiveVideoKickResource(BaseResource):
+    """Idempotent, star-safe primer that starts the live MJPEG video stream
+    for the fork video pages (live_tracker, calibrate_rotation).
+
+    Those pages embed ``<img src="{{imager_root}}/vid">``, but the imaging
+    server only emits frames while ``dev.view_state`` is ``"working"``. On a
+    freshly-booted or idle mount that state is idle, so ``/vid`` yields one
+    Loading+Idle frame and closes. Polling this endpoint refreshes
+    ``dev.view_state`` (so the imaging loop tracks reality) and, when the
+    mount isn't already in an active view, kicks scenery so frames start —
+    all via the guarded :func:`_ensure_scenery_video`, which leaves an
+    active star-mode session untouched and does not re-kick a mount that is
+    already streaming.
+
+    Returns ``204 No Content``; templates poll it with ``hx-swap="none"``,
+    so there is no DOM swap (and thus no destructive empty swap).
+    """
+
+    def on_get(self, req, resp, telescope_id: int = 1):
+        try:
+            if check_api_state(telescope_id):
+                _ensure_scenery_video(int(telescope_id))
+        except Exception as exc:
+            logger.debug(
+                f"live/video_kick: kick failed for telescope {telescope_id}: {exc}"
+            )
+        # 204 No Content: no body and (per RFC/WSGI) no Content-Type header —
+        # htmx treats it as "do nothing", which is exactly what the
+        # hx-swap="none" poll driver wants.
+        resp.status = falcon.HTTP_204
+        resp.content_type = None
 
 
 class LiveFocusResource(BaseResource):
@@ -4322,6 +4418,13 @@ class LiveTrackerResource:
         except Exception:
             pass
         context = get_context(telescope_id, req)
+        # Kick the firmware into scenery view (guarded + star-safe) so the
+        # live-camera <img id="lt-vid"> streams frames on page load without
+        # first visiting a pre-fork live page. Gated on the cached online
+        # state so we don't pay the request timeout when the device is
+        # offline; the actual RPC runs in a daemon thread.
+        if context.get("online"):
+            _ensure_scenery_video_async(telescope_id)
         render_template(
             req,
             resp,
@@ -4422,6 +4525,181 @@ class LiveTrackerStatusResource:
         resp.status = falcon.HTTP_200
         resp.content_type = "application/json"
         resp.text = json.dumps(payload)
+
+
+def _live_stats_dict(telescope_id):
+    """Collect live network stats (video throughput + RPC RTT) for a scope.
+
+    Reads directly off the in-process imager/device objects (front and the
+    device server share a process via root_app). A missing or not-yet-started
+    device yields a null section rather than raising, so the endpoint stays
+    200 and the UI renders placeholders instead of erroring.
+    """
+    tid = int(telescope_id)
+    video = None
+    rpc = None
+    try:
+        imager = telescope.get_seestar_imager(tid)
+        if imager is not None:
+            video = imager.video_throughput()
+    except Exception:
+        video = None
+    try:
+        dev = telescope.get_seestar_device(tid)
+        if dev is not None:
+            rpc = dev.rpc_rtt_stats()
+    except Exception:
+        rpc = None
+    return {
+        "telescope_id": tid,
+        "video": video,
+        "rpc": rpc,
+    }
+
+
+class LiveStatsResource:
+    """JSON: live network stats for one telescope.
+
+    Combines video throughput served to the browser (bytes/s + frames/s over
+    a rolling window) with RPC round-trip latency to the mount (rolling
+    p50/p95). The telescope's wifi uplink carries both the video stream and
+    the mount RPCs, so a rising RTT alongside heavy video bytes/s is the
+    signature of the uplink saturating. Polled at a slow, bounded rate by the
+    live_tracker network-stats readout.
+    """
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(_live_stats_dict(telescope_id))
+
+
+# ---------- Live stream-quality knobs (browser-hop only) --------------
+
+
+def _stream_quality_imager(telescope_id):
+    """Return the live SeestarImaging for a scope, or None if not started.
+
+    Front and the imaging server share a process (root_app), so this is the
+    same object the ``/vid`` serve loop reads its knobs off — mutating it
+    takes effect on the next served frame.
+    """
+    try:
+        return telescope.get_seestar_imager(int(telescope_id))
+    except Exception:
+        return None
+
+
+def _stream_quality_current(telescope_id):
+    """Current stream-quality values: the live imager's if it's running, else
+    the configured ``[stream_quality]`` defaults (so the control renders sane
+    values before the device is up)."""
+    from device.seestar_imaging import SeestarImaging
+
+    imager = _stream_quality_imager(telescope_id)
+    if imager is not None and hasattr(imager, "stream_quality"):
+        try:
+            return dict(imager.stream_quality())
+        except Exception:
+            pass
+    return SeestarImaging.default_stream_quality()
+
+
+def _persist_stream_quality(vals):
+    """Persist the stream-quality knobs to config.toml under ``[stream_quality]``.
+
+    Uses the Config toml helpers (``set_toml`` + ``save_toml``). The section
+    is created on first write since it isn't present in older config.toml
+    files. Exceptions propagate to the caller, which keeps the already-applied
+    runtime change even if the disk write fails.
+    """
+    import tomlkit
+
+    section = "stream_quality"
+    if section not in Config._dict:
+        Config._dict[section] = tomlkit.table()
+    Config.set_toml(section, "max_stream_fps", float(vals["max_stream_fps"]))
+    Config.set_toml(section, "jpeg_quality", int(vals["jpeg_quality"]))
+    Config.save_toml()
+
+
+class LiveStreamQualityResource:
+    """GET/POST the browser-hop stream-quality knobs for one telescope.
+
+    GET returns the current effective values; POST applies (clamped) new
+    values to the live imaging server and persists them to config.toml.
+
+    IMPORTANT: these knobs shape only the MJPEG stream this server sends to
+    the browser (max frames/s + JPEG encode quality). They do NOT change what
+    the telescope pushes over its wifi uplink — the RTSP H.264 bitrate is
+    fixed by firmware — so they will not reduce mount-command latency when the
+    uplink saturates. The UI labels say as much; to relieve the uplink, stop
+    live video (see docs/operations_runbook.md).
+    """
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        vals = _stream_quality_current(telescope_id)
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps({"telescope_id": int(telescope_id), **vals})
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        from device.seestar_imaging import SeestarImaging
+
+        try:
+            body = req.media or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": "request body must be a JSON object"})
+            return
+
+        # Start from the current effective values so a partial POST (only one
+        # knob) leaves the other untouched.
+        vals = dict(_stream_quality_current(telescope_id))
+        try:
+            if body.get("max_stream_fps") is not None:
+                vals["max_stream_fps"] = SeestarImaging._clamp_max_stream_fps(
+                    body["max_stream_fps"]
+                )
+            if body.get("jpeg_quality") is not None:
+                vals["jpeg_quality"] = SeestarImaging._clamp_jpeg_quality(
+                    body["jpeg_quality"]
+                )
+        except (TypeError, ValueError) as exc:
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": f"invalid stream-quality value: {exc}"})
+            return
+
+        # Apply to the live imager first (immediate effect on the serve loop);
+        # its clamp is authoritative, so echo back whatever it settled on.
+        imager = _stream_quality_imager(telescope_id)
+        if imager is not None and hasattr(imager, "set_stream_quality"):
+            try:
+                vals = dict(imager.set_stream_quality(**vals))
+            except Exception as exc:
+                logger.debug(
+                    f"stream_quality: apply to imager failed for {telescope_id}: {exc}"
+                )
+
+        # Persist so the setting survives a restart. A disk failure here must
+        # not fail the request — the runtime change already took effect.
+        try:
+            _persist_stream_quality(vals)
+        except Exception as exc:
+            logger.warning(
+                f"stream_quality: persist to config.toml failed for {telescope_id}: {exc}"
+            )
+
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps({"telescope_id": int(telescope_id), **vals})
 
 
 class LiveTrackerTrackResource:
@@ -4708,29 +4986,17 @@ class CalibrateRotationResource:
         scenery view so the MJPEG stream produces frames before the
         user clicks Start calibration.
 
-        Runs in a daemon thread because ``do_action_device`` ultimately
-        issues a synchronous ``requests.put`` with ``Config.timeout``,
-        which can block page render for the full timeout if the device
-        is slow or just became unreachable. Failures are logged at
-        debug — the page still renders, and the prior/targets REST
-        endpoints surface offline state separately.
+        Delegates to the shared, guarded :func:`_ensure_scenery_video`
+        primer: it first reads ``get_view_state`` and only kicks scenery
+        when the mount isn't already in an active view, so a running
+        star-mode imaging session is never torn down and an already-
+        streaming scenery view isn't needlessly re-kicked. Runs in a
+        daemon thread because ``do_action_device`` ultimately issues a
+        synchronous ``requests.put`` with ``Config.timeout``, which can
+        block page render for the full timeout if the device is slow or
+        just became unreachable.
         """
-
-        def _run():
-            try:
-                do_action_device(
-                    "method_async",
-                    telescope_id,
-                    {"method": "iscope_start_view", "params": {"mode": "scenery"}},
-                )
-            except Exception as exc:
-                logger.debug(
-                    f"calibrate-rotation: scenery view kick failed for telescope {telescope_id}: {exc}"
-                )
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        return t
+        return _ensure_scenery_video_async(telescope_id)
 
     @staticmethod
     def on_get(req, resp, telescope_id=1):
@@ -8118,6 +8384,7 @@ class FrontMain:
         app.add_route("/{telescope_id:int}/live/exposure", LiveExposureResource())
         app.add_route("/{telescope_id:int}/live/photo", LivePhotoResource())
         app.add_route("/{telescope_id:int}/live/video", LiveVideoResource())
+        app.add_route("/{telescope_id:int}/live/video_kick", LiveVideoKickResource())
         app.add_route("/{telescope_id:int}/live/zoom", LiveZoomResource())
         app.add_route(
             "/{telescope_id:int}/schedule/exposure", ScheduleExposureResource()
@@ -8231,6 +8498,14 @@ class FrontMain:
         app.add_route(
             "/api/{telescope_id:int}/live_tracker/status",
             LiveTrackerStatusResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/netstats",
+            LiveStatsResource(),
+        )
+        app.add_route(
+            "/api/{telescope_id:int}/stream_quality",
+            LiveStreamQualityResource(),
         )
         app.add_route(
             "/api/{telescope_id:int}/live_tracker/track",

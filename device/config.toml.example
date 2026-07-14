@@ -25,6 +25,16 @@ font_url = ""
 link_color = ""
 accent_color = ""
 
+[stream_quality]
+# BROWSER-HOP video knobs — they shape only the MJPEG stream the imaging
+# server re-encodes and sends to your browser. They do NOT change what the
+# telescope pushes over its wifi uplink (the RTSP H.264 bitrate is fixed by
+# firmware), so they will NOT reduce mount-command latency when the uplink
+# saturates. To relieve the uplink, stop live video. See
+# docs/operations_runbook.md. Both are editable live from the Live Tracker page.
+max_stream_fps = 0    # cap on frames/s served to the browser; 0 = uncapped (default)
+jpeg_quality = 95     # JPEG encode quality (10-100) for served frames; 95 = OpenCV default
+
 [server]
 location = 'Anywhere on Earth'  # Anything you want here
 verbose_driver_exceptions = true

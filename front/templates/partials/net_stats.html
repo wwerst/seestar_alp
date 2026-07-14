@@ -1,0 +1,70 @@
+{# Compact live network-stats readout: video throughput this app serves,
+   aggregated across every open /vid viewer of this telescope (bytes/s +
+   frames/s over a rolling window), alongside RPC round-trip latency to the
+   mount (p50/p95). Both share the telescope's wifi uplink, so a rising RTT
+   next to heavy video bytes/s is the fingerprint of the uplink saturating
+   and delaying mount commands.
+
+   Reusable: include on any page that has a telescope_id in context, e.g.
+       {% include 'partials/net_stats.html' %}
+   It polls /api/{id}/netstats with a plain fetch (no HTMX swap, so no
+   destructive empty-swap risk) at a bounded, slow cadence and updates the
+   readout text in place, leaving the last values untouched on a failed
+   poll. #}
+<div class="ns-card" id="ns-card-{{ telescope_id }}" data-telescope-id="{{ telescope_id }}">
+  <style>
+    .ns-card { padding: 10px 12px; border: 1px solid rgba(0,0,0,0.12); border-radius: 6px; background: rgba(0,0,0,0.02); font-family: monospace; }
+    .ns-card h4 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; }
+    .ns-kpi-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; }
+    .ns-kpi { padding: 4px 8px; background: rgba(0,0,0,0.03); border-radius: 4px; font-size: 11px; }
+    .ns-kpi .k { opacity: 0.6; }
+    .ns-kpi .v { font-weight: bold; font-size: 13px; }
+  </style>
+  <h4>Network</h4>
+  <div class="ns-kpi-row">
+    <div class="ns-kpi"><div class="k">video</div><div class="v" data-ns="video_rate">—</div></div>
+    <div class="ns-kpi"><div class="k">fps</div><div class="v" data-ns="video_fps">—</div></div>
+    <div class="ns-kpi"><div class="k">rpc p50</div><div class="v" data-ns="rpc_p50">—</div></div>
+    <div class="ns-kpi"><div class="k">rpc p95</div><div class="v" data-ns="rpc_p95">—</div></div>
+  </div>
+</div>
+<script>
+(function(){
+  var card = document.getElementById('ns-card-{{ telescope_id }}');
+  // Guard against double-init if the partial is included more than once on
+  // a page (each copy binds its own interval to its own card element).
+  if (!card || card.dataset.nsInit) return;
+  card.dataset.nsInit = '1';
+  var tid = card.dataset.telescopeId || '{{ telescope_id }}';
+  var POLL_MS = 3000;  // bounded, slow poll (AGENTS.md: no unbounded polling)
+
+  function set(key, val){
+    var el = card.querySelector('[data-ns="' + key + '"]');
+    if (el) el.textContent = val;
+  }
+  function fmtRate(bps){
+    if (bps == null || !isFinite(bps)) return '—';
+    if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' MB/s';
+    if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' KB/s';
+    return bps.toFixed(0) + ' B/s';
+  }
+  function fmtMs(v){ return (v == null || !isFinite(v)) ? '—' : v.toFixed(0) + ' ms'; }
+  function fmtFps(v){ return (v == null || !isFinite(v)) ? '—' : v.toFixed(1); }
+
+  async function poll(){
+    try {
+      var r = await fetch('/api/' + tid + '/netstats', {cache: 'no-store'});
+      if (!r.ok) return;
+      var j = await r.json();
+      var v = j.video || {};
+      var p = j.rpc || {};
+      set('video_rate', fmtRate(v.bytes_per_s));
+      set('video_fps',  fmtFps(v.frames_per_s));
+      set('rpc_p50',    fmtMs(p.p50_ms));
+      set('rpc_p95',    fmtMs(p.p95_ms));
+    } catch (e) { /* leave the last values in place on a failed poll */ }
+  }
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
