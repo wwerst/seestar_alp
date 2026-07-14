@@ -2171,3 +2171,37 @@ def test_move_scope_nonzero_speed_refused_during_lockout(seestar, monkeypatch):
     monkeypatch.setattr(ss, "sun_safety_is_locked_out", lambda: True)
     assert seestar.move_scope(90, 100, 1) is False
     assert sent == []
+
+
+def test_move_scope_zero_speed_stop_suppressed_during_jog(seestar, monkeypatch):
+    """A stop (speed 0) is normally always allowed, but while the
+    SunSafetyMonitor's emergency jog-away is executing it must be a no-op:
+    an ASCOM MoveAxis(rate=0) would truncate the jog, and periodic
+    MoveAxis(0) heartbeats would truncate every re-jog → unbounded trip
+    loop. Returns True without touching the firmware."""
+    import device.sun_safety as ss
+
+    sent = []
+    monkeypatch.setattr(seestar, "is_goto", lambda: False)
+    monkeypatch.setattr(
+        seestar, "send_message_param_sync", lambda data: sent.append(data) or {}
+    )
+    monkeypatch.setattr(ss, "sun_safety_jog_in_progress", lambda tid=None: True)
+    assert seestar.move_scope(0, 0, 1) is True
+    assert sent == [], "no scope_speed_move may be sent while a jog is in progress"
+
+
+def test_move_scope_zero_speed_stop_passes_without_jog(seestar, monkeypatch):
+    """With no jog in progress, a stop passes straight through and issues
+    the raw scope_speed_move(0) — even while a lockout is otherwise held."""
+    import device.sun_safety as ss
+
+    sent = []
+    monkeypatch.setattr(seestar, "is_goto", lambda: False)
+    monkeypatch.setattr(
+        seestar, "send_message_param_sync", lambda data: sent.append(data) or {}
+    )
+    monkeypatch.setattr(ss, "sun_safety_jog_in_progress", lambda tid=None: False)
+    monkeypatch.setattr(ss, "sun_safety_is_locked_out", lambda: True)
+    assert seestar.move_scope(0, 0, 1) is True
+    assert sent and sent[0]["params"]["speed"] == 0

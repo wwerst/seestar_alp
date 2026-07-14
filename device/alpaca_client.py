@@ -17,6 +17,7 @@ import requests
 
 class AlpacaClient:
     def __init__(self, host: str, port: int, device: int):
+        self.device = int(device)
         self.base = f"http://{host}:{port}/api/v1/telescope/{device}"
         self._txn = 1000
 

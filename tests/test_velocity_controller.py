@@ -120,6 +120,60 @@ def test_motor_stop_bypasses_sun_safety_lockout(monkeypatch):
     ]
 
 
+# --- H1a: skip the raw stop while a sun-safety jog is in progress ---------
+
+
+def test_motor_stop_on_exit_skipped_during_sun_safety_jog(monkeypatch, caplog):
+    """While the SunSafetyMonitor's emergency jog-away is executing, the
+    context-exit raw stop must be SKIPPED — issuing it would land ~tens of
+    ms after the jog and truncate it, stranding the mount inside the sun
+    cone. The jog's firmware dur_sec bounds the motion, so skipping is safe.
+    """
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "sun_safety_jog_in_progress", lambda tid=None: True)
+
+    cli = _FakeCli()
+    with caplog.at_level(logging.WARNING, logger="device.velocity_controller"):
+        with _motor_stop_on_exit(cli):
+            pass
+    assert cli.calls == [], "no stop may be issued while a jog is in progress"
+    assert any(
+        "jog in progress" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    )
+
+
+def test_motor_stop_on_exit_skipped_during_jog_on_exception(monkeypatch):
+    """The SunSafetyLocked that drives this exit path is raised while the
+    jog is in progress: the stop is skipped, but the exception still
+    propagates unchanged."""
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "sun_safety_jog_in_progress", lambda tid=None: True)
+
+    cli = _FakeCli()
+    with pytest.raises(RuntimeError, match="sun locked"):
+        with _motor_stop_on_exit(cli):
+            raise RuntimeError("sun locked")
+    assert cli.calls == []
+
+
+def test_motor_stop_on_exit_issued_when_no_jog(monkeypatch):
+    """With no jog in progress the stop is issued exactly as before."""
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "sun_safety_jog_in_progress", lambda tid=None: False)
+
+    cli = _FakeCli()
+    with _motor_stop_on_exit(cli):
+        pass
+    assert cli.calls == [
+        ("scope_speed_move", {"speed": 0, "angle": 0, "dur_sec": 1}),
+    ]
+
+
 # --- P1-7: unwrap_az_series rejects non-finite ---------------------------
 
 
@@ -295,3 +349,116 @@ def test_unwind_azimuth_noop_within_threshold(monkeypatch):
     )
     assert stats["controller"] == "unwind_noop"
     assert stats["commands_issued"] == 0
+
+
+# --- L2: scripts/tune_vc.py drops dead PD/predictor-era CLI knobs ----------
+
+
+def _load_tune_vc():
+    """Load scripts/tune_vc.py as a module (it lives outside any package).
+    Registers it in sys.modules first so its @dataclass can resolve its own
+    module namespace."""
+    import importlib.util
+    import os
+    import sys
+
+    if "tune_vc" in sys.modules:
+        return sys.modules["tune_vc"]
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts",
+        "tune_vc.py",
+    )
+    spec = importlib.util.spec_from_file_location("tune_vc", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["tune_vc"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _parse_tune_vc_args(monkeypatch, argv):
+    """Invoke tune_vc.main() with argv, stubbing out all device I/O, and
+    return (rc, namespace) where namespace is the argparse Namespace that
+    main() dispatched to the mode's run_* function."""
+    import sys
+
+    mod = _load_tune_vc()
+    captured: dict = {}
+
+    def _capture(cli, args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(mod, "run_setpoints", _capture)
+    monkeypatch.setattr(mod, "run_step_response", _capture)
+    monkeypatch.setattr(mod, "run_diagonal", _capture)
+    monkeypatch.setattr(mod, "_print_latency_summary", lambda cli: None)
+    monkeypatch.setattr(mod, "InstrumentedAlpacaClient", lambda *a, **k: object())
+    monkeypatch.setattr(mod.Config, "load_toml", lambda: None, raising=False)
+    monkeypatch.setattr(mod.Config, "init_lat", 1.0, raising=False)
+    monkeypatch.setattr(mod.Config, "init_long", 2.0, raising=False)
+    monkeypatch.setattr(sys, "argv", ["tune_vc.py", *argv])
+    rc = mod.main()
+    return rc, captured.get("args")
+
+
+@pytest.mark.parametrize(
+    "dead_flag",
+    [
+        "--kd",
+        "--tau",
+        "--min-speed",
+        "--fine-min-speed",
+        "--use-predictor",
+        "--no-predictor",
+    ],
+)
+def test_tune_vc_rejects_dead_pd_era_flags(monkeypatch, dead_flag):
+    """The PD/predictor-era knobs were removed because move_azimuth_to_ff
+    ignores them; argparse must now reject them outright."""
+    with pytest.raises(SystemExit):
+        _parse_tune_vc_args(monkeypatch, [dead_flag, "0.5"])
+
+
+def test_tune_vc_keeps_ff_knobs_and_drops_pd_attrs(monkeypatch):
+    """The FF+FB knobs actually wired into move_azimuth_to_ff stay and parse
+    through; the removed PD/predictor-era knobs leave no attribute behind on
+    the parsed namespace (guards against silent re-introduction)."""
+    rc, args = _parse_tune_vc_args(
+        monkeypatch,
+        [
+            "--control",
+            "feedforward",
+            "--kp-pos",
+            "0.7",
+            "--v-corr-max",
+            "1.5",
+            "--max-rate",
+            "4.0",
+            "--a-max",
+            "8.0",
+            "--j-max",
+            "30.0",
+            "--profile",
+            "scurve",
+        ],
+    )
+    assert rc == 0
+    # Retained knobs are present and parsed to the values move_azimuth_to_ff
+    # consumes.
+    assert args.kp_pos == 0.7
+    assert args.v_corr_max == 1.5
+    assert args.max_rate == 4.0
+    assert args.a_max == 8.0
+    # Dead PD/predictor-era knobs leave no namespace attribute.
+    for attr in (
+        "kp",
+        "kd",
+        "tau",
+        "min_speed",
+        "fine_min_speed",
+        "fine_thresh_factor",
+        "max_halvings",
+        "use_predictor",
+    ):
+        assert not hasattr(args, attr), f"dead PD-era arg still present: {attr}"

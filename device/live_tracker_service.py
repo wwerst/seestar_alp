@@ -57,6 +57,7 @@ class LiveTrackerMain:
             altaz_reader=_make_altaz_reader(),
             jog_command=_make_jog_command(),
             abort_active=_abort_active_sessions,
+            jog_telescope_id=_primary_telescope_id(),
             lat_deg=Config.init_lat,
             lon_deg=Config.init_long,
             min_separation_deg=Config.sun_avoidance_min_sep_deg,

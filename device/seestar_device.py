@@ -140,11 +140,17 @@ class Seestar:
         self.lock = threading.RLock()
         self._plate_solve_sync_lock = threading.Lock()
         # Serializes cmdid allocation + socket send so two concurrent callers
-        # can't hand out the same id or interleave bytes on the wire. Held
-        # only across the send, never across the response wait. Reentrant:
-        # send_message recovers from socket errors via reconnect(), whose
-        # auth handshake sends on this same thread — a plain Lock would
-        # self-deadlock there.
+        # can't hand out the same id or interleave bytes on the wire. In the
+        # common case it is held only across the send, never across the
+        # caller's response wait. Reentrant because send_message() recovers
+        # from a socket error by calling reconnect() while still holding this
+        # lock, and reconnect()'s auth handshake issues its own
+        # send_message_param_sync calls (get_verify_str / verify_client) on
+        # this same thread — a plain Lock would self-deadlock there. On that
+        # reconnect-inside-send path the lock IS held across the handshake's
+        # synchronous response waits, so every other sender is serialized
+        # behind the reconnect for its full duration (accepted cost; the
+        # locking is deliberately not restructured here).
         self._send_lock = threading.RLock()
         self.is_cur_scheduler_item_working: bool = False
 
@@ -1108,10 +1114,12 @@ class Seestar:
         # emergency lockout (it owns the mount during an active jog-away), and
         # refuse when the current pointing is inside the sun-avoidance cone.
         # The goto path (`_slew_to_ra_dec`) and the velocity_controller
-        # speed_move wrapper apply the same guard. A stop (speed 0) must
-        # always pass: refusing it would keep the motor running on the last
-        # command — the opposite of what the guard protects against (ASCOM
-        # MoveAxis(rate=0) is the standard stop gesture).
+        # speed_move wrapper apply the same guard. A stop (speed 0) normally
+        # must always pass: refusing it would keep the motor running on the
+        # last command — the opposite of what the guard protects against
+        # (ASCOM MoveAxis(rate=0) is the standard stop gesture). The one
+        # exception is while the emergency jog-away is executing: a stop then
+        # would truncate the jog (see the in_speed == 0 branch below).
         if in_speed != 0:
             from device.sun_safety import sun_safety_is_locked_out
 
@@ -1122,6 +1130,21 @@ class Seestar:
                 return False
             if not self._move_scope_sun_safe():
                 return False
+        else:
+            # in_speed == 0 is a stop. While the SunSafetyMonitor's emergency
+            # jog-away is executing, a stop would truncate the jog and
+            # re-strand the mount inside the sun cone — and periodic ASCOM
+            # MoveAxis(rate=0) heartbeats would truncate every re-jog,
+            # producing an unbounded trip loop. The jog's own firmware dur_sec
+            # bounds the motion, so treat the stop as a no-op while a jog is in
+            # progress.
+            from device.sun_safety import sun_safety_jog_in_progress
+
+            if sun_safety_jog_in_progress(self.device_num):
+                self.logger.warning(
+                    "move_scope stop suppressed: sun-safety jog in progress."
+                )
+                return True
 
         data: MessageParams = {
             "method": "scope_speed_move",
