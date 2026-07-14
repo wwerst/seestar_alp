@@ -48,3 +48,84 @@ def get_scope_start_lock(telescope_id: int) -> threading.Lock:
             lock = threading.Lock()
             _SCOPE_LOCKS[tid] = lock
         return lock
+
+
+def raise_if_scope_busy(
+    telescope_id: int,
+    new_owner: str,
+    *,
+    check_tracker: bool = True,
+    check_calibration: bool = True,
+    check_calibrate_motion: bool = True,
+    check_visibility: bool = True,
+    check_nighttime_auto: bool = True,
+) -> None:
+    """Raise ``RuntimeError`` if another mount-driving manager already owns
+    ``telescope_id``.
+
+    A manager calls this while it holds this telescope's start-lock, right
+    before it registers its own session, so the "is anyone else driving
+    this mount?" check and the registration are atomic across managers.
+    Every manager import is lazy + ``ImportError``-guarded so this helper
+    stays usable from any ``device.*`` module and in unit tests that stub
+    only a subset of managers. Pass ``check_<self>=False`` to skip the
+    caller's own registry — the caller's duplicate-start check lives in
+    its own manager.
+    """
+    tid = int(telescope_id)
+    if check_tracker:
+        try:
+            from device.live_tracker import get_manager as _get_tracker_mgr
+
+            tracker = _get_tracker_mgr().get(tid)
+            if tracker is not None and tracker.is_alive():
+                raise RuntimeError(
+                    f"telescope {tid} is live-tracking; stop the tracker before "
+                    f"starting {new_owner}"
+                )
+        except ImportError:
+            pass
+    if check_calibration:
+        try:
+            from device.rotation_calibration import get_calibration_manager
+
+            if get_calibration_manager().is_running(tid):
+                raise RuntimeError(
+                    f"telescope {tid} is calibrating; stop the calibration before "
+                    f"starting {new_owner}"
+                )
+        except ImportError:
+            pass
+    if check_calibrate_motion:
+        try:
+            from device.calibrate_motion import get_calibrate_motion_manager
+
+            if get_calibrate_motion_manager().is_running(tid):
+                raise RuntimeError(
+                    f"telescope {tid} is in calibrate-motion mode; stop it before "
+                    f"starting {new_owner}"
+                )
+        except ImportError:
+            pass
+    if check_visibility:
+        try:
+            from device.visibility_mapper import get_visibility_manager
+
+            if get_visibility_manager().is_running(tid):
+                raise RuntimeError(
+                    f"telescope {tid} is running a visibility map; stop it before "
+                    f"starting {new_owner}"
+                )
+        except ImportError:
+            pass
+    if check_nighttime_auto:
+        try:
+            from device.nighttime_calibration import get_nighttime_auto_manager
+
+            if get_nighttime_auto_manager().is_running(tid):
+                raise RuntimeError(
+                    f"telescope {tid} has a nighttime auto-run in flight; stop it "
+                    f"before starting {new_owner}"
+                )
+        except ImportError:
+            pass

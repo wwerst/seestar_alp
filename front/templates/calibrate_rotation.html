@@ -579,7 +579,11 @@
     try {
       const r = await fetch(`${apiRoot}/celestial_targets?altitude_m=${encodeURIComponent(altM)}`);
       if (!r.ok) {
-        els.celestialList.textContent = 'celestial unavailable: ' + (await r.json().catch(()=>({})).error || r.statusText);
+        // `await` binds looser than member access, so
+        // `await r.json().catch(...).error` reads `.error` off the *promise*
+        // (always undefined). Await first, then read the field.
+        const j = await r.json().catch(() => ({}));
+        els.celestialList.textContent = 'celestial unavailable: ' + (j.error || r.statusText);
         return;
       }
       const body = await r.json();

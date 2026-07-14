@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field, fields
@@ -108,9 +109,20 @@ class CumulativeAzTracker:
 
     def update(self, wrapped_az_deg: float) -> float:
         """Integrate the next wrapped reading into cumulative az. Returns
-        the updated `cum_az_deg`."""
+        the updated `cum_az_deg`.
+
+        Rejects non-finite readings (NaN/Inf) with ``ValueError`` instead of
+        integrating them: a single bad encoder sample would otherwise poison
+        ``cum_az_deg`` permanently — and, once ``save()`` runs, persist the
+        NaN to the state file where it corrupts every future session.
+        """
         from device.velocity_controller import wrap_pm180  # avoid cycle at import
 
+        if not math.isfinite(wrapped_az_deg):
+            raise ValueError(
+                f"CumulativeAzTracker.update: non-finite wrapped_az_deg: "
+                f"{wrapped_az_deg!r}"
+            )
         if not self._initialized:
             self.cum_az_deg = float(wrapped_az_deg)
             self._prev_wrapped = float(wrapped_az_deg)
@@ -171,6 +183,14 @@ class CumulativeAzTracker:
                 data = json.load(f)
             saved_cum = float(data["cum_az_deg"])
             saved_wrapped = float(data["wrapped_az_deg"])
+            # Reject a non-finite persisted state (Python's json accepts
+            # NaN/Infinity by default): loading it would re-poison cum_az and
+            # break the drift comparison below. Fall back to a fresh tracker.
+            if not (math.isfinite(saved_cum) and math.isfinite(saved_wrapped)):
+                raise ValueError(
+                    f"non-finite saved state (cum={saved_cum!r}, "
+                    f"wrapped={saved_wrapped!r})"
+                )
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             sys.stderr.write(
                 f"CumulativeAzTracker: failed to load {path}: {exc}; starting fresh.\n"

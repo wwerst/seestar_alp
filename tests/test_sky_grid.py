@@ -142,6 +142,46 @@ def test_neighbors_wrap_at_az_360():
     assert last.idx in grid.neighbors[first.idx]
 
 
+def test_band_adjacent_neighbor_is_az_nearest_center():
+    """The band-above / band-below neighbor of each cell must be the cell
+    whose center is *nearest* in azimuth in the adjacent band.
+
+    Cell centers sit at ``(j+0.5)*360/count``, so the containing cell is
+    ``floor(az*count/360)`` — its center is within half a cell of ``az``.
+    The old ``round(az*count/360)`` picked the cell *boundary* index, which
+    lands on the wrong (up to a full cell away) neighbor past the half-cell
+    mark. This pins down the floor convention across the whole grid.
+    """
+    from collections import defaultdict
+
+    grid = make_altaz_band_grid(min_alt_deg=0.0)
+    bands = defaultdict(list)
+    for c in grid.cells:
+        bands[round(c.alt_deg, 6)].append(c)
+    alts = sorted(bands)
+
+    def az_sep(a: float, b: float) -> float:
+        return abs((a - b + 180.0) % 360.0 - 180.0)
+
+    checked = 0
+    for i in range(len(alts) - 1):
+        cur_band = bands[alts[i]]
+        above_band = bands[alts[i + 1]]
+        for c in cur_band:
+            seps = sorted(az_sep(c.az_deg, ac.az_deg) for ac in above_band)
+            # Skip cells sitting on a boundary between two equidistant
+            # centers — "nearest" is ambiguous there.
+            if len(seps) >= 2 and (seps[1] - seps[0]) < 1e-6:
+                continue
+            nearest = min(above_band, key=lambda ac: az_sep(c.az_deg, ac.az_deg))
+            assert nearest.idx in grid.neighbors[c.idx], (
+                f"cell {c.idx} (az={c.az_deg:.2f}) band-above nearest center "
+                f"{nearest.idx} (az={nearest.az_deg:.2f}) is not a neighbor"
+            )
+            checked += 1
+    assert checked > 100  # exercised a meaningful chunk of the grid
+
+
 # ---------- nearest-cell lookup -------------------------------------
 
 

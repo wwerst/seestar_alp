@@ -225,14 +225,19 @@ def make_altaz_band_grid(
                 above_count = band_count[b + 1]
                 target_az = cells[cur].az_deg
                 # Nearest center in the upper band by azimuth (with wrap).
-                k = int(round(target_az * above_count / 360.0)) % above_count
+                # Cell centers sit at (k+0.5)*360/count, so the cell whose
+                # center is nearest ``target_az`` is the one whose span
+                # contains it: floor(az*count/360). round() would pick the
+                # cell boundary index, biasing the neighbor by half a cell.
+                k = int(math.floor(target_az * above_count / 360.0)) % above_count
                 neighbors[cur].append(above_start + k)
             # Band below
             if b - 1 >= 0:
                 below_start = band_start_idx[b - 1]
                 below_count = band_count[b - 1]
                 target_az = cells[cur].az_deg
-                k = int(round(target_az * below_count / 360.0)) % below_count
+                # floor, not round — see the band-above note above.
+                k = int(math.floor(target_az * below_count / 360.0)) % below_count
                 neighbors[cur].append(below_start + k)
             # Dedupe and drop self.
             seen = []

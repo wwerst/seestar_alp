@@ -88,6 +88,12 @@ class JsonlECEFProvider:
     static before the first tick.
     """
 
+    # Static/finite provider: its valid_range() never grows, so the
+    # streaming controller treats reaching the extrapolation horizon as a
+    # clean end-of-track rather than a stall. (See LiveADSBProvider for the
+    # growing counterpart.)
+    is_live = False
+
     def __init__(
         self,
         path: str | Path,

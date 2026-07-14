@@ -558,3 +558,418 @@ def test_live_track_manager_start_atomic_under_lock():
 
     mgr.start(_FakeSession())
     assert captured["lock_held_during_session_start"] is True
+
+
+# --------- _poll_once backoff / seen_pos (findings 2, 3) -----------------
+
+
+def test_poll_once_empty_response_is_success(monkeypatch):
+    """A successful-but-empty adsb.fi response (clear sky) must return True
+    so the poller keeps its 5 s cadence. Only a genuine fetch failure
+    (poll_once_adsbfi -> None) returns False to drive the backoff. Before the
+    fix the success path fell off the end returning None → every good poll
+    looked like a failure and backed off 5 s → 60 s."""
+    import device.live_tracker as lt
+
+    catalog = lt.TargetCatalog(live_enabled=False)
+
+    monkeypatch.setattr(lt, "poll_once_adsbfi", lambda *a, **k: [])
+    assert catalog._poll_once() is True
+
+    monkeypatch.setattr(lt, "poll_once_adsbfi", lambda *a, **k: None)
+    assert catalog._poll_once() is False
+
+
+def test_poll_once_populated_response_is_success(monkeypatch):
+    import device.live_tracker as lt
+
+    site = build_site()
+    ac = {
+        "hex": "abc123",
+        "lat": site.lat_deg + 0.05,
+        "lon": site.lon_deg,
+        "alt_geom": 10000.0,  # ft → ~3048 m, under MAX_ALT_M
+        "flight": "TEST123",
+        "gs": 300.0,
+        "track": 90.0,
+    }
+    catalog = lt.TargetCatalog(live_enabled=False)
+    monkeypatch.setattr(lt, "poll_once_adsbfi", lambda *a, **k: [ac])
+    assert catalog._poll_once() is True
+    assert catalog._live_buffers.get("abc123") is not None
+
+
+def test_poll_once_backdates_sample_by_seen_pos(monkeypatch):
+    """ADS-B samples must be stamped at time.time() - seen_pos (the feed's
+    per-aircraft position age), not the poll wall time — otherwise the mount
+    trails the target by degrees."""
+    import device.live_tracker as lt
+
+    site = build_site()
+    seen_pos = 8.0
+    ac = {
+        "hex": "def456",
+        "lat": site.lat_deg + 0.05,
+        "lon": site.lon_deg,
+        "alt_geom": 10000.0,
+        "flight": "AGED1",
+        "gs": 300.0,
+        "track": 90.0,
+        "seen_pos": seen_pos,
+    }
+    catalog = lt.TargetCatalog(live_enabled=False)
+    monkeypatch.setattr(lt, "poll_once_adsbfi", lambda *a, **k: [ac])
+
+    t_before = time.time()
+    assert catalog._poll_once() is True
+    t_after = time.time()
+
+    buf = catalog._live_buffers.get("def456")
+    assert buf is not None
+    assert (
+        (t_before - seen_pos) - 0.1 <= buf.last_sample_t <= (t_after - seen_pos) + 0.1
+    )
+
+
+def test_live_buffer_drops_equal_and_backdated_stamps():
+    """The buffer must stay strictly monotonic in t_unix: a re-poll of a
+    stale position (seen_pos yields an equal or earlier stamp) is dropped so
+    np.interp / unwrap downstream never see a non-sorted time axis."""
+    from device.live_tracker import _LiveBuffer
+
+    buf = _LiveBuffer(icao24="x", callsign="")
+    buf.append(100.0, (1.0, 2.0, 3.0))
+    buf.append(100.0, (4.0, 5.0, 6.0))  # equal → dropped
+    buf.append(95.0, (7.0, 8.0, 9.0))  # backdated → dropped
+    buf.append(105.0, (1.0, 1.0, 1.0))  # newer → kept
+    _, t, _ecef = buf.snapshot()
+    assert list(t) == [100.0, 105.0]
+
+
+# --------- guarded unwrap (finding 8) ------------------------------------
+
+
+def test_live_adsb_provider_guarded_unwrap_handles_non_finite(monkeypatch):
+    """LiveADSBProvider._rebuild uses the guarded device.geometry
+    unwrap_az_series; a non-finite az reading is rejected at the boundary
+    (ValueError handled) instead of poisoning the interpolation table."""
+    import device.live_tracker as lt
+    from device.target_frame import MountFrame
+
+    site = build_site()
+    buf = lt._LiveBuffer(icao24="deadbe", callsign="T")
+    # Exactly 3 samples → _rebuild takes the linear/else branch that calls
+    # unwrap_az_series directly (≥4 would go through ecef_traj_to_mount).
+    t0 = time.time() - 5.0
+    ecef = tuple(
+        float(x)
+        for x in lla_to_ecef(site.lat_deg + 0.05, site.lon_deg, site.alt_m + 3000.0)
+    )
+    for i in range(3):
+        buf.append(t0 + i, ecef)
+
+    def _bad_azel(self, ecef_arr):
+        n = len(ecef_arr)
+        az = np.full(n, 10.0)
+        az[0] = np.inf
+        return az, np.full(n, 45.0), np.full(n, 1000.0)
+
+    monkeypatch.setattr(MountFrame, "ecef_array_to_mount", _bad_azel)
+
+    # Construction must not raise even though the unwrap rejects the input.
+    provider = lt.LiveADSBProvider(
+        buf, MountFrame.from_identity_enu(site), rebuild_s=0.0
+    )
+    s = provider.sample(time.time())
+    assert s.stale  # empty tables → graceful stale sample, not a crash
+
+
+# --------- feasibility pre-check + cable limits (finding 4) --------------
+
+
+class _OverheadProvider:
+    """Provider whose elevation exceeds the mount's usable band, so
+    pre_check must mark it infeasible."""
+
+    is_live = False
+    extrapolation_s = 1.0
+
+    def __init__(self, t0: float, duration_s: float = 3.0):
+        self._t0 = t0
+        self._t1 = t0 + duration_s
+
+    def sample(self, t):
+        return ReferenceSample(
+            t_unix=float(t),
+            az_cum_deg=0.0,
+            el_deg=95.0,  # above the 85° usable ceiling
+            v_az_degs=0.0,
+            v_el_degs=0.0,
+            a_az_degs2=0.0,
+            a_el_degs2=0.0,
+            stale=False,
+            extrapolated=False,
+        )
+
+    def valid_range(self):
+        return (self._t0, self._t1)
+
+
+def test_live_track_manager_rejects_infeasible_trajectory(tmp_path, monkeypatch):
+    """LiveTrackManager.start runs a feasibility pre-check and raises
+    PreCheckFailed (a ValueError, mapped to HTTP 400) for a trajectory that
+    would leave the elevation band before any motion is commanded."""
+    import pytest
+    import device.live_tracker as lt
+    from device.live_tracker import PreCheckFailed
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            return {"result": None}
+
+    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+
+    session = LiveTrackSession(
+        telescope_id=120,
+        target_kind="file",
+        target_id="overhead",
+        target_display_name="Overhead",
+        provider=_OverheadProvider(t0=time.time() + 0.2),
+        offsets=AtomicOffsets(),
+        dry_run=True,
+        auto_slew=False,
+        log_dir=tmp_path / "logs",
+    )
+    mgr = LiveTrackManager()
+    with pytest.raises(PreCheckFailed):
+        mgr.start(session)
+    # Nothing was started.
+    assert mgr.get(120) is None
+
+
+def test_auto_slew_passes_cable_limits_to_move_to_ff(monkeypatch):
+    """The web pre-slew must thread AzimuthLimits + CumulativeAzTracker into
+    move_to_ff so its cumulative-aware planner keeps inside the ±450° cable
+    hard stop (the CLI track path already does this)."""
+    import device.live_tracker as lt
+    from device import sun_safety as ss
+    from device.plant_limits import AzimuthLimits, CumulativeAzTracker
+
+    monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    captured: dict = {}
+
+    def _fake_move(cli, **kwargs):
+        captured.update(kwargs)
+        return (kwargs["target_el_deg"], kwargs["target_az_deg"], {"converged": True})
+
+    monkeypatch.setattr(lt, "move_to_ff", _fake_move)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    session = LiveTrackSession(
+        telescope_id=130,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=_StationaryProvider(t0=time.time() + 0.2),
+        offsets=AtomicOffsets(),
+        dry_run=True,
+    )
+    limits = AzimuthLimits.load()
+    tracker = CumulativeAzTracker()
+    session._auto_slew(_FakeCli(), None, az_limits=limits, az_tracker=tracker)
+
+    assert captured.get("az_limits") is limits
+    assert captured.get("az_tracker") is tracker
+
+
+# --------- sun-refusal terminal / direct motor stop (findings 5, 7) ------
+
+
+def test_run_preslew_sun_refusal_is_terminal(tmp_path, monkeypatch):
+    """On a sun refusal the pre-slew is terminal: _run must not fall through
+    into track() and clobber phase/exit_reason. The refusal also sets the
+    stop event."""
+    import device.live_tracker as lt
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(
+        ss, "is_sun_safe", lambda *a, **k: (False, "sun_avoidance: forced")
+    )
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+
+    session = LiveTrackSession(
+        telescope_id=140,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=_StationaryProvider(t0=time.time() + 0.2),
+        offsets=AtomicOffsets(),
+        dry_run=False,
+        auto_slew=True,
+        log_dir=tmp_path / "logs",
+    )
+    session._run()
+
+    assert session._exit_reason == "sun_avoidance"
+    assert session._phase == "refused"
+    assert session._stop_evt.is_set()
+
+
+def test_run_direct_motor_stop_bypasses_sun_lockout(tmp_path, monkeypatch):
+    """During a sun-safety emergency lockout the wrapper-based exit stop is
+    refused; _run must issue a direct scope_speed_move(0) so the motor still
+    halts on session exit."""
+    import device.live_tracker as lt
+    from device.sun_safety import SunSafetyMonitor, get_sun_monitor, set_sun_monitor
+    from tests.fakes.fake_mount import FakeMountClient
+
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=45.0)
+    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: cli)
+
+    session = LiveTrackSession(
+        telescope_id=150,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=_StationaryProvider(t0=time.time(), duration_s=0.3),
+        offsets=AtomicOffsets(),
+        dry_run=False,
+        auto_slew=False,
+        log_dir=tmp_path / "logs",
+    )
+
+    prev = get_sun_monitor()
+    m = SunSafetyMonitor(
+        altaz_reader=lambda: None,
+        jog_command=lambda *a, **k: None,
+        lat_deg=0.0,
+        lon_deg=0.0,
+    )
+    m._emergency_lockout.set()
+    set_sun_monitor(m)
+    try:
+        session._run()
+    finally:
+        set_sun_monitor(prev)
+
+    # The only scope_speed_move reaching the mount under lockout is the
+    # direct bypass in _run's finally.
+    assert cli.state.commands_received >= 1
+    assert cli.state.last_cmd is not None
+    assert cli.state.last_cmd[0] == 0
+
+
+# --------- manager cross-exclusion (finding 9) ---------------------------
+
+
+def _make_stationary_session(tid: int, tmp_path) -> LiveTrackSession:
+    return LiveTrackSession(
+        telescope_id=tid,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=_StationaryProvider(t0=time.time() + 0.2),
+        offsets=AtomicOffsets(),
+        dry_run=True,
+        auto_slew=False,
+        log_dir=tmp_path / "logs",
+    )
+
+
+def test_live_track_manager_refuses_when_visibility_map_running(tmp_path, monkeypatch):
+    import pytest
+    import device.visibility_mapper as vm
+
+    class _FakeVisMgr:
+        def is_running(self, tid):
+            return True
+
+    monkeypatch.setattr(vm, "get_visibility_manager", lambda: _FakeVisMgr())
+
+    mgr = LiveTrackManager()
+    with pytest.raises(RuntimeError):
+        mgr.start(_make_stationary_session(160, tmp_path))
+    assert mgr.get(160) is None
+
+
+def test_live_track_manager_refuses_when_nighttime_auto_running(tmp_path, monkeypatch):
+    import pytest
+    import device.nighttime_calibration as nc
+
+    class _FakeAutoMgr:
+        def is_running(self, tid):
+            return True
+
+        def get(self, tid):
+            return None
+
+    monkeypatch.setattr(nc, "get_nighttime_auto_manager", lambda: _FakeAutoMgr())
+
+    mgr = LiveTrackManager()
+    with pytest.raises(RuntimeError):
+        mgr.start(_make_stationary_session(161, tmp_path))
+    assert mgr.get(161) is None
+
+
+def test_run_direct_motor_stop_skipped_while_sun_jog_in_progress(tmp_path, monkeypatch):
+    """The session-exit direct stop must NOT cancel an in-flight emergency
+    jog-away: with the monitor's jog window open, no scope_speed_move may
+    reach the mount from the session at all (the jog's own firmware dur_sec
+    bounds the motion)."""
+    import time as _time
+
+    import device.live_tracker as lt
+    from device.sun_safety import SunSafetyMonitor, get_sun_monitor, set_sun_monitor
+    from tests.fakes.fake_mount import FakeMountClient
+
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=45.0)
+    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: cli)
+
+    session = LiveTrackSession(
+        telescope_id=151,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=_StationaryProvider(t0=time.time(), duration_s=0.3),
+        offsets=AtomicOffsets(),
+        dry_run=False,
+        auto_slew=False,
+        log_dir=tmp_path / "logs",
+    )
+
+    prev = get_sun_monitor()
+    m = SunSafetyMonitor(
+        altaz_reader=lambda: None,
+        jog_command=lambda *a, **k: None,
+        lat_deg=0.0,
+        lon_deg=0.0,
+    )
+    m._emergency_lockout.set()
+    with m._lock:
+        m._jog_until_ts = _time.time() + 30.0
+    set_sun_monitor(m)
+    try:
+        session._run()
+    finally:
+        set_sun_monitor(prev)
+
+    # Wrapper stops are refused by the lockout AND the direct bypass is
+    # skipped by the jog window — nothing reaches the mount.
+    assert cli.state.last_cmd is None

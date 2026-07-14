@@ -183,6 +183,14 @@ class RotationSolution:
 KEEP_MAX_AGE_S = 6 * 3600
 KEEP_MAX_DISTANCE_M = 10.0
 
+# Below this many sightings a 3-DOF (yaw/pitch/roll) fit is
+# ill-conditioned — with only two directions the roll about the
+# line-of-sight is effectively unobservable, so the solver invents a
+# spurious roll that extrapolates badly across the rest of the sky.
+# ``dof="auto"`` fits yaw-only below this threshold. Mirrors
+# ``device.nighttime_calibration.MIN_SIGHTINGS_FOR_APPLY``.
+MIN_SIGHTINGS_FOR_3DOF = 3
+
 _EARTH_R_M = 6_371_000.0
 
 
@@ -300,6 +308,11 @@ def decide_clear_or_keep(prior: PriorInfo | None) -> bool:
 
 
 def _wrap_pm180(deg: float) -> float:
+    # Intentionally the (-180, +180] variant (−180 folds to +180), which
+    # diverges from ``device.geometry.wrap_pm180``'s half-open [−180, +180)
+    # convention. The rotation-fit residual math + calibration-frame code
+    # depends on this boundary; unify with device.geometry only alongside a
+    # recalibration-safe migration (see device/geometry.py module docstring).
     d = (deg + 180.0) % 360.0 - 180.0
     return 180.0 if d == -180.0 else d
 
@@ -444,12 +457,15 @@ def solve_rotation(
     """Least-squares fit of a mount-frame rotation to the sightings.
 
     ``dof``:
-      - ``"auto"`` (default): fit yaw only when exactly one sighting
-        is available (enables seeding landmark #2 without pitch/roll
-        ambiguity), otherwise fit full 3-DOF (yaw, pitch, roll).
+      - ``"auto"`` (default): fit yaw only with fewer than
+        ``MIN_SIGHTINGS_FOR_3DOF`` (3) sightings — roll is unobservable
+        from one or two directions and a 3-DOF fit there produces a
+        spurious roll that extrapolates badly across the sky. With ≥3
+        sightings fit full 3-DOF (yaw, pitch, roll).
       - ``"yaw"``: force yaw-only. Useful as a sanity check.
-      - ``"full"``: force 3-DOF even from a single sighting (under-
-        determined but occasionally useful for regression tests).
+      - ``"full"``: force 3-DOF even from one or two sightings (under-
+        determined but useful when the two sightings are known to be
+        well-separated, and for regression tests).
 
     Residuals combine az and el errors with equal weight. The encoder
     az reported by the mount is in [-180, 180) — we wrap-diff the
@@ -462,7 +478,9 @@ def solve_rotation(
     if dof not in ("auto", "yaw", "full"):
         raise ValueError(f"unknown dof mode: {dof!r}")
 
-    yaw_only = (dof == "yaw") or (dof == "auto" and len(sightings) == 1)
+    yaw_only = (dof == "yaw") or (
+        dof == "auto" and len(sightings) < MIN_SIGHTINGS_FOR_3DOF
+    )
 
     def _predict(
         s: Sighting, yaw: float, pitch: float, roll: float

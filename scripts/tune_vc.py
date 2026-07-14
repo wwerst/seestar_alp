@@ -4,9 +4,9 @@
 Three modes:
 
   --mode setpoints   (default)
-        Drive a short list of az setpoints via move_azimuth_to_velocity.
-        Useful for measuring convergence behavior and oscillation
-        against different PD tunings.
+        Drive a short list of az setpoints via move_azimuth_to_ff (the
+        FF+FB mover). Useful for measuring convergence behavior and
+        oscillation; --control selects closed-loop FF+FB vs pure-FF.
 
   --mode step_response
         Issue scope_speed_move(speed, angle, dur_sec) bursts from rest and
@@ -79,7 +79,6 @@ _wait_for_mount_idle = vc.wait_for_mount_idle
 set_tracking = vc.set_tracking
 _MIN_DUR_S = vc.MIN_DUR_S
 _SPEED_PER_DEG_PER_SEC = vc.SPEED_PER_DEG_PER_SEC
-move_azimuth_to_velocity = vc.move_azimuth_to_velocity
 move_azimuth_to_ff = vc.move_azimuth_to_ff
 move_azimuth_to_with_correction = vc.move_azimuth_to_with_correction
 
@@ -262,58 +261,37 @@ def run_setpoints(cli: InstrumentedAlpacaClient, args) -> int:
             t_step = time.monotonic()
             print(f"{tag} START  (cur={cur_az:+.3f}°, delta={delta:+.3f}°)", flush=True)
             try:
-                if args.control in ("feedforward", "ff_pure"):
-                    # ff_pure forces kp_pos=0 (pure open-loop FF);
-                    # feedforward uses the configured kp_pos (closed-loop).
-                    kp_pos_use = 0.0 if args.control == "ff_pure" else args.kp_pos
-                    _, meas_az, stats = move_azimuth_to_ff(
-                        cli,
-                        target_az_deg=target,
-                        cur_az_deg=cur_az,
-                        loc=loc,
-                        target_alt_deg=args.alt,
-                        tag=tag,
-                        position_logger=logger,
-                        v_max=args.max_rate,
-                        a_max=args.a_max,
-                        j_max=args.j_max,
-                        tick_dt=args.loop_dt,
-                        settle_s=args.settle if args.settle > 0 else 1.5,
-                        cold_start_lag_s=args.cold_start_lag,
-                        profile=args.profile,
-                        az_forbidden_deg=args.az_forbidden,
-                        az_limits=az_limits,
-                        az_tracker=az_tracker,
-                        kp_pos=kp_pos_use,
-                        v_corr_max=args.v_corr_max,
-                        arrive_tolerance_deg=args.tol,
-                        settle_max_s=args.settle_max_s,
-                        fallback_residual_deg=args.ff_fallback_residual,
-                        fallback_goto_fn=iscope_fallback_goto,
-                    )
-                else:
-                    _, meas_az, stats = move_azimuth_to_velocity(
-                        cli,
-                        target_az_deg=target,
-                        cur_az_deg=cur_az,
-                        loc=loc,
-                        target_alt_deg=args.alt,
-                        tag=tag,
-                        arrive_tolerance_deg=args.tol,
-                        position_logger=logger,
-                        timeout_s=args.timeout,
-                        kp=args.kp,
-                        kd=args.kd,
-                        max_rate_degs=args.max_rate,
-                        loop_dt_s=args.loop_dt,
-                        min_speed=args.min_speed,
-                        fine_min_speed=args.fine_min_speed,
-                        fine_threshold_factor=args.fine_thresh_factor,
-                        max_halvings=args.max_halvings,
-                        use_predictor=args.use_predictor,
-                        tau_s=args.tau,
-                        fallback_goto_fn=iscope_fallback_goto,
-                    )
+                # The legacy PD "velocity" controller was removed. All three
+                # control modes now run through the FF+FB mover:
+                #   - "feedforward": closed-loop, configured kp_pos.
+                #   - "ff_pure" / "velocity": pure open-loop FF (kp_pos=0) —
+                #     the comparison-mode replacement for the old PD path.
+                kp_pos_use = args.kp_pos if args.control == "feedforward" else 0.0
+                _, meas_az, stats = move_azimuth_to_ff(
+                    cli,
+                    target_az_deg=target,
+                    cur_az_deg=cur_az,
+                    loc=loc,
+                    target_alt_deg=args.alt,
+                    tag=tag,
+                    position_logger=logger,
+                    v_max=args.max_rate,
+                    a_max=args.a_max,
+                    j_max=args.j_max,
+                    tick_dt=args.loop_dt,
+                    settle_s=args.settle if args.settle > 0 else 1.5,
+                    cold_start_lag_s=args.cold_start_lag,
+                    profile=args.profile,
+                    az_forbidden_deg=args.az_forbidden,
+                    az_limits=az_limits,
+                    az_tracker=az_tracker,
+                    kp_pos=kp_pos_use,
+                    v_corr_max=args.v_corr_max,
+                    arrive_tolerance_deg=args.tol,
+                    settle_max_s=args.settle_max_s,
+                    fallback_residual_deg=args.ff_fallback_residual,
+                    fallback_goto_fn=iscope_fallback_goto,
+                )
             except Exception as e:
                 print(f"{tag} ERROR: {e}", file=sys.stderr)
                 logger.mark_event("setpoint_error", step=i, error=repr(e))
@@ -793,10 +771,11 @@ def main() -> int:
     p.add_argument("--control",
                    choices=["velocity", "feedforward", "ff_pure"],
                    default="velocity",
-                   help="Controller: 'velocity' (PD+predictor, default); "
-                        "'feedforward' (open-loop trajectory + post-move "
-                        "slow-nudge correction loop); 'ff_pure' (trajectory "
-                        "only, no correction — for evaluating raw FF).")
+                   help="Controller (all via the FF+FB mover): 'feedforward' "
+                        "runs closed-loop FF+FB with --kp-pos; 'ff_pure' and "
+                        "'velocity' run pure open-loop FF (kp_pos=0). The old "
+                        "PD 'velocity' controller was removed; 'velocity' is "
+                        "kept as an alias for the pure-FF comparison mode.")
     p.add_argument("--a-max", type=float, default=10.0,
                    help="FF: max accel (°/s²) for trajectory planner.")
     p.add_argument("--j-max", type=float, default=40.0,

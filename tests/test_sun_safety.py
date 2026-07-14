@@ -7,6 +7,7 @@ ephem path is deterministic and runs the same anywhere.
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime, timezone
 
@@ -20,6 +21,7 @@ from device.sun_safety import (
     compute_jog_angle,
     compute_sun_altaz,
     is_sun_safe,
+    make_scope_altaz_reader,
 )
 
 
@@ -486,8 +488,14 @@ def test_monitor_trips_and_calls_abort_then_jog_then_releases():
     try:
         aborts: list[int] = []
         jog = _FakeJog()
+
+        def reader():
+            # In the cone before the jog; clear of it afterwards — the
+            # post-jog verify re-jogs only when the jog was truncated.
+            return (181.0, 31.0) if not jog.calls else (90.0, 10.0)
+
         m = SunSafetyMonitor(
-            altaz_reader=lambda: (181.0, 31.0),  # 1.4° from sun
+            altaz_reader=reader,
             jog_command=jog,
             abort_active=lambda: aborts.append(1),
             lat_deg=33.96,
@@ -702,3 +710,245 @@ def test_speed_move_refuses_while_monitor_locked_out():
         assert cli.calls == []  # firmware never touched
     finally:
         set_sun_monitor(prev)
+
+
+# --- P1: fail CLOSED when the observer location is unset -------------------
+
+
+def test_is_sun_safe_fails_closed_when_location_unset():
+    # Explicit 0,0 sentinel: the sun position at Null Island cannot be
+    # trusted to represent the real site, so refuse rather than fail open.
+    safe, reason = is_sun_safe(180.0, 33.0, lat_deg=0.0, lon_deg=0.0)
+    assert safe is False
+    assert "location is not set" in reason
+
+
+def test_is_sun_safe_fails_closed_when_config_location_unset(monkeypatch):
+    # lat/lon omitted → resolved from Config; the fresh-install default is
+    # 0/0, which must fail closed for every pointing (even at night).
+    from device import config as _config
+
+    monkeypatch.setattr(_config.Config, "init_lat", 0.0)
+    monkeypatch.setattr(_config.Config, "init_long", 0.0)
+    safe, reason = is_sun_safe(10.0, 5.0)
+    assert safe is False
+    assert "location is not set" in reason
+
+
+def test_is_sun_safe_ok_when_location_is_set():
+    # Sanity: a real site at night is still allowed (not tripped by the
+    # unset-location guard).
+    safe, reason = is_sun_safe(
+        180.0,
+        33.0,
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_midnight_utc(),
+    )
+    assert safe is True
+    assert reason == ""
+
+
+def test_monitor_warns_and_skips_when_location_unset(caplog):
+    jog = _FakeJog()
+    m = SunSafetyMonitor(
+        altaz_reader=lambda: (180.0, 30.0),  # pointing right at where sun is
+        jog_command=jog,
+        lat_deg=0.0,
+        lon_deg=0.0,
+        jog_duration_s=0,
+    )
+    with caplog.at_level(logging.ERROR, logger="device.sun_safety"):
+        m._tick()
+    assert jog.calls == [], "blind monitor must not jog on an untrusted site"
+    assert m.last_trip() is None
+    assert any("SUN SAFETY BLIND" in r.message for r in caplog.records)
+
+
+# --- P1: encoder-based sensing (make_scope_altaz_reader) ------------------
+
+
+def test_make_scope_altaz_reader_returns_encoder_azel():
+    # scope_get_horiz_coord → [alt, az]; reader yields (az, alt).
+    reader = make_scope_altaz_reader(lambda *_a, **_k: {"result": [33.0, 180.0]})
+    assert reader() == (180.0, 33.0)
+
+
+def test_make_scope_altaz_reader_wraps_az():
+    reader = make_scope_altaz_reader(lambda *_a, **_k: {"result": [12.0, 370.0]})
+    az, alt = reader()
+    assert az == pytest.approx(10.0)
+    assert alt == pytest.approx(12.0)
+
+
+def test_make_scope_altaz_reader_none_on_missing_or_bad():
+    assert make_scope_altaz_reader(lambda *_a, **_k: {"ok": 1})() is None
+    assert make_scope_altaz_reader(lambda *_a, **_k: "nope")() is None
+    assert make_scope_altaz_reader(lambda *_a, **_k: {"result": [1.0]})() is None
+    assert (
+        make_scope_altaz_reader(lambda *_a, **_k: {"result": [float("nan"), 1.0]})()
+        is None
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("socket down")
+
+    assert make_scope_altaz_reader(_boom)() is None
+
+
+def test_monitor_trips_for_uncalibrated_scope_via_encoder():
+    # Regression: RA/Dec reads ra==dec==0 (pre-plate-solve) during the day,
+    # but the encoder reader still senses a real pointing near the sun. The
+    # monitor must trip on the encoder reading.
+    from device import sun_safety as ss
+
+    sun_pos = (180.0, 30.0)
+    real = ss.compute_sun_altaz
+    ss.compute_sun_altaz = lambda **kw: sun_pos
+    try:
+        jog = _FakeJog()
+
+        # Encoder reports (alt=31, az=181) → 1.4° from the sun before the
+        # jog; clear of the cone once the jog has run (so the post-jog
+        # verify doesn't re-jog).
+        def _horiz(*_a, **_k):
+            return {"result": [31.0, 181.0] if not jog.calls else [10.0, 90.0]}
+
+        reader = make_scope_altaz_reader(_horiz)
+        m = SunSafetyMonitor(
+            altaz_reader=reader,
+            jog_command=jog,
+            lat_deg=33.96,
+            lon_deg=-118.46,
+            jog_duration_s=0,
+        )
+        m._tick()
+    finally:
+        ss.compute_sun_altaz = real
+    assert len(jog.calls) == 1, "uncalibrated (encoder-sensed) scope must trip"
+    trip = m.last_trip()
+    assert trip is not None
+    assert trip.separation_deg < 30.0
+
+
+# --- P1: emergency jog is issued BEFORE abort_active ----------------------
+
+
+def test_trip_jogs_before_aborting():
+    from device import sun_safety as ss
+
+    sun_pos = (180.0, 30.0)
+    real = ss.compute_sun_altaz
+    ss.compute_sun_altaz = lambda **kw: sun_pos
+    try:
+        order: list[str] = []
+
+        def _jog(_s, _a, _d):
+            order.append("jog")
+
+        def _abort():
+            order.append("abort")
+
+        def _reader():
+            # In-cone before the jog, clear afterwards — keeps the
+            # post-jog verify from re-jogging in this ordering test.
+            return (181.0, 31.0) if "jog" not in order else (90.0, 10.0)
+
+        m = SunSafetyMonitor(
+            altaz_reader=_reader,
+            jog_command=_jog,
+            abort_active=_abort,
+            lat_deg=33.96,
+            lon_deg=-118.46,
+            jog_duration_s=0,
+        )
+        m._tick()
+    finally:
+        ss.compute_sun_altaz = real
+    assert order == ["jog", "abort"], (
+        "mount must jog out of the cone before slow abort_active teardown"
+    )
+
+
+# --- P1: geometry consolidation -------------------------------------------
+
+
+def test_angular_separation_delegates_to_geometry():
+    from device import geometry as geo
+
+    for args in [
+        (12.0, 34.0, 200.0, -5.0),
+        (0.0, 0.0, 90.0, 0.0),
+        (350.0, 10.0, 10.0, -10.0),
+    ]:
+        assert angular_separation(*args) == geo.angular_separation_deg(*args)
+
+
+def test_sun_safety_reuses_geometry_wrap_pm180():
+    from device import geometry as geo
+    from device import sun_safety as ss
+
+    # The local (-180,180] duplicate was removed in favour of the shared
+    # [-180,180) helper.
+    assert ss.wrap_pm180 is geo.wrap_pm180
+    assert not hasattr(ss, "_wrap_pm180")
+
+
+def test_monitor_rejogs_when_teardown_truncates_jog():
+    """A session teardown's direct motor-stop can cancel the in-flight
+    emergency jog. The monitor must verify separation after each jog and
+    re-jog (uncontested, sessions now aborted) until it is out of the cone."""
+    sun_pos = (180.0, 30.0)
+    from device import sun_safety as ss
+
+    real = ss.compute_sun_altaz
+    ss.compute_sun_altaz = lambda **kw: sun_pos
+    try:
+        jog = _FakeJog()
+
+        def reader():
+            # Still inside the cone until the second jog lands (jog #1
+            # "truncated" by a teardown stop), then well clear.
+            return (181.0, 31.0) if len(jog.calls) < 2 else (90.0, 10.0)
+
+        m = SunSafetyMonitor(
+            altaz_reader=reader,
+            jog_command=jog,
+            abort_active=lambda: None,
+            lat_deg=33.96,
+            lon_deg=-118.46,
+            jog_duration_s=0,
+        )
+        jog.bind(m)
+        m._tick()
+    finally:
+        ss.compute_sun_altaz = real
+
+    assert len(jog.calls) == 2, "truncated jog must be re-issued once"
+    assert m.is_locked_out() is False
+    assert m.is_jog_in_progress() is False
+
+
+def test_sun_safety_jog_in_progress_helper():
+    """Module helper reflects the monitor's jog window; False without a
+    monitor installed (test mode / CLI)."""
+    import time as _time
+
+    from device import sun_safety as ss
+
+    assert ss.sun_safety_jog_in_progress() is False
+    m = SunSafetyMonitor(
+        altaz_reader=lambda: None,
+        jog_command=lambda *a: None,
+        lat_deg=33.96,
+        lon_deg=-118.46,
+    )
+    prev = ss.get_sun_monitor()
+    ss.set_sun_monitor(m)
+    try:
+        assert ss.sun_safety_jog_in_progress() is False
+        with m._lock:
+            m._jog_until_ts = _time.time() + 5.0
+        assert ss.sun_safety_jog_in_progress() is True
+    finally:
+        ss.set_sun_monitor(prev)

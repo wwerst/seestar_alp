@@ -11,7 +11,8 @@ from falcon import (
 )
 from astroquery.simbad import Simbad
 from jinja2 import Environment, FileSystemLoader
-from wsgiref.simple_server import WSGIRequestHandler, make_server
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from pathlib import Path
 import urllib.parse
 import requests
@@ -4436,6 +4437,16 @@ class LiveTrackerTrackResource:
             load_session_mount_frame,
         )
 
+        # Feasibility pre-check failures (cable-wrap / elevation-band) are
+        # raised as device.live_tracker.PreCheckFailed. Import defensively so
+        # the route still works against an older device module that predates
+        # the symbol; falling back to ValueError keeps the 400 mapping intact
+        # because PreCheckFailed subclasses ValueError.
+        try:
+            from device.live_tracker import PreCheckFailed
+        except ImportError:
+            PreCheckFailed = ValueError
+
         try:
             body = req.media or {}
         except Exception:
@@ -4489,6 +4500,14 @@ class LiveTrackerTrackResource:
         )
         try:
             get_manager().start(session)
+        except PreCheckFailed as exc:
+            # Infeasible trajectory (cable-wrap / elevation hard stop) —
+            # surface the reason as a 400 so the UI can show it instead of a
+            # generic 500 from an uncaught ValueError.
+            resp.status = falcon.HTTP_400
+            resp.content_type = "application/json"
+            resp.text = json.dumps({"error": str(exc)})
+            return
         except RuntimeError as exc:
             resp.status = falcon.HTTP_409
             resp.content_type = "application/json"
@@ -7742,6 +7761,20 @@ class PlatformRpiResource:
                 ).start()
 
 
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    """Serve each request in its own thread.
+
+    The default ``wsgiref.simple_server.WSGIServer`` is single-threaded, so a
+    single long-lived response — e.g. the visibility SSE stream, which holds
+    its worker for up to 300s — blocks every other page load, HTMX poll and
+    status banner behind it. ThreadingMixIn spawns a worker thread per request
+    so those streams no longer freeze the UI. ``daemon_threads`` lets the
+    process exit even while an SSE client is still connected.
+    """
+
+    daemon_threads = True
+
+
 class LoggingWSGIRequestHandler(WSGIRequestHandler):
     """Subclass of  WSGIRequestHandler allowing us to control WSGI server's logging"""
 
@@ -8378,6 +8411,7 @@ class FrontMain:
                 Config.ip_address,
                 Config.uiport,
                 app,
+                server_class=ThreadingWSGIServer,
                 handler_class=LoggingWSGIRequestHandler,
             )
             logger.info(

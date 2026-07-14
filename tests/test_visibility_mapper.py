@@ -751,6 +751,89 @@ def test_persistence_skips_garbage(tmp_path):
     assert load_snapshot(p) is None
 
 
+def _healpix_grid(radec, *, min_alt_deg=10.0):
+    """Build a synthetic HEALPix-kind grid with explicit RA/Dec on each
+    cell (no astropy_healpix dependency). The horizon cut renumbers array
+    indices per session, so two sessions can carry the same RA/Dec points
+    in a different index order — exactly the case the key-based restore
+    must handle."""
+    from device.sky_grid import SkyCell, SkyGrid
+
+    cells = [
+        SkyCell(
+            idx=i,
+            az_deg=float((i * 40) % 360),
+            alt_deg=45.0,
+            ra_deg=float(ra),
+            dec_deg=float(dec),
+        )
+        for i, (ra, dec) in enumerate(radec)
+    ]
+    return SkyGrid(
+        cells=cells,
+        neighbors=[[] for _ in cells],
+        min_alt_deg=float(min_alt_deg),
+        kind="healpix",
+        nside=4,
+    )
+
+
+def _hp_mapper(tid, grid, tmp_path):
+    return VisibilityMapper(
+        telescope_id=tid,
+        grid=grid,
+        slew_func=lambda az, alt: True,
+        plate_solve_func=lambda t: SolveOutcome.SOLVED,
+        options=VisibilityMapperOptions(min_alt_deg=10.0),
+        state_dir=tmp_path,
+    )
+
+
+def test_healpix_resume_matches_by_radec_key(tmp_path):
+    """HEALPix resume must align cells by their stable RA/Dec key, not by
+    array index. The horizon cut renumbers indices between sessions, so an
+    index-based restore would paste a posterior onto the wrong sky."""
+    grid1 = _healpix_grid([(10.0, 20.0), (30.0, 40.0), (50.0, 60.0)])
+    m1 = _hp_mapper(5, grid1, tmp_path)
+    # Distinctive posterior on the (30, 40) cell, which is index 1 here.
+    m1._alpha[1] = 9.0
+    m1._beta[1] = 1.0
+    m1._persist()
+
+    # Session 2: same (30,40) and (50,60) points but re-ordered — (30,40)
+    # is now index 0 — plus one new point and one dropped.
+    grid2 = _healpix_grid([(30.0, 40.0), (50.0, 60.0), (70.0, 80.0)])
+    m2 = _hp_mapper(5, grid2, tmp_path)
+
+    # (30,40) is grid2 index 0 → must receive the (30,40) posterior by key.
+    assert m2._alpha[0] == pytest.approx(9.0)
+    assert m2._beta[0] == pytest.approx(1.0)
+    # An index-based restore would have put alpha=9 on index 1 (= (50,60)).
+    assert m2._alpha[1] != pytest.approx(9.0)
+    # (70,80) had no saved counterpart → stays at its prior.
+    assert m2._alpha[2] == pytest.approx(m2._prior_alpha[2])
+    assert m2._beta[2] == pytest.approx(m2._prior_beta[2])
+
+
+def test_healpix_resume_refused_when_grids_disjoint(tmp_path):
+    """When the saved and current HEALPix grids share too few cells
+    (different site/time dropped a different set of pixels), the resume is
+    refused and the mapper starts fresh from priors rather than mapping
+    posteriors onto unrelated sky."""
+    grid1 = _healpix_grid([(10.0, 20.0), (30.0, 40.0), (50.0, 60.0)])
+    m1 = _hp_mapper(6, grid1, tmp_path)
+    m1._alpha[0] = 9.0
+    m1._beta[0] = 1.0
+    m1._persist()
+
+    # No RA/Dec overlap with grid1 → 0 keys align → refuse, start fresh.
+    grid2 = _healpix_grid([(100.0, 10.0), (120.0, 15.0), (140.0, 20.0)])
+    m2 = _hp_mapper(6, grid2, tmp_path)
+    for i in range(len(grid2.cells)):
+        assert m2._alpha[i] == pytest.approx(m2._prior_alpha[i])
+        assert m2._beta[i] == pytest.approx(m2._prior_beta[i])
+
+
 def test_persistence_resume_picks_up_priors(tmp_path):
     grid = make_altaz_band_grid(min_alt_deg=20.0)
     # Save a fake snapshot for telescope 7 with one well-observed cell.

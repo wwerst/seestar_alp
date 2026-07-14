@@ -14,16 +14,24 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import rasterio
-from rasterio.transform import from_bounds
 
-from scripts.trajectory import terrain_los
-from scripts.trajectory.terrain_los import (
+# The geospatial stack is the optional "terrain" extra; skip cleanly when
+# it isn't installed. CI/dev install it via requirements.txt, so these
+# tests run there rather than skipping.
+pytest.importorskip("rasterio")
+pytest.importorskip("pyproj")
+
+import rasterio  # noqa: E402
+from rasterio.transform import from_bounds  # noqa: E402
+
+from scripts.trajectory import terrain_los  # noqa: E402
+from scripts.trajectory.terrain_los import (  # noqa: E402
     DEFAULT_K,
     LosResult,
     _bilinear_sample_dem,
     _effective_earth_radius,
     _great_circle_samples,
+    _require_terrain_deps,
     _tile_name_for,
     check_los,
     default_cache_dir,
@@ -685,3 +693,31 @@ def test_filter_visible_check_terrain_k_is_plumbed(tmp_path):
     # Clear target stays visible under both.
     assert len(hits_k0) == 1
     assert len(hits_k13) == 1
+
+
+# ---------- optional-extra import guard --------------------------------
+
+
+def test_require_terrain_deps_noop_when_installed():
+    """With the terrain extra installed (CI/dev), the guard is a no-op
+    and the module-level dep handles are bound."""
+    assert terrain_los._TERRAIN_IMPORT_ERROR is None
+    assert _require_terrain_deps() is None
+    assert terrain_los.rasterio is not None
+    assert terrain_los.Geod is not None
+
+
+def test_require_terrain_deps_raises_install_hint_when_missing(monkeypatch):
+    """When the extra is absent, use-time entry points raise a clear
+    ImportError pointing at ``pip install seestar_alp[terrain]`` rather
+    than an opaque NameError on a None handle."""
+    monkeypatch.setattr(
+        terrain_los, "_TERRAIN_IMPORT_ERROR", ImportError("no rasterio")
+    )
+    with pytest.raises(ImportError, match=r"seestar_alp\[terrain\]"):
+        _require_terrain_deps()
+    # Surfaces through the public entry points before any DEM access.
+    with pytest.raises(ImportError, match=r"seestar_alp\[terrain\]"):
+        check_los(_OBS, 33.90, -118.42, 100.0, dem_provider=lambda *a: None)
+    with pytest.raises(ImportError, match=r"seestar_alp\[terrain\]"):
+        dem_lookup_elevation(33.90, -118.42, dem_provider=lambda *a: None)

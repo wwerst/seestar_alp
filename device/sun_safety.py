@@ -29,6 +29,8 @@ from typing import Callable, Optional
 
 import ephem
 
+from device.geometry import angular_separation_deg, wrap_pm180
+
 
 logger = logging.getLogger(__name__)
 
@@ -78,24 +80,31 @@ def _site_from_config_or(lat_deg: Optional[float], lon_deg: Optional[float]) -> 
     return _Site(float(Config.init_lat), float(Config.init_long))
 
 
+# Both lat and lon within this many degrees of 0 is the "location not set"
+# sentinel: Config.init_lat/init_long default to 0/0, and no real observer
+# sits within ~0.1 m of Null Island. When the site is unset we cannot trust
+# the computed sun position, so the guard must fail CLOSED rather than open
+# (see `is_sun_safe` and `SunSafetyMonitor._tick`).
+_UNSET_LOCATION_EPS_DEG = 1e-6
+
+
+def _location_is_unset(lat_deg: float, lon_deg: float) -> bool:
+    return (
+        abs(lat_deg) < _UNSET_LOCATION_EPS_DEG
+        and abs(lon_deg) < _UNSET_LOCATION_EPS_DEG
+    )
+
+
 def angular_separation(
     a_az_deg: float, a_el_deg: float, b_az_deg: float, b_el_deg: float
 ) -> float:
     """Great-circle angular separation between two (az, el) directions.
 
-    Returns degrees in [0, 180]. Pure function — no observer, no time.
-    Az is treated as longitude, el as latitude on the celestial sphere.
+    Returns degrees in [0, 180]. Public name kept for existing callers;
+    delegates to :func:`device.geometry.angular_separation_deg`, the single
+    source of truth for this math.
     """
-    a_az = math.radians(a_az_deg)
-    a_el = math.radians(a_el_deg)
-    b_az = math.radians(b_az_deg)
-    b_el = math.radians(b_el_deg)
-    # Spherical law of cosines, clamped for numerical safety.
-    cos_sep = math.sin(a_el) * math.sin(b_el) + math.cos(a_el) * math.cos(
-        b_el
-    ) * math.cos(a_az - b_az)
-    cos_sep = max(-1.0, min(1.0, cos_sep))
-    return math.degrees(math.acos(cos_sep))
+    return angular_separation_deg(a_az_deg, a_el_deg, b_az_deg, b_el_deg)
 
 
 def compute_sun_altaz(
@@ -144,10 +153,23 @@ def is_sun_safe(
 
     The ``reason`` string is empty when safe and includes the numbers
     (separation, cone, sun alt) when unsafe so callers can log it.
+
+    Fails CLOSED when the observer site is the unset 0,0 sentinel: the sun
+    position cannot be trusted there (the real sun may be well up while the
+    Null-Island computation puts it below the threshold), so we refuse the
+    motion and tell the operator to set their location rather than silently
+    allowing a sun-pointing slew.
     """
+    site = _site_from_config_or(lat_deg, lon_deg)
+    if _location_is_unset(site.lat_deg, site.lon_deg):
+        return False, (
+            "sun_avoidance: observer location is not set (lat/long = 0,0); "
+            "set your site location before slewing so the sun position can "
+            "be computed"
+        )
     sun_az, sun_alt = compute_sun_altaz(
-        lat_deg=lat_deg,
-        lon_deg=lon_deg,
+        lat_deg=site.lat_deg,
+        lon_deg=site.lon_deg,
         when=when,
     )
     if sun_alt < alt_threshold_deg:
@@ -174,11 +196,6 @@ class SunSafetyLocked(RuntimeError):
 # Duplicated here so the monitor module has no import-time dependency on
 # the velocity controller (which pulls in astropy and other heavy deps).
 _SPEED_PER_DEG_PER_SEC = 237.0
-
-
-def _wrap_pm180(x: float) -> float:
-    """Wrap x (degrees) to the range (-180, 180]."""
-    return ((x + 180.0) % 360.0) - 180.0
 
 
 def compute_jog_angle(
@@ -215,7 +232,7 @@ def compute_jog_angle(
 
     Returns an integer angle in [0, 360).
     """
-    daz_diff = _wrap_pm180(sun_az_deg - mount_az_deg)
+    daz_diff = wrap_pm180(sun_az_deg - mount_az_deg)
     del_diff = sun_alt_deg - mount_el_deg
     norm = math.hypot(daz_diff, del_diff)
 
@@ -288,9 +305,11 @@ class SunSafetyMonitor:
 
     On a violation it:
       1. Sets the emergency lockout event (blocks the wrapped speed_move).
-      2. Calls `abort_active()` to stop in-flight tracking/calibration.
-      3. Runs one jog at `jog_speed` / `jog_duration_s` in the direction
-         picked by `compute_jog_angle`.
+      2. Runs one jog at `jog_speed` / `jog_duration_s` in the direction
+         picked by `compute_jog_angle` — issued FIRST so the mount leaves
+         the cone immediately, before any slow teardown.
+      3. Calls `abort_active()` to stop in-flight tracking/calibration
+         (which may join worker threads and take several seconds).
       4. Sleeps for jog_duration_s + margin, then clears the lockout
          so the user can drive the mount again.
       5. Leaves `last_trip` populated until the UI POSTs dismiss.
@@ -332,6 +351,15 @@ class SunSafetyMonitor:
         self._last_trip: Optional[SafetyTrip] = None
         self._trip_dismissed: bool = False
         self._lock = threading.Lock()
+        # End of the currently-executing emergency jog window (0 = none).
+        # Guarded by _lock; see is_jog_in_progress().
+        self._jog_until_ts: float = 0.0
+        # Bounded re-jog attempts when a session teardown's direct motor
+        # stop truncates the jog; the periodic tick is the final backstop.
+        self._max_jog_attempts: int = 3
+        # Timestamp of the last "location not set" hard warning; rate-limits
+        # the log so a blind monitor doesn't flood at the active cadence.
+        self._last_unset_warn_ts: float = 0.0
 
     # ---------- lifecycle ----------
 
@@ -428,12 +456,31 @@ class SunSafetyMonitor:
                 wait = self._tick_active
             self._stop_evt.wait(timeout=wait)
 
+    def _warn_location_unset(self) -> None:
+        """Log a rate-limited hard warning that the guard is blind."""
+        now = time.time()
+        if now - self._last_unset_warn_ts < 300.0:
+            return
+        self._last_unset_warn_ts = now
+        logger.error(
+            "SUN SAFETY BLIND: observer location is not set (lat/long = 0,0). "
+            "The sun-avoidance monitor cannot compute the sun position and is "
+            "NOT protecting the mount — set your site location in config."
+        )
+
     def _tick(self) -> None:
         if not self._enabled or self._emergency_lockout.is_set():
             return
+        site = _site_from_config_or(self._lat_deg, self._lon_deg)
+        if _location_is_unset(site.lat_deg, site.lon_deg):
+            # Fail closed: without a site we cannot trust the sun position.
+            # We can't compute a jog direction either, so log hard and skip;
+            # the is_sun_safe pre-flights refuse motion in the meantime.
+            self._warn_location_unset()
+            return
         sun_az, sun_alt = compute_sun_altaz(
-            lat_deg=self._lat_deg,
-            lon_deg=self._lon_deg,
+            lat_deg=site.lat_deg,
+            lon_deg=site.lon_deg,
         )
         if sun_alt < self._alt_threshold_deg:
             return
@@ -499,28 +546,154 @@ class SunSafetyMonitor:
         # 1. Lock out lockout-aware speed_move calls from tracker/calibration.
         self._emergency_lockout.set()
         try:
-            # 2. Ask any active session to stop. Runs whatever caller provided.
-            if self._abort_active is not None:
+            attempts = 0
+            while True:
+                attempts += 1
+                # 2. Issue the jog FIRST (raw path — bypasses the wrapper) so
+                #    the mount leaves the cone immediately. Doing this before
+                #    abort_active() matters: abort joins worker threads
+                #    (seconds each), and we must not leave the optics pointed
+                #    at the sun for that whole window. Publish the jog window
+                #    so session-exit direct stops know not to cancel it.
+                with self._lock:
+                    self._jog_until_ts = time.time() + self._jog_duration_s + 0.5
                 try:
-                    self._abort_active()
+                    self._jog_command(
+                        self._jog_speed,
+                        jog_angle,
+                        self._jog_duration_s,
+                    )
                 except Exception:
-                    logger.exception("abort_active callback failed")
-            # 3. Issue the jog (raw path — bypasses the wrapper).
-            try:
-                self._jog_command(
-                    self._jog_speed,
-                    jog_angle,
-                    self._jog_duration_s,
+                    logger.exception("jog_command raised — NOT retrying")
+                # 3. Stop any active session (first pass only). Its teardown
+                #    stop commands run on the raw channel and may land AFTER
+                #    our jog command, truncating it — that's why we re-sense
+                #    and re-jog below once the sessions are gone.
+                if attempts == 1 and self._abort_active is not None:
+                    try:
+                        self._abort_active()
+                    except Exception:
+                        logger.exception("abort_active callback failed")
+                # 4. Wait for the jog to complete, plus a small margin so any
+                #    caller that races back in can see us already done.
+                time.sleep(self._jog_duration_s + 0.5)
+                # 5. Verify we actually left the cone: a session teardown's
+                #    direct motor-stop can have cancelled the in-flight jog.
+                #    With sessions now aborted, a re-jog runs uncontested.
+                if attempts >= self._max_jog_attempts:
+                    logger.error(
+                        "SUN SAFETY: still inside the cone after %d jog "
+                        "attempt(s) — releasing lockout; monitor will re-trip "
+                        "next tick",
+                        attempts,
+                    )
+                    break
+                sep_now, rejog_angle = self._resense_for_rejog()
+                if sep_now is None or sep_now >= self._min_separation_deg:
+                    break
+                logger.error(
+                    "SUN SAFETY: jog truncated (sep=%.1f° < cone=%.1f°) — "
+                    "re-jogging (attempt %d)",
+                    sep_now,
+                    self._min_separation_deg,
+                    attempts + 1,
                 )
-            except Exception:
-                logger.exception("jog_command raised — NOT retrying")
-            # 4. Wait for the jog to complete, plus a small margin so any
-            #    caller that races back in can see us already done.
-            time.sleep(self._jog_duration_s + 0.5)
+                if rejog_angle is not None:
+                    jog_angle = rejog_angle
         finally:
-            # 5. Release the lockout so the user can drive the mount.
+            with self._lock:
+                self._jog_until_ts = 0.0
+            # 6. Release the lockout so the user can drive the mount.
             self._emergency_lockout.clear()
         logger.info("SUN SAFETY jog complete — user has control")
+
+    def _resense_for_rejog(self) -> tuple[Optional[float], Optional[int]]:
+        """Re-read mount pointing + sun position after a jog.
+
+        Returns ``(separation_deg, next_jog_angle)``; ``(None, None)`` when
+        either reading fails — the caller treats that as "cannot verify" and
+        exits the jog loop (the periodic tick re-trips if we're still unsafe).
+        """
+        try:
+            altaz = self._altaz_reader()
+        except Exception:
+            logger.warning("altaz_reader failed during jog verify", exc_info=True)
+            return None, None
+        if altaz is None:
+            return None, None
+        site = _site_from_config_or(self._lat_deg, self._lon_deg)
+        try:
+            sun_az, sun_alt = compute_sun_altaz(
+                lat_deg=site.lat_deg,
+                lon_deg=site.lon_deg,
+            )
+        except Exception:
+            logger.warning("sun ephemeris failed during jog verify", exc_info=True)
+            return None, None
+        mount_az, mount_el = altaz
+        sep = angular_separation(mount_az, mount_el, sun_az, sun_alt)
+        angle = compute_jog_angle(
+            mount_az,
+            mount_el,
+            sun_az,
+            sun_alt,
+            jog_speed=self._jog_speed,
+            jog_duration_s=float(self._jog_duration_s),
+        )
+        return sep, angle
+
+    def is_jog_in_progress(self) -> bool:
+        """True while an emergency jog command is executing on the mount.
+
+        Session-exit direct motor-stops (which deliberately bypass the
+        lockout-aware wrapper) consult this so they don't cancel the
+        in-flight jog — the jog's own firmware dur_sec bounds it, so
+        skipping the stop cannot leave the motor running.
+        """
+        with self._lock:
+            return time.time() < self._jog_until_ts
+
+
+def make_scope_altaz_reader(method_sync: Callable[..., object]) -> AltazReader:
+    """Build an :data:`AltazReader` that senses the mount's sky (az, el) from
+    the raw motor **encoder** (``scope_get_horiz_coord``) rather than from
+    plate-solved RA/Dec.
+
+    The RA/Dec path reports ``ra==dec==0`` until the first plate-solve
+    alignment — i.e. during *daytime, pre-alignment* operation (landmark
+    calibration, manual jogging), which is exactly the window in which the
+    mount can be swept toward the sun. Reading the encoder keeps the monitor
+    sighted then instead of going blind.
+
+    Encoder (alt, az) is used directly as sky (az, el): exact after rotation
+    calibration and a conservative (wider-than-needed) cone otherwise — the
+    same approximation the pre-flight guards use. Returns ``None`` only when
+    the reading is genuinely missing / malformed / non-finite, so the monitor
+    skips that tick rather than acting on bad data.
+
+    ``method_sync`` is any callable with the ``method_sync(method[, params])``
+    shape (AlpacaClient / Seestar).
+    """
+
+    def _read() -> Optional[tuple[float, float]]:
+        try:
+            resp = method_sync("scope_get_horiz_coord")
+        except Exception:
+            logger.debug("scope_get_horiz_coord failed", exc_info=True)
+            return None
+        if not isinstance(resp, dict) or "result" not in resp:
+            return None
+        result = resp["result"]
+        try:
+            enc_alt = float(result[0])
+            enc_az = float(result[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None
+        if not (math.isfinite(enc_alt) and math.isfinite(enc_az)):
+            return None
+        return enc_az % 360.0, enc_alt
+
+    return _read
 
 
 _MONITOR: Optional[SunSafetyMonitor] = None
@@ -555,6 +728,17 @@ def sun_safety_is_locked_out() -> bool:
     return bool(m is not None and m.is_locked_out())
 
 
+def sun_safety_jog_in_progress() -> bool:
+    """True while the monitor's emergency jog is executing on the mount.
+
+    Session-exit direct motor-stops consult this before issuing their raw
+    ``scope_speed_move(speed=0)`` so they don't cancel the jog-away. Returns
+    False when no monitor is installed. Never raises.
+    """
+    m = get_sun_monitor()
+    return bool(m is not None and m.is_jog_in_progress())
+
+
 __all__ = [
     "DEFAULT_ALT_THRESHOLD_DEG",
     "DEFAULT_MIN_SEPARATION_DEG",
@@ -568,6 +752,8 @@ __all__ = [
     "compute_sun_altaz",
     "get_sun_monitor",
     "is_sun_safe",
+    "make_scope_altaz_reader",
     "set_sun_monitor",
     "sun_safety_is_locked_out",
+    "sun_safety_jog_in_progress",
 ]

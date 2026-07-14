@@ -60,6 +60,8 @@ from typing import Any, Callable
 
 import numpy as np
 
+from device.geometry import wrap_pm180
+
 
 @dataclass
 class AutoLevelSample:
@@ -122,11 +124,6 @@ class AutoLevelFit:
     """1σ uncertainty on `tilt_mount_az_deg` in degrees (from covariance, Jacobian-propagated)."""
     dropped_indices: list[int] = field(default_factory=list, repr=False)
     """Indices of input samples dropped as outliers (empty if no rejection pass ran)."""
-
-
-def _wrap_pm180(deg: float) -> float:
-    """Wrap an angle in degrees to [-180, 180): -180 inclusive, +180 exclusive."""
-    return ((deg + 180.0) % 360.0) - 180.0
 
 
 def _fit_axis(theta_rad: np.ndarray, values: np.ndarray) -> AxisFit:
@@ -330,7 +327,7 @@ def fit_auto_level(
 
     a, b, x0, y0 = (float(p) for p in params)
     amplitude = math.hypot(a, b)
-    phase = _wrap_pm180(math.degrees(math.atan2(b, a)))
+    phase = wrap_pm180(math.degrees(math.atan2(b, a)))
 
     sigma_A, sigma_phi_rad = _propagate_uncertainty_ab_to_Aphi(a, b, cov)
 
@@ -379,9 +376,7 @@ def apply_sign_flip(fit: AutoLevelFit, flip: bool) -> AutoLevelFit:
     (after compass-to-mount alignment); True rotates it by 180°.
     """
     uphill = (
-        fit.tilt_mount_az_deg
-        if not flip
-        else _wrap_pm180(fit.tilt_mount_az_deg + 180.0)
+        fit.tilt_mount_az_deg if not flip else wrap_pm180(fit.tilt_mount_az_deg + 180.0)
     )
     return replace(fit, uphill_world_az_deg=float(uphill))
 
@@ -426,7 +421,7 @@ def planned_azimuths(num_samples: int, start_deg: float = 0.0) -> list[float]:
     if num_samples < 1:
         raise ValueError("num_samples must be >= 1")
     step = 360.0 / num_samples
-    return [_wrap_pm180(start_deg + i * step) for i in range(num_samples)]
+    return [wrap_pm180(start_deg + i * step) for i in range(num_samples)]
 
 
 @dataclass

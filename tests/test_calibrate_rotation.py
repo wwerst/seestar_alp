@@ -92,14 +92,20 @@ def test_solver_recovers_known_rotation_yaw_only():
 
 
 def test_solver_recovers_small_tilt():
-    """Yaw + small pitch + small roll — realistic tripod tilt."""
+    """Yaw + small pitch + small roll — realistic tripod tilt.
+
+    Two well-separated landmarks *can* pin a full 3-DOF rotation, but
+    ``dof='auto'`` now fits yaw-only below three sightings (roll is
+    unobservable in the general two-sighting case). This test opts into
+    the full fit explicitly via ``dof='full'``.
+    """
     site = build_site(**DOCKWEILER)
     yaw_true, pitch_true, roll_true = -25.0, 0.8, -0.3
     sightings = [
         _synth_sighting(HYPERION_06_000301, site, yaw_true, pitch_true, roll_true),
         _synth_sighting(LA_BROADCAST_06_000177, site, yaw_true, pitch_true, roll_true),
     ]
-    sol = solve_rotation(sightings, site)
+    sol = solve_rotation(sightings, site, dof="full")
     # With only 2 sightings we can end up in a local min for the
     # under-constrained pitch/roll split, but the residuals must be
     # tiny and the composite rotation must match.
@@ -139,6 +145,55 @@ def test_solver_auto_mode_single_sighting_fits_yaw_only():
     assert sol.roll_deg == 0.0
     # Residual at the single point should be near zero.
     assert sol.residual_rms_deg < 0.01
+
+
+def test_solver_auto_two_sightings_fits_yaw_only():
+    """Regression for the spurious-roll bug: with only two sightings
+    ``dof='auto'`` must fit yaw only. Roll about the line of sight is
+    effectively unobservable from two directions, so the solver must not
+    invent a 3-DOF rotation — pitch/roll stay pinned at the seed (0)."""
+    site = build_site(**DOCKWEILER)
+    # Data synthesised WITH a real pitch + roll; a yaw-only fit therefore
+    # leaves pitch/roll at 0 rather than chasing the (under-determined)
+    # tilt split.
+    two = [
+        _synth_sighting(HYPERION_06_000301, site, -25.0, 0.8, -0.3),
+        _synth_sighting(LA_BROADCAST_06_000177, site, -25.0, 0.8, -0.3),
+    ]
+    sol = solve_rotation(two, site)  # dof='auto'
+    assert sol.pitch_deg == 0.0
+    assert sol.roll_deg == 0.0
+
+
+def test_solver_auto_three_sightings_fits_full_3dof():
+    """The ≥3 path (mirrors MIN_SIGHTINGS_FOR_APPLY): three well-separated
+    sightings let ``dof='auto'`` fit full 3-DOF and recover a known
+    yaw/pitch/roll to high precision."""
+    from device.calibration_targets import CalibrationTargetSpec
+    from device.rotation_calibration import _predict_mount_azel_from_topo
+
+    site = build_site(**DOCKWEILER)
+    yaw_t, pitch_t, roll_t = 7.0, 1.5, -0.9
+    dirs = [(40.0, 30.0), (160.0, 55.0), (280.0, 40.0)]
+    sightings = []
+    for az, el in dirs:
+        enc_az, enc_el = _predict_mount_azel_from_topo(yaw_t, pitch_t, roll_t, az, el)
+        sightings.append(
+            Sighting(
+                target=CalibrationTargetSpec.celestial("X", ra_hours=0.0, dec_deg=0.0),
+                encoder_az_deg=enc_az,
+                encoder_el_deg=enc_el,
+                true_az_deg=az,
+                true_el_deg=el,
+                slant_m=None,
+                t_unix=0.0,
+            )
+        )
+    sol = solve_rotation(sightings, site)  # dof='auto' → full 3-DOF at ≥3
+    assert sol.yaw_deg == pytest.approx(yaw_t, abs=0.01)
+    assert sol.pitch_deg == pytest.approx(pitch_t, abs=0.01)
+    assert sol.roll_deg == pytest.approx(roll_t, abs=0.01)
+    assert sol.residual_rms_deg < 1e-3
 
 
 def test_solver_dof_yaw_forces_yaw_only_even_with_two_sightings():

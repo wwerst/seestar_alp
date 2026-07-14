@@ -83,18 +83,30 @@ def _path_crosses_forbidden(
 ) -> bool:
     """Does traveling from p0 by signed-delta cross az_forbidden (interior)?
 
-    Crossing means the forbidden point is strictly between p0 and p0+delta
-    along the direction of travel. Endpoint-equal doesn't count as crossing
-    (the trajectory stops before the forbidden angle).
+    Crossing means the forbidden bearing is reached at some travel distance
+    strictly inside ``(0, |delta_signed|)``. Endpoint-equal doesn't count
+    (the trajectory stops before the forbidden angle), and the start point
+    doesn't count either.
+
+    Correct for multi-wrap paths (``|delta_signed| > 180``): rather than
+    wrapping the offset into a single ±180° window — which silently misses
+    forbidden bearings that sit in the far arc or on a second lap — we
+    accumulate signed arc coverage across the full ``|delta_signed|``. The
+    forbidden bearing (any representative mod 360) is hit at travel
+    distances ``d, d + 360, d + 720, …`` where ``d`` is the offset measured
+    in the direction of travel and reduced to ``[0, 360)``.
     """
-    # wrap_pm180 puts the answer in (-180, +180]. 0 means "same angle",
-    # positive means "CW from p0", negative means "CCW from p0".
-    d_to_fbd = wrap_pm180(az_forbidden - p0)
-    if delta_signed > 0:
-        return 0 < d_to_fbd < delta_signed
-    if delta_signed < 0:
-        return delta_signed < d_to_fbd < 0
-    return False
+    if delta_signed == 0:
+        return False
+    direction = 1.0 if delta_signed > 0 else -1.0
+    # Offset from start to the forbidden bearing, measured in the direction
+    # of travel and reduced to [0, 360).
+    d = ((az_forbidden - p0) * direction) % 360.0
+    abs_delta = abs(delta_signed)
+    # A d of 0 means the forbidden bearing coincides with the start; the
+    # first interior hit is then one full lap away (360), not at distance 0.
+    first_hit = d if d > 1e-9 else 360.0
+    return first_hit < abs_delta - 1e-9
 
 
 def _select_delta(
@@ -203,6 +215,98 @@ def _sample_phase(
     return t_end, p_end, v_end
 
 
+def _plan_trapezoid_phases(
+    v0: float,
+    delta: float,
+    v_max: float,
+    a_max: float,
+) -> list[tuple[float, float]]:
+    """Bang-bang accel schedule that starts at velocity ``v0``, achieves a
+    net signed displacement ``delta``, and ends at ``v = 0``, respecting
+    ``|v| <= v_max`` and ``|a| <= a_max``.
+
+    Returns a list of ``(accel, duration)`` phases (durations > 0). Works
+    in a single continuous coordinate — no wrapping — so cumulative targets
+    beyond ±180° and any pre-chosen (short/long) path are preserved by the
+    caller passing the already-resolved signed ``delta``.
+
+    Handles arbitrary ``v0``: over-speed (|v0| > v_max), same-direction
+    (accelerate/cruise/decel straight to the target), opposing-direction or
+    too-fast-to-stop-in-range (brake to rest, then a rest-to-rest move that
+    may reverse to land exactly on the target). In every case the terminal
+    velocity is zero on the target.
+    """
+    phases: list[tuple[float, float]] = []
+    v = v0
+    x = 0.0  # displacement accumulated so far
+
+    # Pre-phase: shed excess speed down to v_max, keeping v0's direction.
+    if abs(v) > v_max:
+        dur = (abs(v) - v_max) / a_max
+        a = -math.copysign(a_max, v)
+        x += v * dur + 0.5 * a * dur * dur
+        v = math.copysign(v_max, v)
+        phases.append((a, dur))
+
+    remaining = delta - x
+    # Signed displacement if we braked to rest starting from the current v.
+    d_stop = v * abs(v) / (2.0 * a_max)
+    same_dir = (v > 0 and remaining > 0) or (v < 0 and remaining < 0)
+
+    if v != 0.0 and same_dir and abs(d_stop) <= abs(remaining) + 1e-12:
+        # Enough room to keep going in v's direction: accel (maybe) to a
+        # peak, optional cruise, decel to 0, landing on the target.
+        dir_sign = 1.0 if remaining > 0 else -1.0
+        rem_abs = abs(remaining)
+        v_in = abs(v)
+        v_p = math.sqrt(max(0.0, (2.0 * a_max * rem_abs + v_in * v_in) / 2.0))
+        if v_p <= v_max:
+            t_accel = (v_p - v_in) / a_max
+            if t_accel > 1e-12:
+                phases.append((dir_sign * a_max, t_accel))
+            phases.append((-dir_sign * a_max, v_p / a_max))
+        else:
+            t_accel = (v_max - v_in) / a_max
+            t_decel = v_max / a_max
+            d_accel = (v_max * v_max - v_in * v_in) / (2.0 * a_max)
+            d_decel = (v_max * v_max) / (2.0 * a_max)
+            d_cruise = rem_abs - d_accel - d_decel
+            if t_accel > 1e-12:
+                phases.append((dir_sign * a_max, t_accel))
+            if d_cruise > 1e-12:
+                phases.append((0.0, d_cruise / v_max))
+            phases.append((-dir_sign * a_max, t_decel))
+        return phases
+
+    # Either at rest, moving the wrong way, or moving too fast to stop
+    # within range: brake to rest first, then a rest-to-rest move covers
+    # whatever displacement remains (reversing if the brake overshot).
+    if v != 0.0:
+        dur = abs(v) / a_max
+        a = -math.copysign(a_max, v)
+        x += v * dur + 0.5 * a * dur * dur
+        v = 0.0
+        phases.append((a, dur))
+
+    remaining = delta - x
+    if abs(remaining) > 1e-12:
+        dir_sign = 1.0 if remaining >= 0 else -1.0
+        rem_abs = abs(remaining)
+        v_p = math.sqrt(max(0.0, a_max * rem_abs))  # rest-to-rest peak
+        if v_p <= v_max:
+            phases.append((dir_sign * a_max, v_p / a_max))
+            phases.append((-dir_sign * a_max, v_p / a_max))
+        else:
+            t_ramp = v_max / a_max
+            d_ramp = v_max * v_max / (2.0 * a_max)
+            d_cruise = rem_abs - 2.0 * d_ramp
+            phases.append((dir_sign * a_max, t_ramp))
+            if d_cruise > 1e-12:
+                phases.append((0.0, d_cruise / v_max))
+            phases.append((-dir_sign * a_max, t_ramp))
+    return phases
+
+
 def trapezoidal_profile(
     p0: float,
     v0: float,
@@ -229,8 +333,10 @@ def trapezoidal_profile(
     (see `device.plant_limits.pick_cum_target`). `az_forbidden_deg` is
     ignored in this mode.
 
-    Non-zero `v0` is handled by first bringing the velocity to zero (or
-    to the cruise direction) before the normal trapezoid.
+    Non-zero `v0` is handled by `_plan_trapezoid_phases`: the profile
+    always terminates at `v = 0` exactly on the target, whether `v0` is in
+    the direction of travel, opposes it, or is too fast to stop within the
+    remaining distance (in which case it brakes, overshoots, and returns).
 
     `t_offset > 0` prepends a hold at (p0, v=0, a=0) for that many seconds
     before the motion starts — for firmware cold-start compensation.
@@ -251,97 +357,25 @@ def trapezoidal_profile(
         )
         return _apply_t_offset(base, t_offset, tick_dt)
 
-    # Direction of net motion.
-    dir_sign = 1.0 if delta_signed >= 0 else -1.0
-    abs_delta = abs(delta_signed)
-
     out: list[TrajectoryPoint] = [
         TrajectoryPoint(t=0.0, pos=p0, vel=v0, acc=0.0),
     ]
     t_cur, p_cur, v_cur = 0.0, p0, v0
 
-    # --- Phase 0: bring v0 toward the target direction at a_max. ---
-    # If v0 opposes dir_sign (or if we need to first decel a too-fast v0),
-    # spend time flipping/reducing it before the main trapezoid.
-    # For simplicity: always first bring v to zero if v0 is nonzero and
-    # opposes direction, or if |v0| > v_max.
-    if v0 != 0.0 and (v0 * dir_sign < 0 or abs(v0) > v_max):
-        # time to reach v=0 at -sign(v0)*a_max
-        dur0 = abs(v0) / a_max
-        a0 = -math.copysign(a_max, v0)
+    # Bang-bang phase schedule that starts at v0 and lands on the target at
+    # v=0. Planned in continuous coordinates from the resolved signed delta,
+    # so cumulative targets (|delta| > 180) and the chosen forbidden-avoiding
+    # path are never re-wrapped away.
+    for a_phase, dur_phase in _plan_trapezoid_phases(v0, delta_signed, v_max, a_max):
+        if dur_phase <= 1e-12:
+            continue
         t_cur, p_cur, v_cur = _sample_phase(
             out,
             t_cur,
             p_cur,
             v_cur,
-            a=a0,
-            dur=dur0,
-            tick_dt=tick_dt,
-            include_endpoint=True,
-        )
-        # Update abs_delta given we may have moved during phase 0
-        abs_delta = abs(wrap_pm180(p_target - p_cur))
-        dir_sign = 1.0 if wrap_pm180(p_target - p_cur) >= 0 else -1.0
-
-    # --- Decide triangular vs trapezoidal. ---
-    # From current state (v_cur in the direction dir_sign, possibly 0),
-    # accel to v_peak, cruise, decel to 0 at p_target.
-    # signed vel in trap reference: v_trap = v_cur * dir_sign (>= 0 now)
-    v_in = abs(v_cur)
-    # Triangular: peak v_p such that accel-from-v_in to v_p takes (v_p-v_in)/a
-    # and decel from v_p to 0 takes v_p/a. Distance = (v_p²-v_in²)/(2a) + v_p²/(2a).
-    # Set equal to abs_delta: (2v_p² - v_in²)/(2a) = abs_delta →
-    #   v_p = sqrt((2a * abs_delta + v_in²)/2)
-    v_p_tri = math.sqrt(max(0.0, (2 * a_max * abs_delta + v_in * v_in) / 2.0))
-    if v_p_tri <= v_max:
-        # Triangular profile
-        t_accel = (v_p_tri - v_in) / a_max
-        t_cruise = 0.0
-        t_decel = v_p_tri / a_max
-    else:
-        # Trapezoidal with cruise at v_max
-        t_accel = (v_max - v_in) / a_max
-        t_decel = v_max / a_max
-        d_accel = (v_max * v_max - v_in * v_in) / (2.0 * a_max)
-        d_decel = (v_max * v_max) / (2.0 * a_max)
-        d_cruise = abs_delta - d_accel - d_decel
-        t_cruise = d_cruise / v_max
-
-    # --- Phase 1: accelerate to v_cruise in dir_sign. ---
-    if t_accel > 1e-9:
-        t_cur, p_cur, v_cur = _sample_phase(
-            out,
-            t_cur,
-            p_cur,
-            v_cur,
-            a=dir_sign * a_max,
-            dur=t_accel,
-            tick_dt=tick_dt,
-            include_endpoint=True,
-        )
-
-    # --- Phase 2: cruise at v_cruise (a=0). ---
-    if t_cruise > 1e-9:
-        t_cur, p_cur, v_cur = _sample_phase(
-            out,
-            t_cur,
-            p_cur,
-            v_cur,
-            a=0.0,
-            dur=t_cruise,
-            tick_dt=tick_dt,
-            include_endpoint=True,
-        )
-
-    # --- Phase 3: decelerate to 0. ---
-    if t_decel > 1e-9:
-        t_cur, p_cur, v_cur = _sample_phase(
-            out,
-            t_cur,
-            p_cur,
-            v_cur,
-            a=-dir_sign * a_max,
-            dur=t_decel,
+            a=a_phase,
+            dur=dur_phase,
             tick_dt=tick_dt,
             include_endpoint=True,
         )
