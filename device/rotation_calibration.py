@@ -28,6 +28,7 @@ Exposed API:
 from __future__ import annotations
 
 import json
+import logging
 import math
 import queue
 import threading
@@ -49,6 +50,9 @@ from device.calibration_targets import (
 from device.target_frame import MountFrame
 from scripts.trajectory.faa_dof import Landmark
 from scripts.trajectory.observer import ObserverSite, haversine_m
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------- data model ----------------------------------------------
@@ -720,7 +724,7 @@ def solve_rotation_from_pairs(
     if dof not in ("auto", "yaw", "full"):
         raise ValueError(f"unknown dof mode: {dof!r}")
 
-    yaw_only = (dof == "yaw") or (dof == "auto" and len(pairs) == 1)
+    yaw_only = (dof == "yaw") or (dof == "auto" and len(pairs) < MIN_SIGHTINGS_FOR_3DOF)
 
     def _resid(yaw: float, pitch: float, roll: float) -> np.ndarray:
         out = np.empty(2 * len(pairs), dtype=np.float64)
@@ -1244,12 +1248,23 @@ class CalibrationSession:
         finally:
             # Best-effort stop of any lingering motion.
             if cli is not None and not self.dry_run:
-                try:
-                    cli.method_sync(
-                        "scope_speed_move", {"speed": 0, "angle": 0, "dur_sec": 0}
+                # Skip the raw stop while the sun-safety emergency jog is
+                # executing: it would cancel the jog-away and strand the
+                # mount inside the cone. The jog's firmware dur_sec bounds
+                # the motion, so skipping cannot leave the motor running.
+                from device.sun_safety import sun_safety_jog_in_progress
+
+                if sun_safety_jog_in_progress(self.telescope_id):
+                    logger.warning(
+                        "session-exit motor stop skipped: sun-safety jog in progress"
                     )
-                except Exception:
-                    pass
+                else:
+                    try:
+                        cli.method_sync(
+                            "scope_speed_move", {"speed": 0, "angle": 0, "dur_sec": 0}
+                        )
+                    except Exception:
+                        pass
 
     def _connect_mount(self):
         """Import lazily so unit tests that stub AlpacaClient via the
@@ -1822,20 +1837,26 @@ class CalibrationManager:
         # calls on the same scope cannot both pass their respective
         # cross-checks. Without this shared lock, each manager only
         # locks its own registry → TOCTOU between the two.
-        from device._scope_start_lock import get_scope_start_lock
+        from device._scope_start_lock import (
+            get_scope_start_lock,
+            raise_if_scope_busy,
+        )
 
         with get_scope_start_lock(int(tid)):
-            # Refuse if the live tracker is driving the same mount. The
-            # import is lazy so tests that stub either module don't pull
-            # the other unnecessarily.
-            try:
-                from device.live_tracker import get_manager as _get_tracker_mgr
-
-                tracker = _get_tracker_mgr().get(tid)
-                if tracker is not None and tracker.is_alive():
-                    raise RuntimeError(f"telescope {tid} is live-tracking; stop first")
-            except ImportError:
-                pass
+            # Refuse if any other mount-driving manager owns this scope
+            # (live tracker, visibility map, nighttime auto-run, or the
+            # interactive nighttime calibration session). ``check_*=False``
+            # skips our own registry (the duplicate-start check below) and
+            # the calibrate-motion session, which is the documented
+            # allowed-concurrency exception: when both are alive the
+            # calibration session delegates its motion to the motion
+            # session instead of issuing ``move_to_ff``.
+            raise_if_scope_busy(
+                int(tid),
+                "rotation calibration",
+                check_calibration=False,
+                check_calibrate_motion=False,
+            )
             with self._lock:
                 existing = self._sessions.get(tid)
                 if existing is not None and existing.is_alive():

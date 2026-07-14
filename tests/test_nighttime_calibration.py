@@ -344,6 +344,35 @@ def test_solve_rotation_from_pairs_yaw_only_one_sighting():
     assert sol.roll_deg == 0.0
 
 
+def test_solve_rotation_from_pairs_yaw_only_two_sightings():
+    """Regression for the spurious-3-DOF preview bug: with only two
+    sightings ``dof='auto'`` must fit yaw only (roll about the line of
+    sight is unobservable from two directions), matching
+    ``solve_rotation``'s ``MIN_SIGHTINGS_FOR_3DOF`` gate. Fitting full
+    3-DOF here reported a spuriously-excellent preview fit at 2 sightings."""
+    from device.rotation_calibration import (
+        MIN_SIGHTINGS_FOR_3DOF,
+        _predict_mount_azel_from_topo,
+    )
+
+    assert MIN_SIGHTINGS_FOR_3DOF == 3
+    # Synthesize two sightings under a rotation that has real pitch/roll;
+    # auto mode must NOT recover them (yaw-only), so they stay at 0.
+    truth_yaw, truth_pitch, truth_roll = 9.0, 1.5, -0.8
+    pairs = []
+    for true_az, true_el in [(80.0, 30.0), (260.0, 40.0)]:
+        enc_az, enc_el = _predict_mount_azel_from_topo(
+            truth_yaw, truth_pitch, truth_roll, true_az, true_el
+        )
+        pairs.append((enc_az, enc_el, true_az, true_el))
+    sol = solve_rotation_from_pairs(pairs)  # dof='auto'
+    assert sol.pitch_deg == 0.0
+    assert sol.roll_deg == 0.0
+    # The explicit dof='full' override still fits 3-DOF from two sightings.
+    sol_full = solve_rotation_from_pairs(pairs, dof="full")
+    assert not (sol_full.pitch_deg == 0.0 and sol_full.roll_deg == 0.0)
+
+
 # ---------- NighttimeCalibrationSession --------------------------------
 
 

@@ -524,7 +524,7 @@ class CalibrateMotionSession:
             if not self.dry_run:
                 from device.sun_safety import sun_safety_jog_in_progress
 
-                if sun_safety_jog_in_progress():
+                if sun_safety_jog_in_progress(self.telescope_id):
                     logger.warning(
                         "session-exit motor stop skipped: sun-safety jog in progress"
                     )
@@ -577,21 +577,26 @@ class CalibrateMotionManager:
         # CalibrateMotionManager starts on the same scope cannot all pass
         # their respective cross-checks. Mirrors the pattern in
         # ``device.live_tracker.LiveTrackManager.start``.
-        from device._scope_start_lock import get_scope_start_lock
+        from device._scope_start_lock import (
+            get_scope_start_lock,
+            raise_if_scope_busy,
+        )
 
         with get_scope_start_lock(tid):
-            # Cross-manager mutex against LiveTrackManager. Lazy import keeps
-            # this module from pulling in live_tracker at import time.
-            try:
-                from device.live_tracker import get_manager as _get_tracker_mgr
-
-                tracker = _get_tracker_mgr().get(tid)
-                if tracker is not None and tracker.is_alive():
-                    raise RuntimeError(
-                        f"telescope {tid} is live-tracking; stop the live tracker first"
-                    )
-            except ImportError:
-                pass
+            # Refuse if any other mount-driving manager owns this scope
+            # (live tracker, visibility map, or nighttime auto-run).
+            # ``check_*=False`` skips our own registry (the duplicate-start
+            # check below) plus the two documented allowed-concurrency
+            # partners: the rotation CalibrationSession and the interactive
+            # nighttime calibration session both delegate their motion to a
+            # calibrate-motion session when one is alive.
+            raise_if_scope_busy(
+                tid,
+                "calibrate-motion",
+                check_calibrate_motion=False,
+                check_calibration=False,
+                check_nighttime_interactive=False,
+            )
             with self._lock:
                 existing = self._sessions.get(tid)
                 if existing is not None and existing.is_alive():
