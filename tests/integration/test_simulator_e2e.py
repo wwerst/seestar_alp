@@ -87,6 +87,9 @@ def _build_front_test_app():
         "/{telescope_id:int}/schedule/state", front_app.ScheduleToggleResource()
     )
     app.add_route("/{telescope_id:int}/startup", front_app.StartupResource())
+    app.add_route(
+        "/{telescope_id:int}/live/video_kick", front_app.LiveVideoKickResource()
+    )
     app.add_route("/{telescope_id:int}/live_tracker", front_app.LiveTrackerResource())
     app.add_route(
         "/api/{telescope_id:int}/live_tracker/targets",
@@ -111,6 +114,14 @@ def _build_front_test_app():
     app.add_route(
         "/api/{telescope_id:int}/live_tracker/offsets/reset",
         front_app.LiveTrackerResetResource(),
+    )
+    app.add_route(
+        "/api/{telescope_id:int}/netstats",
+        front_app.LiveStatsResource(),
+    )
+    app.add_route(
+        "/api/{telescope_id:int}/stream_quality",
+        front_app.LiveStreamQualityResource(),
     )
     # ---- Calibration routes (mirror front/app.py FrontMain setup) ----
     app.add_route(
@@ -503,6 +514,8 @@ def test_06b_live_tracker_smoke(front_sim_bridge):
     page = client.simulate_get("/1/live_tracker")
     assert page.status_code == 200
     assert "Live Tracker" in page.text
+    # Self-healing reconnect on the live-camera <img id="lt-vid">.
+    assert "if (completeStreak >= 2) reconnectVideo();" in page.text
 
     # /targets returns JSON with live/cached keys.
     targets = client.simulate_get("/api/1/live_tracker/targets")
@@ -671,6 +684,87 @@ def test_06c_calibrate_rotation_smoke(front_sim_bridge):
 
     # Malformed body → 400.
     r = client.simulate_post("/api/1/calibration/start", json=[1, 2, 3])
+    assert r.status_code == 400
+
+    # The hidden video_kick driver is present so the page can prime the
+    # /vid MJPEG stream without visiting a pre-fork live page.
+    assert 'id="cal-video-kick"' in page.text
+    assert "/live/video_kick" in page.text
+    # Self-healing reconnect on the live-camera <img>.
+    assert "if (completeStreak >= 2) reconnectVideo();" in page.text
+
+
+def test_06f_live_video_kick_endpoint(front_sim_bridge):
+    """GET /{id}/live/video_kick primes the video stream and returns 204.
+
+    The simulator answers get_view_state with an empty View (idle), so the
+    guarded primer issues an iscope_start_view scenery kick and the endpoint
+    responds 204 No Content with an empty body (hx-swap="none" driver)."""
+    client = front_sim_bridge["client"]
+    r = client.simulate_get("/1/live/video_kick")
+    assert r.status_code == 204
+    assert r.text == ""
+    # Idempotent: a repeat call is still a clean 204.
+    r2 = client.simulate_get("/1/live/video_kick")
+    assert r2.status_code == 204
+
+
+def test_06g_netstats_endpoint_returns_sane_json(front_sim_bridge):
+    """GET /api/{id}/netstats returns 200 with a sane stats envelope.
+
+    No in-process imager/device is started in the e2e harness, so the
+    video/rpc sections are the graceful device-missing null (rather than a
+    500), and the endpoint still returns well-formed JSON with the expected
+    keys."""
+    client = front_sim_bridge["client"]
+    r = client.simulate_get("/api/1/netstats")
+    assert r.status_code == 200
+    assert r.headers.get("content-type", "").startswith("application/json")
+    body = json.loads(r.text)
+    assert body["telescope_id"] == 1
+    # Both sections are present as keys (null here since no device is started).
+    assert "video" in body
+    assert "rpc" in body
+
+
+def test_06h_stream_quality_endpoint_roundtrip(front_sim_bridge, monkeypatch):
+    """GET/POST /api/{id}/stream_quality round-trips the browser-hop knobs.
+
+    GET returns the configured defaults (no live imager in the harness); POST
+    clamps out-of-range values, echoes the settled values, and drives the
+    persist path (stubbed here so the test never writes config.toml). A
+    non-numeric value is rejected with 400."""
+    client = front_sim_bridge["client"]
+
+    persisted = {}
+    monkeypatch.setattr(
+        front_app, "_persist_stream_quality", lambda vals: persisted.update(vals)
+    )
+
+    # GET -> sane defaults with both knobs present.
+    r = client.simulate_get("/api/1/stream_quality")
+    assert r.status_code == 200
+    got = json.loads(r.text)
+    assert got["telescope_id"] == 1
+    assert "max_stream_fps" in got and "jpeg_quality" in got
+
+    # POST out-of-range -> clamped, echoed, and persisted.
+    r = client.simulate_post(
+        "/api/1/stream_quality",
+        json={"max_stream_fps": 999, "jpeg_quality": 999},
+    )
+    assert r.status_code == 200
+    applied = json.loads(r.text)
+    assert applied["telescope_id"] == 1
+    assert applied["max_stream_fps"] == 60.0  # SeestarImaging.MAX_STREAM_FPS_CAP
+    assert applied["jpeg_quality"] == 100  # SeestarImaging.JPEG_QUALITY_MAX
+    assert persisted == {"max_stream_fps": 60.0, "jpeg_quality": 100}
+
+    # Non-numeric value -> 400 (invalid input rejected, nothing applied).
+    r = client.simulate_post(
+        "/api/1/stream_quality",
+        json={"jpeg_quality": "not-a-number"},
+    )
     assert r.status_code == 400
 
 

@@ -1,6 +1,7 @@
 import json
 import re
 import threading
+from types import SimpleNamespace
 
 import pytest
 import front.app as front_app
@@ -1310,7 +1311,9 @@ def test_calibrate_rotation_step_buttons_use_one_tenth_increments():
 def test_calibrate_rotation_page_kicks_off_scenery_view_for_streaming(monkeypatch):
     """Visiting /{id}/calibrate_rotation must idempotently kick the
     firmware into scenery view mode so the MJPEG stream produces frames
-    before the user clicks 'Start calibration'.
+    before the user clicks 'Start calibration' — but only after a
+    get_view_state read confirms the mount isn't already in an active
+    (e.g. star-imaging) view.
 
     Without this, the live-camera <img id="cal-vid"> sits on a Loading
     frame until the calibration session itself starts (which is when
@@ -1318,11 +1321,16 @@ def test_calibrate_rotation_page_kicks_off_scenery_view_for_streaming(monkeypatc
     import time as _time
 
     calls = []
-    call_event = threading.Event()
+    kick_event = threading.Event()
 
     def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
         calls.append((action, dev_num, parameters))
-        call_event.set()
+        method = parameters.get("method") if isinstance(parameters, dict) else None
+        if action == "method_sync" and method == "get_view_state":
+            # Idle mount → no active view → the guard should kick scenery.
+            return {"Value": {"result": {}}}
+        if action == "method_async" and method == "iscope_start_view":
+            kick_event.set()
         return {"Value": "ok"}
 
     monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
@@ -1337,12 +1345,17 @@ def test_calibrate_rotation_page_kicks_off_scenery_view_for_streaming(monkeypatc
     front_app.CalibrateRotationResource.on_get(req, resp, telescope_id=1)
 
     # The kick is dispatched in a daemon thread; wait briefly for it.
-    assert call_event.wait(timeout=2.0), (
+    assert kick_event.wait(timeout=2.0), (
         f"scenery iscope_start_view kick never landed within 2s; calls={calls}"
     )
     # Allow a tick for any duplicate kicks that might land after the
     # first — we want to assert exactly one.
     _time.sleep(0.05)
+
+    # A get_view_state guard read must precede the kick.
+    assert any(
+        c[0] == "method_sync" and c[2].get("method") == "get_view_state" for c in calls
+    ), f"expected a get_view_state guard read, got: {calls}"
 
     # The scenery-view kick must have been issued exactly once.
     matching = [
@@ -1360,6 +1373,349 @@ def test_calibrate_rotation_page_kicks_off_scenery_view_for_streaming(monkeypatc
     # Page should still render the calibration UI.
     assert "Calibrate rotation" in resp.text
     assert 'id="cal-vid"' in resp.text
+
+
+def test_calibrate_rotation_page_skips_scenery_kick_when_star_working(monkeypatch):
+    """The scenery kick must be guarded: when get_view_state reports the
+    mount is already in an active view (state=="working" — e.g. a star-mode
+    imaging session), the page must NOT issue iscope_start_view scenery,
+    which would tear that session down."""
+    import time as _time
+
+    calls = []
+    guard_event = threading.Event()
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        method = parameters.get("method") if isinstance(parameters, dict) else None
+        if action == "method_sync" and method == "get_view_state":
+            guard_event.set()
+            return {"Value": {"result": {"View": {"state": "working"}}}}
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(
+        front_app,
+        "get_context",
+        lambda _tid, _req: _minimal_context("calibrate_rotation", online=True),
+    )
+    req = DummyHTMXReq(relative_uri="/1/calibrate_rotation")
+    resp = DummyResp()
+
+    front_app.CalibrateRotationResource.on_get(req, resp, telescope_id=1)
+
+    # Wait for the guard read to land in the daemon thread, then give any
+    # (erroneous) kick a chance to fire before asserting it did not.
+    assert guard_event.wait(timeout=2.0), (
+        f"guard get_view_state read never landed within 2s; calls={calls}"
+    )
+    _time.sleep(0.1)
+
+    scenery_kicks = [
+        c
+        for c in calls
+        if c[0] == "method_async" and c[2].get("method") == "iscope_start_view"
+    ]
+    assert scenery_kicks == [], (
+        f"scenery kick must be suppressed while mount is working; calls={calls}"
+    )
+    assert "Calibrate rotation" in resp.text
+
+
+# ---------- LiveTrackerResource scenery-video kick --------------------
+
+
+def test_live_tracker_page_kicks_off_scenery_view_for_streaming(monkeypatch):
+    """Visiting /{id}/live_tracker must (guarded + star-safe) kick the
+    firmware into scenery view so the <img id="lt-vid"> streams frames on
+    page load, matching the calibrate page."""
+    import time as _time
+
+    calls = []
+    kick_event = threading.Event()
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        method = parameters.get("method") if isinstance(parameters, dict) else None
+        if action == "method_sync" and method == "get_view_state":
+            return {"Value": {"result": {}}}
+        if action == "method_async" and method == "iscope_start_view":
+            kick_event.set()
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(
+        front_app,
+        "get_context",
+        lambda _tid, _req: _minimal_context("live_tracker", online=True),
+    )
+    req = DummyHTMXReq(relative_uri="/1/live_tracker")
+    resp = DummyResp()
+
+    front_app.LiveTrackerResource.on_get(req, resp, telescope_id=1)
+
+    assert kick_event.wait(timeout=2.0), (
+        f"scenery iscope_start_view kick never landed within 2s; calls={calls}"
+    )
+    _time.sleep(0.05)
+    matching = [
+        c
+        for c in calls
+        if c[0] == "method_async"
+        and c[2].get("method") == "iscope_start_view"
+        and c[2].get("params", {}).get("mode") == "scenery"
+    ]
+    assert len(matching) == 1, (
+        f"expected exactly one scenery iscope_start_view kick, got: {calls}"
+    )
+    assert "Live Tracker" in resp.text
+    assert 'id="lt-vid"' in resp.text
+
+
+def test_live_tracker_page_no_scenery_kick_when_offline(monkeypatch):
+    """The scenery kick is gated on the cached online state — an offline
+    device must not spawn the kick (and thus never blocks on the request
+    timeout)."""
+    import time as _time
+
+    calls = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(
+        front_app,
+        "get_context",
+        lambda _tid, _req: _minimal_context("live_tracker", online=False),
+    )
+    req = DummyHTMXReq(relative_uri="/1/live_tracker")
+    resp = DummyResp()
+
+    front_app.LiveTrackerResource.on_get(req, resp, telescope_id=1)
+    _time.sleep(0.1)
+    assert calls == [], f"offline page must not issue any device RPC; calls={calls}"
+    assert "Live Tracker" in resp.text
+
+
+# ---------- Live network stats (video throughput + RPC RTT) -----------
+
+
+def test_live_stats_resource_returns_video_and_rpc(monkeypatch):
+    class FakeImager:
+        def video_throughput(self):
+            return {
+                "window_s": 10.0,
+                "bytes_per_s": 1234.0,
+                "frames_per_s": 5.0,
+                "bytes_total": 100,
+                "frames_total": 2,
+            }
+
+    class FakeDev:
+        def rpc_rtt_stats(self):
+            return {
+                "count": 3,
+                "sample_count": 3,
+                "p50_ms": 21.0,
+                "p95_ms": 88.0,
+                "last_ms": 19.0,
+            }
+
+    fake_tel = SimpleNamespace(
+        get_seestar_imager=lambda _tid: FakeImager(),
+        get_seestar_device=lambda _tid: FakeDev(),
+    )
+    monkeypatch.setattr(front_app, "telescope", fake_tel)
+
+    resp = _DummyJSONResp()
+    front_app.LiveStatsResource.on_get(DummyReq(), resp, telescope_id=7)
+
+    assert resp.status == front_app.falcon.HTTP_200
+    assert resp.content_type == "application/json"
+    payload = json.loads(resp.text)
+    assert payload["telescope_id"] == 7
+    assert payload["video"]["bytes_per_s"] == 1234.0
+    assert payload["video"]["frames_per_s"] == 5.0
+    assert payload["rpc"]["p50_ms"] == 21.0
+    assert payload["rpc"]["p95_ms"] == 88.0
+
+
+def test_live_stats_resource_null_sections_when_device_missing(monkeypatch):
+    def boom(_tid):
+        raise KeyError(_tid)
+
+    fake_tel = SimpleNamespace(get_seestar_imager=boom, get_seestar_device=boom)
+    monkeypatch.setattr(front_app, "telescope", fake_tel)
+
+    resp = _DummyJSONResp()
+    front_app.LiveStatsResource.on_get(DummyReq(), resp, telescope_id=1)
+
+    # Missing/not-yet-started device must not 500 — stay 200 with null sections
+    # so the readout renders placeholders.
+    assert resp.status == front_app.falcon.HTTP_200
+    payload = json.loads(resp.text)
+    assert payload["telescope_id"] == 1
+    assert payload["video"] is None
+    assert payload["rpc"] is None
+
+
+def test_net_stats_partial_render_contract():
+    template = front_app.fetch_template("partials/net_stats.html")
+    html = template.render(telescope_id=4)
+    # Card + KPI readout slots present.
+    assert 'id="ns-card-4"' in html
+    for key in ("video_rate", "video_fps", "rpc_p50", "rpc_p95"):
+        assert f'data-ns="{key}"' in html
+    # Polls the per-telescope netstats endpoint at a bounded, slow cadence
+    # (no HTMX swap, so no destructive empty-swap risk).
+    assert "netstats" in html
+    assert "POLL_MS = 3000" in html
+    assert "setInterval(poll, POLL_MS)" in html
+
+
+def test_live_tracker_page_embeds_net_stats_readout():
+    template = front_app.fetch_template("live_tracker.html")
+    html = template.render(
+        telescope_id=1,
+        **_minimal_context("live_tracker", online=True),
+    )
+    # The compact network-stats readout (partials/net_stats.html) is embedded
+    # on the page and wired to the per-telescope netstats endpoint.
+    assert 'id="ns-card-1"' in html
+    assert 'data-ns="video_rate"' in html
+    assert 'data-ns="rpc_p95"' in html
+    assert "netstats" in html
+    assert "POLL_MS = 3000" in html
+
+
+# ---------- LiveVideoKickResource (guarded scenery primer) ------------
+
+
+def test_live_video_kick_starts_scenery_when_idle(monkeypatch):
+    """GET /{id}/live/video_kick refreshes view_state and, when the mount
+    is idle, issues the scenery kick, returning 204."""
+    calls = []
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        calls.append(("method_sync", method, telescope_id, kwargs))
+        if method == "get_view_state":
+            return {}  # idle → no View → not working
+        return None
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.LiveVideoKickResource().on_get(req, resp, telescope_id=1)
+
+    assert "204" in str(resp.status)
+    kicks = [
+        c
+        for c in calls
+        if c[0] == "method_async"
+        and c[2].get("method") == "iscope_start_view"
+        and c[2].get("params", {}).get("mode") == "scenery"
+    ]
+    assert len(kicks) == 1, f"expected one scenery kick; calls={calls}"
+
+
+def test_live_video_kick_skips_scenery_when_working(monkeypatch):
+    """When the mount already reports state=="working", the endpoint must
+    refresh view_state but issue no scenery kick (star-safe / idempotent)."""
+    calls = []
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        calls.append(("method_sync", method, telescope_id, kwargs))
+        if method == "get_view_state":
+            return {"View": {"state": "working", "stage": "RTSP", "mode": "star"}}
+        return None
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.LiveVideoKickResource().on_get(req, resp, telescope_id=1)
+
+    assert "204" in str(resp.status)
+    # get_view_state was read (refresh), but no scenery start was issued.
+    assert any(c[0] == "method_sync" and c[1] == "get_view_state" for c in calls)
+    assert not any(c[0] == "method_async" for c in calls), (
+        f"working mount must not be re-kicked; calls={calls}"
+    )
+
+
+def test_live_video_kick_offline_is_noop_204(monkeypatch):
+    """Offline device: the endpoint returns 204 without touching the mount
+    (no get_view_state, no scenery kick)."""
+    calls = []
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        calls.append(("method_sync", method))
+        return {}
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: False)
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.LiveVideoKickResource().on_get(req, resp, telescope_id=1)
+
+    assert "204" in str(resp.status)
+    assert calls == [], f"offline kick must be a no-op; calls={calls}"
+
+
+def test_ensure_scenery_video_guard_matrix(monkeypatch):
+    """Unit contract for the shared guarded primer: kick only when the
+    fresh get_view_state read shows the mount is not already 'working'."""
+    seen = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        seen.append((action, parameters))
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    # Idle → kick.
+    monkeypatch.setattr(front_app, "method_sync", lambda *a, **k: {})
+    seen.clear()
+    assert front_app._ensure_scenery_video(1) is True
+    assert any(
+        a == "method_async" and p.get("params", {}).get("mode") == "scenery"
+        for a, p in seen
+    )
+
+    # Working → no kick.
+    monkeypatch.setattr(
+        front_app, "method_sync", lambda *a, **k: {"View": {"state": "working"}}
+    )
+    seen.clear()
+    assert front_app._ensure_scenery_video(1) is False
+    assert seen == []
+
+    # "Offline" string / None from method_sync → treated as not working
+    # (the kick attempt is itself a no-op when the device is unreachable).
+    monkeypatch.setattr(front_app, "method_sync", lambda *a, **k: "Offline")
+    seen.clear()
+    assert front_app._ensure_scenery_video(1) is True
 
 
 def test_calibrate_rotation_page_renders_when_streaming_kick_fails(monkeypatch):
@@ -2133,3 +2489,412 @@ def test_live_tracker_status_poll_skips_busy_sliders():
     # Debounced-post flag is cleared when the timer fires so the poll can
     # resume once the user stops editing.
     assert "pendingPost = null;" in html
+
+
+# ---------- fork video pages: MJPEG stream reconnect ------------------
+
+
+def test_live_tracker_reconnects_dead_video_stream():
+    """The live-tracker <img id="lt-vid"> must self-heal: after /vid closes
+    (idle mount → Loading/Idle then generator returns), it re-opens the
+    stream with a cache-busted src, throttled, watching img.complete so a
+    healthy (still-loading) stream is never interrupted."""
+    html = front_app.fetch_template("live_tracker.html").render(
+        telescope_id=1,
+        **_minimal_context("live_tracker", online=True),
+    )
+    # Reconnect targets the live-view img and cache-busts so the browser
+    # opens a NEW request instead of reusing the closed one.
+    assert "document.getElementById('lt-vid')" in html
+    assert "vid.src = base + '?t=' + now;" in html
+    # Hard errors reconnect.
+    assert "vid.addEventListener('error', reconnectVideo);" in html
+    # Clean-close watchdog: img.complete is true only when the stream isn't
+    # actively loading, so a healthy stream is left alone.
+    assert "if (completeStreak >= 2) reconnectVideo();" in html
+    # Throttled so the imaging server's worker pool isn't churned.
+    assert "const RECONNECT_MS = 3000;" in html
+    assert "if (now - lastReconnect < RECONNECT_MS) return;" in html
+
+
+def test_calibrate_rotation_reconnects_dead_video_stream():
+    """Same self-healing contract for the calibrate page's <img id="cal-vid">."""
+    html = front_app.fetch_template("calibrate_rotation.html").render(
+        telescope_id=1,
+        **_minimal_context("calibrate_rotation", online=True),
+    )
+    assert "const vid = els.vid;" in html
+    assert "vid.src = base + '?t=' + now;" in html
+    assert "vid.addEventListener('error', reconnectVideo);" in html
+    assert "if (completeStreak >= 2) reconnectVideo();" in html
+    assert "const RECONNECT_MS = 3000;" in html
+
+
+def test_calibrate_rotation_polls_video_kick_to_refresh_view_state():
+    """The calibrate page has no other get_view_state driver, so it must
+    poll /live/video_kick to refresh dev.view_state (and idempotently keep
+    scenery alive) — with hx-swap="none" so there's no destructive empty
+    swap, and a modest cadence (no 0.5s-style hammering on the shared
+    wifi uplink)."""
+    html = front_app.fetch_template("calibrate_rotation.html").render(
+        telescope_id=1,
+        **_minimal_context("calibrate_rotation", online=True),
+    )
+    driver = re.search(r'<div id="cal-video-kick"[^>]*>', html)
+    assert driver is not None, "hidden video_kick driver div missing"
+    tag = driver.group(0)
+    assert 'hx-get="/1/live/video_kick"' in tag
+    assert 'hx-swap="none"' in tag
+    assert 'hx-trigger="every 2s"' in tag
+    # Must not adopt the 0.5s /live/status cadence on the calibration page.
+    assert 'hx-trigger="every 0.5s"' not in html
+
+
+# ---------- Stream-quality knobs (browser-hop only) -------------------
+#
+# Two verified-controllable knobs shape the MJPEG stream the imaging server
+# sends to the browser: max serve FPS and JPEG encode quality. They are
+# BROWSER-HOP only (they do not change what the telescope pushes over its
+# wifi uplink), so both the UI labels and the config docs must say so. These
+# tests cover the SeestarImaging clamp/serve helpers, the front endpoint, and
+# the live_tracker render contract.
+
+
+def test_clamp_max_stream_fps_bounds():
+    from device.seestar_imaging import SeestarImaging as SI
+
+    assert SI._clamp_max_stream_fps(0) == 0.0
+    assert SI._clamp_max_stream_fps(-4) == 0.0  # non-positive -> uncapped
+    assert SI._clamp_max_stream_fps(10) == 10.0
+    assert SI._clamp_max_stream_fps(999) == SI.MAX_STREAM_FPS_CAP  # clamped down
+    assert SI._clamp_max_stream_fps(float("inf")) == SI.MAX_STREAM_FPS_CAP
+    assert SI._clamp_max_stream_fps(float("nan")) == 0.0  # NaN -> uncapped
+    # Non-numeric input raises so the endpoint can reject it with a 400.
+    with pytest.raises((TypeError, ValueError)):
+        SI._clamp_max_stream_fps("abc")
+
+
+def test_clamp_jpeg_quality_bounds():
+    from device.seestar_imaging import SeestarImaging as SI
+
+    assert SI._clamp_jpeg_quality(95) == 95
+    assert SI._clamp_jpeg_quality(5000) == SI.JPEG_QUALITY_MAX
+    assert SI._clamp_jpeg_quality(1) == SI.JPEG_QUALITY_MIN  # clamped up
+    assert SI._clamp_jpeg_quality(72.6) == 73  # rounded
+    with pytest.raises((TypeError, ValueError)):
+        SI._clamp_jpeg_quality("nope")
+
+
+def test_default_stream_quality_falls_back_to_uncapped_q95(monkeypatch):
+    from device.config import Config
+    from device.seestar_imaging import SeestarImaging
+
+    # get_toml returns the passed-in default => no [stream_quality] section.
+    monkeypatch.setattr(Config, "get_toml", lambda s, i, d: d)
+    assert SeestarImaging.default_stream_quality() == {
+        "max_stream_fps": 0.0,
+        "jpeg_quality": 95,
+    }
+
+
+def test_default_stream_quality_reads_and_clamps_config(monkeypatch):
+    from device.config import Config
+    from device.seestar_imaging import SeestarImaging
+
+    vals = {
+        ("stream_quality", "max_stream_fps"): 12,
+        ("stream_quality", "jpeg_quality"): 300,  # out of range -> clamped
+    }
+    monkeypatch.setattr(Config, "get_toml", lambda s, i, d: vals.get((s, i), d))
+    out = SeestarImaging.default_stream_quality()
+    assert out["max_stream_fps"] == 12.0
+    assert out["jpeg_quality"] == 100
+
+
+def test_default_stream_quality_tolerates_garbage_config(monkeypatch):
+    from device.config import Config
+    from device.seestar_imaging import SeestarImaging
+
+    # A bad config value must never block imager start-up.
+    monkeypatch.setattr(Config, "get_toml", lambda s, i, d: "not-a-number")
+    assert SeestarImaging.default_stream_quality() == {
+        "max_stream_fps": 0.0,
+        "jpeg_quality": 95,
+    }
+
+
+def _bare_imager():
+    """A SeestarImaging with no socket/thread — bypasses __init__ so the
+    pure knob helpers can be exercised without a live device."""
+    from device.seestar_imaging import SeestarImaging
+
+    obj = SeestarImaging.__new__(SeestarImaging)
+    obj.max_stream_fps = 0.0
+    obj.jpeg_quality = 95
+    return obj
+
+
+def test_set_stream_quality_partial_update_and_clamp():
+    obj = _bare_imager()
+    # Update only fps; jpeg left untouched.
+    assert obj.set_stream_quality(max_stream_fps=15) == {
+        "max_stream_fps": 15.0,
+        "jpeg_quality": 95,
+    }
+    # Update only jpeg (clamped); fps retained.
+    assert obj.set_stream_quality(jpeg_quality=5000) == {
+        "max_stream_fps": 15.0,
+        "jpeg_quality": 100,
+    }
+    assert obj.stream_quality() == {"max_stream_fps": 15.0, "jpeg_quality": 100}
+
+
+def test_serve_delay_honors_fps_cap():
+    obj = _bare_imager()
+    # Uncapped -> base delay unchanged (historical behavior).
+    obj.max_stream_fps = 0.0
+    assert obj._serve_delay(0.001) == 0.001
+    assert obj._serve_delay(0.1) == 0.1
+    # 10 fps -> 0.1 s floor raises the fast streaming cadence.
+    obj.max_stream_fps = 10.0
+    assert obj._serve_delay(0.001) == pytest.approx(0.1)
+    # 2 fps -> 0.5 s floor exceeds even the preview base.
+    obj.max_stream_fps = 2.0
+    assert obj._serve_delay(0.1) == pytest.approx(0.5)
+    # A cap looser than the base delay never speeds the stream up.
+    obj.max_stream_fps = 100.0  # 1/100 = 0.01 < 0.1 preview base
+    assert obj._serve_delay(0.1) == 0.1
+
+
+def test_build_frame_bytes_applies_jpeg_quality():
+    """Lowering jpeg_quality must actually shrink the served frame — proves
+    the encode quality param is wired into the hot path, not just stored."""
+    import numpy as np
+
+    obj = _bare_imager()
+    obj.BOUNDARY = b"\r\n--frame\r\n"
+    obj.raw_img_size = [None, None]
+    # Noise so JPEG quality has a real effect on encoded size.
+    rng = np.random.default_rng(0)
+    img = rng.integers(0, 256, size=(200, 200, 3), dtype=np.uint8)
+    obj.jpeg_quality = 100
+    big = obj.build_frame_bytes(img, 200, 200)
+    obj.jpeg_quality = 10
+    small = obj.build_frame_bytes(img, 200, 200)
+    assert len(small) < len(big)
+
+
+def _boom_imager(_tid):
+    raise KeyError(_tid)
+
+
+def test_stream_quality_get_returns_imager_values(monkeypatch):
+    class FakeImager:
+        def stream_quality(self):
+            return {"max_stream_fps": 12.0, "jpeg_quality": 70}
+
+    monkeypatch.setattr(
+        front_app,
+        "telescope",
+        SimpleNamespace(get_seestar_imager=lambda _tid: FakeImager()),
+    )
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_get(DummyReq(), resp, telescope_id=3)
+
+    assert resp.status == front_app.falcon.HTTP_200
+    assert resp.content_type == "application/json"
+    payload = json.loads(resp.text)
+    assert payload["telescope_id"] == 3
+    assert payload["max_stream_fps"] == 12.0
+    assert payload["jpeg_quality"] == 70
+
+
+def test_stream_quality_get_falls_back_to_config_defaults(monkeypatch):
+    from device.config import Config
+
+    monkeypatch.setattr(
+        front_app, "telescope", SimpleNamespace(get_seestar_imager=_boom_imager)
+    )
+    monkeypatch.setattr(Config, "get_toml", lambda s, i, d: d)
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_get(DummyReq(), resp, telescope_id=1)
+
+    payload = json.loads(resp.text)
+    assert payload["max_stream_fps"] == 0.0
+    assert payload["jpeg_quality"] == 95
+
+
+def test_stream_quality_post_applies_and_persists(monkeypatch):
+    applied = {}
+
+    class FakeImager:
+        def __init__(self):
+            self.v = {"max_stream_fps": 0.0, "jpeg_quality": 95}
+
+        def stream_quality(self):
+            return dict(self.v)
+
+        def set_stream_quality(self, max_stream_fps=None, jpeg_quality=None):
+            if max_stream_fps is not None:
+                self.v["max_stream_fps"] = float(max_stream_fps)
+            if jpeg_quality is not None:
+                self.v["jpeg_quality"] = int(jpeg_quality)
+            applied.update(self.v)
+            return dict(self.v)
+
+    imager = FakeImager()
+    monkeypatch.setattr(
+        front_app,
+        "telescope",
+        SimpleNamespace(get_seestar_imager=lambda _tid: imager),
+    )
+    persisted = {}
+    monkeypatch.setattr(
+        front_app, "_persist_stream_quality", lambda vals: persisted.update(vals)
+    )
+
+    req = _DummyJSONReq(body={"max_stream_fps": 8, "jpeg_quality": 60})
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_post(req, resp, telescope_id=1)
+
+    assert resp.status == front_app.falcon.HTTP_200
+    payload = json.loads(resp.text)
+    assert payload["max_stream_fps"] == 8.0
+    assert payload["jpeg_quality"] == 60
+    # Applied live to the running imager (immediate effect on the serve loop).
+    assert applied == {"max_stream_fps": 8.0, "jpeg_quality": 60}
+    # Persisted for restart survival.
+    assert persisted == {"max_stream_fps": 8.0, "jpeg_quality": 60}
+
+
+def test_stream_quality_post_clamps_out_of_range(monkeypatch):
+    from device.config import Config
+    from device.seestar_imaging import SeestarImaging as SI
+
+    monkeypatch.setattr(
+        front_app, "telescope", SimpleNamespace(get_seestar_imager=_boom_imager)
+    )
+    monkeypatch.setattr(Config, "get_toml", lambda s, i, d: d)
+    monkeypatch.setattr(front_app, "_persist_stream_quality", lambda vals: None)
+
+    req = _DummyJSONReq(body={"max_stream_fps": 999, "jpeg_quality": 5000})
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_post(req, resp, telescope_id=1)
+
+    payload = json.loads(resp.text)
+    assert payload["max_stream_fps"] == SI.MAX_STREAM_FPS_CAP
+    assert payload["jpeg_quality"] == 100
+
+
+def test_stream_quality_post_rejects_non_dict_body(monkeypatch):
+    class _ListMediaReq:
+        media = [1, 2, 3]
+
+        def get_header(self, _k):
+            return None
+
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_post(_ListMediaReq(), resp, telescope_id=1)
+    assert "400" in str(resp.status)
+
+
+def test_stream_quality_post_rejects_invalid_value(monkeypatch):
+    monkeypatch.setattr(
+        front_app, "telescope", SimpleNamespace(get_seestar_imager=_boom_imager)
+    )
+    # Non-numeric jpeg_quality must 400, not 500 or silently coerce.
+    req = _DummyJSONReq(body={"jpeg_quality": "abc"})
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_post(req, resp, telescope_id=1)
+    assert "400" in str(resp.status)
+
+
+def test_persist_stream_quality_writes_config_section(monkeypatch):
+    from device.config import Config
+
+    saved = {"called": False}
+    monkeypatch.setattr(
+        Config, "save_toml", lambda *a, **k: saved.__setitem__("called", True)
+    )
+    had_section = "stream_quality" in Config._dict
+    try:
+        front_app._persist_stream_quality({"max_stream_fps": 14.0, "jpeg_quality": 66})
+        assert saved["called"] is True
+        # Real set_toml round-trips through the tomlkit dict.
+        assert Config.get_toml("stream_quality", "max_stream_fps", None) == 14.0
+        assert Config.get_toml("stream_quality", "jpeg_quality", None) == 66
+    finally:
+        # Don't leak the section into the shared Config singleton.
+        if not had_section and "stream_quality" in Config._dict:
+            del Config._dict["stream_quality"]
+
+
+def test_live_tracker_has_stream_quality_controls():
+    """The live_tracker page exposes the two browser-hop stream knobs near the
+    video stats, POSTing to /api/<id>/stream_quality, with an honest label and
+    user-triggered (not polled) apply."""
+    html = front_app.fetch_template("live_tracker.html").render(
+        telescope_id=1,
+        **_minimal_context("live_tracker", online=True),
+    )
+    # Card + both sliders present.
+    assert 'id="lt-stream-quality"' in html
+    assert 'id="lt-sq-fps"' in html
+    assert 'id="lt-sq-jpeg"' in html
+    # Talks to the stream_quality endpoint.
+    assert "/api/${telescopeId}/stream_quality" in html
+    # Honest label: shared across all viewers, persistent, and does not
+    # relieve the telescope's wifi uplink.
+    assert "every" in html and "viewer" in html
+    assert "persists across restarts" in html
+    assert "saturated uplink" in html
+    assert "stop live video" in html
+    # Applied on slider release (change), not via a background poll — keeps
+    # with AGENTS.md's no-unbounded-polling rule.
+    assert "fps.addEventListener('change', apply)" in html
+    assert "jpeg.addEventListener('change', apply)" in html
+
+
+def test_stream_quality_post_malformed_json_returns_400():
+    """A present-but-unparseable body must surface as 400, not masquerade
+    as a successful no-op (PR #25 review)."""
+
+    class _BadMediaReq:
+        content_length = 12
+
+        @property
+        def media(self):
+            raise ValueError("bad json")
+
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_post(_BadMediaReq(), resp, telescope_id=1)
+    assert resp.status == front_app.falcon.HTTP_400
+    assert "not valid JSON" in resp.text
+
+
+def test_stream_quality_post_empty_body_is_noop_echo(monkeypatch):
+    """An omitted/empty body still means 'no changes': 200 + current values."""
+
+    class FakeImager:
+        def stream_quality(self):
+            return {"max_stream_fps": 8.0, "jpeg_quality": 60}
+
+        def set_stream_quality(self, **kw):
+            raise AssertionError("no-op POST must not set anything")
+
+    monkeypatch.setattr(
+        front_app,
+        "telescope",
+        SimpleNamespace(get_seestar_imager=lambda _tid: FakeImager()),
+    )
+    monkeypatch.setattr(front_app, "_persist_stream_quality", lambda *a, **kw: None)
+
+    class _EmptyReq:
+        content_length = 0
+
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_post(_EmptyReq(), resp, telescope_id=1)
+    assert resp.status == front_app.falcon.HTTP_200
+    payload = json.loads(resp.text)
+    assert payload["max_stream_fps"] == 8.0
+    assert payload["jpeg_quality"] == 60

@@ -271,6 +271,98 @@ def test_get_frame_loop_non_streaming_and_stats(monkeypatch):
     assert imager.snr == 77
 
 
+def test_meter_serve_counts_bytes_and_distinct_frames(monkeypatch):
+    imager = make_imager(monkeypatch)
+
+    imager._meter_serve(100, True)  # distinct frame
+    imager._meter_serve(100, False)  # Chromium double-yield: bytes only
+    imager._meter_serve(50, True)  # another distinct frame
+
+    assert imager.served_bytes_total == 250
+    assert imager.served_frames_total == 2
+
+    tp = imager.video_throughput()
+    assert tp["bytes_total"] == 250
+    assert tp["frames_total"] == 2
+    # frames/s counts distinct frames (2), bytes/s counts all wire bytes (250),
+    # so the byte rate must exceed the frame rate for this sample set.
+    assert tp["bytes_per_s"] > tp["frames_per_s"]
+    assert tp["window_s"] == seestar_imaging.SeestarImaging.THROUGHPUT_WINDOW_S
+
+
+def test_video_throughput_empty_is_zeroed(monkeypatch):
+    imager = make_imager(monkeypatch)
+    tp = imager.video_throughput()
+    assert tp["bytes_per_s"] == 0
+    assert tp["frames_per_s"] == 0
+    assert tp["bytes_total"] == 0
+    assert tp["frames_total"] == 0
+    assert tp["window_s"] == 10.0
+
+
+def test_video_throughput_window_excludes_old_samples(monkeypatch):
+    imager = make_imager(monkeypatch)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(seestar_imaging, "monotonic", lambda: clock["t"])
+
+    imager._meter_serve(1000, True)  # first sample at t=1000
+    clock["t"] = 1000.0 + 30.0  # advance 30s (well past the 10s window)
+    imager._meter_serve(500, True)  # only this one is inside the window
+
+    tp = imager.video_throughput(window=10.0)
+    # denom clamps to min(window, elapsed-since-first-sample) = 10s.
+    assert tp["bytes_per_s"] == 500 / 10.0
+    assert tp["frames_per_s"] == 1 / 10.0
+    # Cumulative totals still include the evicted-from-window sample.
+    assert tp["bytes_total"] == 1500
+    assert tp["frames_total"] == 2
+
+
+def test_video_throughput_no_startup_spike(monkeypatch):
+    imager = make_imager(monkeypatch)
+    clock = {"t": 500.0}
+    monkeypatch.setattr(seestar_imaging, "monotonic", lambda: clock["t"])
+    # A single large frame recorded within the first second must not divide
+    # by a near-zero denominator and report an absurd rate.
+    imager._meter_serve(1_000_000, True)
+    tp = imager.video_throughput(window=10.0)
+    assert tp["bytes_per_s"] == 1_000_000 / 1.0  # denom floored to 1.0s
+
+
+def test_snapshot_serve_samples_survives_mutation_error(monkeypatch):
+    imager = make_imager(monkeypatch)
+
+    class Boom:
+        def __iter__(self):
+            raise RuntimeError("deque mutated during iteration")
+
+    imager._serve_samples = Boom()
+    assert imager._snapshot_serve_samples() == []
+    # video_throughput must still return a well-formed zeroed reading.
+    tp = imager.video_throughput()
+    assert tp["bytes_per_s"] == 0
+    assert tp["frames_per_s"] == 0
+
+
+def test_get_frame_records_throughput(monkeypatch):
+    imager = make_imager(monkeypatch)
+    monkeypatch.setattr(seestar_imaging, "sleep", lambda _s: None)
+    monkeypatch.setattr(imager, "build_frame_bytes", lambda *_a, **_k: b"FRAMEBYTES")
+    monkeypatch.setattr(
+        imager, "blank_frame", lambda message="", timestamp=False: b"BL"
+    )
+    # Idle immediately so only the initial frame block runs (image present).
+    imager.device.view_state = {"state": "idle", "stage": "RTSP"}
+
+    list(imager.get_frame())
+
+    # The initial content frame is metered once as a distinct frame plus the
+    # Chromium duplicate, so bytes cover both copies.
+    assert imager.served_frames_total >= 1
+    assert imager.served_bytes_total >= len(b"FRAMEBYTES")
+    assert imager.video_throughput()["frames_total"] >= 1
+
+
 def test_get_frame_handles_encode_exception_and_loading(monkeypatch):
     imager = make_imager(monkeypatch)
     monkeypatch.setattr(seestar_imaging, "sleep", lambda _s: None)

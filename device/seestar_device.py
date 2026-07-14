@@ -111,6 +111,13 @@ class Seestar:
         self.heartbeat_msg_thread: Optional[threading.Thread] = None
         self.is_debug: bool = is_debug
         self.response_dict: OrderedDict[int, dict] = FixedSizeOrderedDict(max=100)
+        # RPC round-trip-time metering: wall-clock latency (seconds) of each
+        # synchronous command, from send to the response landing in
+        # response_dict. Lock-free — the sync caller appends one float; the
+        # stats reader (rpc_rtt_stats) snapshots + sorts a copy. maxlen bounds
+        # memory and makes p50/p95 a rolling window over recent commands.
+        self._rtt_samples: collections.deque = collections.deque(maxlen=200)
+        self.rtt_count_total: int = 0
         self.logger = logger
         self.is_connected: bool = False
         # PEM key bytes (lazy loaded)
@@ -755,8 +762,62 @@ class Seestar:
             # Firmware round-trip is ~10-30 ms; at 10 ms poll we hit the
             # firmware floor with negligible CPU overhead (~100 polls/s).
             time.sleep(0.01)
+        # Correlation point: the reply for cur_cmdid has just arrived, so
+        # (now - start) is the firmware/wifi round-trip. Record it for the
+        # rolling p50/p95 metering. Only successful replies land here; the
+        # timeout path returns above without polluting the RTT samples.
+        self._record_rtt(time.time() - start)
         self.logger.debug(f"response is {self.response_dict[cur_cmdid]}")
         return self.response_dict[cur_cmdid]
+
+    def _record_rtt(self, latency_s: float) -> None:
+        """Record one synchronous-RPC round-trip latency (seconds).
+
+        Called on the caller thread the moment the firmware reply lands in
+        ``response_dict``. Lock-free single deque append; the stats reader
+        (:meth:`rpc_rtt_stats`) takes a defensive snapshot.
+        """
+        self._rtt_samples.append(latency_s)
+        self.rtt_count_total += 1
+
+    def rpc_rtt_stats(self):
+        """Rolling p50/p95 (milliseconds) over the most recent RPC round-trips.
+
+        Reads the sample deque lock-free (retrying on the rare
+        ``deque mutated during iteration`` if a command completes mid-read).
+        Percentiles use the nearest-rank method on a sorted copy.
+        """
+        samples = None
+        for _ in range(5):
+            try:
+                samples = list(self._rtt_samples)
+                break
+            except RuntimeError:
+                samples = None
+        if not samples:
+            return {
+                "count": self.rtt_count_total,
+                "sample_count": 0,
+                "p50_ms": None,
+                "p95_ms": None,
+                "last_ms": None,
+            }
+        last_ms = round(samples[-1] * 1000.0, 1)
+        ordered = sorted(samples)
+        n = len(ordered)
+
+        def pct(p):
+            k = int(math.ceil(p / 100.0 * n)) - 1
+            k = max(0, min(n - 1, k))
+            return round(ordered[k] * 1000.0, 1)
+
+        return {
+            "count": self.rtt_count_total,
+            "sample_count": n,
+            "p50_ms": pct(50),
+            "p95_ms": pct(95),
+            "last_ms": last_ms,
+        }
 
     def get_event_state(self, params=None):
         if "scheduler" not in self.event_state:

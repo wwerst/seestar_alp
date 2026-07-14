@@ -71,6 +71,33 @@
         <h4>Recording</h4>
         <div id="lt-record-slot" hx-get="{{ root }}/live/video" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
       </div>
+      <!-- Star-safe scenery kick (mirrors #cal-video-kick): starts the camera
+           view when the scope is idle so the stream above comes up without
+           visiting the classic live page, and re-kicks if the view ever
+           drops. 204 + hx-swap="none" so nothing is swapped. -->
+      <div id="lt-video-kick" hx-get="{{ root }}/live/video_kick"
+           hx-trigger="every 2s" hx-swap="none" style="display:none;"></div>
+      {% include 'partials/net_stats.html' %}
+      <div class="lt-card" id="lt-stream-quality">
+        <h4>Stream quality</h4>
+        <div style="font-size:11px; opacity:0.7; margin-bottom:8px;">
+          Trims the MJPEG video this app serves (frame rate + JPEG quality).
+          Applies to <em>every</em> viewer and live page for this telescope
+          and persists across restarts. It does <strong>not</strong> reduce
+          what the telescope pushes over wifi, so it won't cut mount-command
+          lag from a saturated uplink — stop live video for that.
+        </div>
+        <div class="lt-slider-row">
+          <span>FPS</span>
+          <input type="range" id="lt-sq-fps" min="0" max="30" step="1" value="0">
+          <span class="v" id="lt-sq-fps-v">uncapped</span>
+        </div>
+        <div class="lt-slider-row">
+          <span>JPEG</span>
+          <input type="range" id="lt-sq-jpeg" min="10" max="100" step="5" value="95">
+          <span class="v" id="lt-sq-jpeg-v">95</span>
+        </div>
+      </div>
       <div class="lt-card">
         <h4>Tracking status</h4>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:6px;">
@@ -629,6 +656,86 @@
     chart.data.datasets[3].data = refElHist.slice();
     chart.update('none');
   }
+
+  // --- keep the MJPEG stream alive ---------------------------------
+  // The <img id="lt-vid"> streams from the imaging server's /vid endpoint,
+  // but that generator returns (closing the multipart response) whenever the
+  // mount's view_state is idle at connect time — e.g. before the scenery
+  // view has spun up on a fresh page load. A cleanly-closed stream fires no
+  // 'error' (the last frame just freezes), so we watch img.complete: it is
+  // false only while the stream is actively delivering and flips true when
+  // the stream errors or the server closes it. Re-point src (cache-busted so
+  // the browser opens a NEW request instead of reusing the dead one) on a
+  // throttle, so a healthy stream is never interrupted and the imaging
+  // server's limited worker pool isn't churned.
+  (function(){
+    const vid = document.getElementById('lt-vid');
+    if (!vid) return;
+    const base = (vid.getAttribute('src') || '').split('?')[0];
+    if (!base) return;
+    let lastReconnect = 0;
+    let completeStreak = 0;
+    const RECONNECT_MS = 3000;
+    function reconnectVideo(){
+      const now = Date.now();
+      if (now - lastReconnect < RECONNECT_MS) return;
+      lastReconnect = now;
+      completeStreak = 0;
+      vid.src = base + '?t=' + now;
+    }
+    vid.addEventListener('error', reconnectVideo);
+    // Some browsers flip img.complete true transiently between multipart
+    // frames of a healthy stream; require two consecutive observations so
+    // only a genuinely-closed stream triggers the reconnect.
+    setInterval(() => {
+      completeStreak = vid.complete ? completeStreak + 1 : 0;
+      if (completeStreak >= 2) reconnectVideo();
+    }, RECONNECT_MS);
+  })();
+
+  // --- stream-quality knobs (browser-hop only) ---------------------
+  // Two sliders (max serve FPS + JPEG quality) shaping the MJPEG this
+  // server re-encodes for EVERY viewer and live page of this telescope
+  // (shared + persisted in config.toml) — never the telescope's own wifi
+  // uplink. POST is fired on 'change' (slider release), so it is driven by
+  // user interaction, not a background poll (AGENTS.md: no unbounded
+  // polling). Current values are loaded once on page load.
+  (function(){
+    const fps = document.getElementById('lt-sq-fps');
+    const jpeg = document.getElementById('lt-sq-jpeg');
+    if (!fps || !jpeg) return;
+    const fpsV = document.getElementById('lt-sq-fps-v');
+    const jpegV = document.getElementById('lt-sq-jpeg-v');
+    const url = `/api/${telescopeId}/stream_quality`;
+    function fmtFps(v){ v = Number(v); return v > 0 ? v.toFixed(0) + ' fps' : 'uncapped'; }
+    function paint(){ fpsV.textContent = fmtFps(fps.value); jpegV.textContent = String(jpeg.value); }
+    // Load current values (imager runtime, or configured defaults).
+    fetch(url, {cache:'no-store'})
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (!j) return;
+        if (j.max_stream_fps != null) fps.value = j.max_stream_fps;
+        if (j.jpeg_quality != null) jpeg.value = j.jpeg_quality;
+        paint();
+      })
+      .catch(() => {});
+    async function apply(){
+      paint();
+      try {
+        await fetch(url, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({
+            max_stream_fps: Number(fps.value),
+            jpeg_quality: Number(jpeg.value),
+          }),
+        });
+      } catch (e) { /* transient; the slider keeps the user's value */ }
+    }
+    fps.addEventListener('input', paint);
+    jpeg.addEventListener('input', paint);
+    fps.addEventListener('change', apply);   // fires on release → throttled
+    jpeg.addEventListener('change', apply);
+  })();
 })();
 </script>
 {% endblock %}
