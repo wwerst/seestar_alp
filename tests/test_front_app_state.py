@@ -2853,3 +2853,48 @@ def test_live_tracker_has_stream_quality_controls():
     # with AGENTS.md's no-unbounded-polling rule.
     assert "fps.addEventListener('change', apply)" in html
     assert "jpeg.addEventListener('change', apply)" in html
+
+
+def test_stream_quality_post_malformed_json_returns_400():
+    """A present-but-unparseable body must surface as 400, not masquerade
+    as a successful no-op (PR #25 review)."""
+
+    class _BadMediaReq:
+        content_length = 12
+
+        @property
+        def media(self):
+            raise ValueError("bad json")
+
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_post(_BadMediaReq(), resp, telescope_id=1)
+    assert resp.status == front_app.falcon.HTTP_400
+    assert "not valid JSON" in resp.text
+
+
+def test_stream_quality_post_empty_body_is_noop_echo(monkeypatch):
+    """An omitted/empty body still means 'no changes': 200 + current values."""
+
+    class FakeImager:
+        def stream_quality(self):
+            return {"max_stream_fps": 8.0, "jpeg_quality": 60}
+
+        def set_stream_quality(self, **kw):
+            raise AssertionError("no-op POST must not set anything")
+
+    monkeypatch.setattr(
+        front_app,
+        "telescope",
+        SimpleNamespace(get_seestar_imager=lambda _tid: FakeImager()),
+    )
+    monkeypatch.setattr(front_app, "_persist_stream_quality", lambda *a, **kw: None)
+
+    class _EmptyReq:
+        content_length = 0
+
+    resp = _DummyJSONResp()
+    front_app.LiveStreamQualityResource.on_post(_EmptyReq(), resp, telescope_id=1)
+    assert resp.status == front_app.falcon.HTTP_200
+    payload = json.loads(resp.text)
+    assert payload["max_stream_fps"] == 8.0
+    assert payload["jpeg_quality"] == 60

@@ -694,8 +694,9 @@
   })();
 
   // --- stream-quality knobs (browser-hop only) ---------------------
-  // Two sliders (max serve FPS + JPEG quality) that shape only the MJPEG
-  // this server sends to *this* browser — never the telescope's wifi
+  // Two sliders (max serve FPS + JPEG quality) shaping the MJPEG this
+  // server re-encodes for EVERY viewer and live page of this telescope
+  // (shared + persisted in config.toml) — never the telescope's own wifi
   // uplink. POST is fired on 'change' (slider release), so it is driven by
   // user interaction, not a background poll (AGENTS.md: no unbounded
   // polling). Current values are loaded once on page load.

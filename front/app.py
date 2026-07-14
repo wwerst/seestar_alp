@@ -3537,11 +3537,10 @@ class LiveVideoKickResource(BaseResource):
             logger.debug(
                 f"live/video_kick: kick failed for telescope {telescope_id}: {exc}"
             )
-        # 204 No Content: no body and (per RFC/WSGI) no Content-Type header —
-        # htmx treats it as "do nothing", which is exactly what the
-        # hx-swap="none" poll driver wants.
+        # 204 No Content: htmx treats it as "do nothing", which is exactly
+        # what the hx-swap="none" poll driver wants. With no body set, Falcon
+        # omits the content headers on its own.
         resp.status = falcon.HTTP_204
-        resp.content_type = None
 
 
 class LiveFocusResource(BaseResource):
@@ -4649,9 +4648,17 @@ class LiveStreamQualityResource:
     def on_post(req, resp, telescope_id=1):
         from device.seestar_imaging import SeestarImaging
 
+        # An omitted/empty body means "no changes" (the echo below still
+        # runs); a PRESENT but unparseable body is a caller bug and must
+        # surface as 400, not masquerade as a successful no-op.
         try:
             body = req.media or {}
         except Exception:
+            if getattr(req, "content_length", None):
+                resp.status = falcon.HTTP_400
+                resp.content_type = "application/json"
+                resp.text = json.dumps({"error": "request body is not valid JSON"})
+                return
             body = {}
         if not isinstance(body, dict):
             resp.status = falcon.HTTP_400
