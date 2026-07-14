@@ -927,6 +927,256 @@ def test_live_track_manager_refuses_when_nighttime_auto_running(tmp_path, monkey
     assert mgr.get(161) is None
 
 
+# --------- M3: split feasibility gate (cable-wrap deferred to runtime) ----
+
+
+class _WoundAzProvider:
+    """Provider whose topocentric az_cum sits far outside any plausible
+    cable-wrap budget, but whose elevation is in-band. Used to prove the
+    pre-launch gate no longer rejects on the frame mismatch."""
+
+    is_live = False
+    extrapolation_s = 1.0
+
+    def __init__(
+        self, t0: float, az_cum_deg: float = 100_000.0, duration_s: float = 3.0
+    ):
+        self._t0 = t0
+        self._t1 = t0 + duration_s
+        self._az = float(az_cum_deg)
+
+    def sample(self, t):
+        return ReferenceSample(
+            t_unix=float(t),
+            az_cum_deg=self._az,
+            el_deg=45.0,
+            v_az_degs=0.0,
+            v_el_degs=0.0,
+            a_az_degs2=0.0,
+            a_el_degs2=0.0,
+            stale=False,
+            extrapolated=False,
+        )
+
+    def valid_range(self):
+        return (self._t0, self._t1)
+
+
+def test_pre_check_feasibility_ignores_cable_wrap(tmp_path):
+    """M3: pre_check_feasibility is frame-independent. A trajectory whose raw
+    topocentric az_cum lies far outside the cable-wrap budget (but with
+    elevation in-band) must NOT be rejected pre-launch — the provider's
+    az_cum only reconciles with the mount's cumulative encoder budget once
+    the runtime anchor offset is applied. (Before the fix this produced a
+    false 400.)"""
+    session = LiveTrackSession(
+        telescope_id=170,
+        target_kind="file",
+        target_id="wound",
+        target_display_name="Wound",
+        provider=_WoundAzProvider(t0=time.time() + 0.2),
+        offsets=AtomicOffsets(),
+        dry_run=True,
+        auto_slew=False,
+        log_dir=tmp_path / "logs",
+    )
+    # Sanity: real cable limits are on disk, so the *old* behavior would have
+    # compared az_cum=100000 against them and rejected.
+    assert session._resolve_az_limits() is not None
+    pre = session.pre_check_feasibility()
+    assert pre.feasible is True
+    # Elevation gating still works (frame-independent).
+    assert pre.el_limit_violations == 0
+
+
+def test_pre_check_feasibility_still_rejects_out_of_band_elevation(tmp_path):
+    """M3: the frame-independent elevation gate survives the split — an
+    overhead trajectory is still infeasible pre-launch."""
+    session = LiveTrackSession(
+        telescope_id=171,
+        target_kind="file",
+        target_id="overhead",
+        target_display_name="Overhead",
+        provider=_OverheadProvider(t0=time.time() + 0.2),
+        offsets=AtomicOffsets(),
+        dry_run=True,
+        auto_slew=False,
+        log_dir=tmp_path / "logs",
+    )
+    pre = session.pre_check_feasibility()
+    assert pre.feasible is False
+    assert pre.el_limit_violations > 0
+
+
+def _cable_wrap_session(tid: int, tmp_path) -> LiveTrackSession:
+    return LiveTrackSession(
+        telescope_id=tid,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=_StationaryProvider(t0=time.time() + 0.2),  # az_cum=0 flat
+        offsets=AtomicOffsets(),
+        dry_run=True,
+        auto_slew=False,
+        log_dir=tmp_path / "logs",
+    )
+
+
+def test_runtime_cable_wrap_check_fires_on_wound_mount(tmp_path):
+    """M3: with the mount wound past the usable CW hard stop, the deferred
+    runtime gate (evaluated against the measured anchor) refuses the track
+    and ends the session with exit_reason='cable_wrap'."""
+    from device.plant_limits import AzimuthLimits, CumulativeAzTracker
+
+    session = _cable_wrap_session(170, tmp_path)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                # wrapped 85° ≡ cumulative 445° for a mount wound +445°
+                return {"result": [45.0, 85.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    tracker = CumulativeAzTracker()
+    tracker.reset(cum_az_deg=445.0, wrapped_az_deg=85.0)  # past +435° usable CW
+    limits = AzimuthLimits(
+        ccw_hard_stop_cum_deg=-450.0,
+        cw_hard_stop_cum_deg=450.0,
+        padding_deg=15.0,
+    )
+
+    abort = session._runtime_cable_wrap_check(_FakeCli(), None, tracker, limits)
+    assert abort is True
+    assert session._exit_reason == "cable_wrap"
+    assert session._phase == "refused"
+    assert session._stop_evt.is_set()
+    assert any("cable-wrap" in e for e in session._errors)
+
+
+def test_runtime_cable_wrap_check_passes_within_budget(tmp_path):
+    """M3: a mount near home with an in-budget trajectory is not aborted by
+    the runtime gate."""
+    from device.plant_limits import AzimuthLimits, CumulativeAzTracker
+
+    session = _cable_wrap_session(172, tmp_path)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    tracker = CumulativeAzTracker()
+    tracker.reset(cum_az_deg=0.0, wrapped_az_deg=0.0)  # home
+    limits = AzimuthLimits(
+        ccw_hard_stop_cum_deg=-450.0,
+        cw_hard_stop_cum_deg=450.0,
+        padding_deg=15.0,
+    )
+
+    abort = session._runtime_cable_wrap_check(_FakeCli(), None, tracker, limits)
+    assert abort is False
+    assert session._exit_reason is None
+    assert not session._stop_evt.is_set()
+
+
+def test_runtime_cable_wrap_check_noop_without_limits(tmp_path):
+    """M3: with no cable limits configured, the runtime gate is a no-op (it
+    never measures the mount or aborts)."""
+    from device.plant_limits import CumulativeAzTracker
+
+    session = _cable_wrap_session(173, tmp_path)
+    measured = {"n": 0}
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            measured["n"] += 1
+            return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
+
+    tracker = CumulativeAzTracker()
+    abort = session._runtime_cable_wrap_check(_FakeCli(), None, tracker, None)
+    assert abort is False
+    assert measured["n"] == 0  # short-circuited before touching the mount
+
+
+# --------- M5: pre-slew sun check keys off sky, not mount frame -----------
+
+
+def test_auto_slew_sun_check_transforms_mount_to_sky(monkeypatch):
+    """M5: the pre-slew sun-avoidance check must key off SKY coordinates, not
+    the raw mount-frame (az, el). With a yawed session frame the mount az
+    differs from the sky az, so is_sun_safe must be queried with the
+    un-rotated sky coordinates (mirroring the per-tick net in
+    streaming_controller.track)."""
+    import pytest
+
+    import device.live_tracker as lt
+    from device import sun_safety as ss
+    from device.streaming_controller import _mount_azel_to_sky
+    from device.target_frame import MountFrame
+
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    captured: dict = {}
+
+    def _spy_is_sun_safe(az, el, *a, **k):
+        captured["az"] = float(az)
+        captured["el"] = float(el)
+        return (False, "sun_avoidance: spy")
+
+    monkeypatch.setattr(ss, "is_sun_safe", _spy_is_sun_safe)
+
+    yaw_frame = MountFrame.from_euler_deg(yaw_deg=30.0, pitch_deg=0.0, roll_deg=0.0)
+
+    class _FramedProvider:
+        def __init__(self, t0, mount_frame):
+            self.mount_frame = mount_frame
+            self._t0 = t0
+            self._t1 = t0 + 3.0
+
+        def sample(self, t):
+            return ReferenceSample(
+                t_unix=float(t),
+                az_cum_deg=10.0,
+                el_deg=40.0,
+                v_az_degs=0.0,
+                v_el_degs=0.0,
+                a_az_degs2=0.0,
+                a_el_degs2=0.0,
+                stale=False,
+                extrapolated=False,
+            )
+
+        def valid_range(self):
+            return (self._t0, self._t1)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    session = LiveTrackSession(
+        telescope_id=180,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=_FramedProvider(time.time() + 0.2, yaw_frame),
+        offsets=AtomicOffsets(),
+        dry_run=True,
+    )
+    session._auto_slew(_FakeCli(), None)
+
+    assert session._exit_reason == "sun_avoidance"
+    mount_az = 10.0  # provider az_cum_deg wrapped into [0, 360)
+    expected_az, expected_el = _mount_azel_to_sky(yaw_frame, mount_az, 40.0)
+    assert captured["az"] == pytest.approx(expected_az, abs=1e-6)
+    assert captured["el"] == pytest.approx(expected_el, abs=1e-6)
+    # The transform actually moved the az off the raw mount value (yaw=30°).
+    delta = ((captured["az"] - mount_az + 180.0) % 360.0) - 180.0
+    assert abs(delta) > 1.0
+
+
 def test_run_direct_motor_stop_skipped_while_sun_jog_in_progress(tmp_path, monkeypatch):
     """The session-exit direct stop must NOT cancel an in-flight emergency
     jog-away: with the monitor's jog window open, no scope_speed_move may
@@ -973,3 +1223,31 @@ def test_run_direct_motor_stop_skipped_while_sun_jog_in_progress(tmp_path, monke
     # Wrapper stops are refused by the lockout AND the direct bypass is
     # skipped by the jog window — nothing reaches the mount.
     assert cli.state.last_cmd is None
+
+
+def test_runtime_cable_wrap_check_fails_closed_on_measure_error(tmp_path):
+    """The deferred gate must fail CLOSED: a transient anchor-measurement
+    error refuses the track (origin/main refused synchronously before any
+    motion; deferral must not turn an error into an unchecked launch)."""
+    from device.plant_limits import AzimuthLimits, CumulativeAzTracker
+
+    session = _cable_wrap_session(174, tmp_path)
+
+    class _BrokenCli:
+        def method_sync(self, method, params=None):
+            raise RuntimeError("scope unreachable")
+
+    tracker = CumulativeAzTracker()
+    tracker.reset(cum_az_deg=0.0, wrapped_az_deg=0.0)
+    limits = AzimuthLimits(
+        ccw_hard_stop_cum_deg=-450.0,
+        cw_hard_stop_cum_deg=450.0,
+        padding_deg=15.0,
+    )
+
+    abort = session._runtime_cable_wrap_check(_BrokenCli(), None, tracker, limits)
+    assert abort is True
+    assert session._exit_reason == "cable_wrap_unverified"
+    assert session._phase == "refused"
+    assert session._stop_evt.is_set()
+    assert any("could not be verified" in e for e in session._errors)
