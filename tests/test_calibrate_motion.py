@@ -140,11 +140,15 @@ def test_static_provider_valid_range_wide():
 
 
 def _install_fake_cli(monkeypatch, cli):
-    """Patch device.calibrate_motion.AlpacaClient so the session thread
-    uses our in-process fake instead of hitting a real Alpaca endpoint."""
-    import device.alpaca_client as ac
+    """Patch device.calibrate_motion.get_mount_client so the session thread
+    uses our in-process fake instead of acquiring a real transport.
 
-    monkeypatch.setattr(ac, "AlpacaClient", lambda *a, **kw: cli)
+    Patching the factory (rather than the AlpacaClient fallback) keeps the
+    stub independent of whether a live Seestar object happens to be
+    registered in device.telescope.seestar_dev by another test."""
+    import device.calibrate_motion as cm
+
+    monkeypatch.setattr(cm, "get_mount_client", lambda *a, **kw: cli)
 
 
 def test_session_start_then_stop_clean(monkeypatch, tmp_path):
@@ -525,7 +529,7 @@ def test_live_tracker_refuses_when_motion_running(monkeypatch, tmp_path):
         def valid_range(self):
             return (self._t0, self._t1)
 
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: object())
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: object())
     session = LiveTrackSession(
         telescope_id=66,
         target_kind="file",
