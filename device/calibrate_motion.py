@@ -49,6 +49,7 @@ from typing import Any
 from astropy.coordinates import EarthLocation
 
 from device.config import Config
+from device.mount_client import get_mount_client
 from device.plant_limits import AzimuthLimits, CumulativeAzTracker
 from device.reference_provider import ReferenceSample
 from device.streaming_controller import (
@@ -423,9 +424,15 @@ class CalibrateMotionSession:
             self._phase = "track"
 
     def _connect_mount(self) -> Any:
-        from device.alpaca_client import AlpacaClient
-
-        return AlpacaClient(self._alpaca_host, self._alpaca_port, self.telescope_id)
+        # In-process when this telescope is registered+connected here (skips
+        # the per-tick localhost HTTP round-trip in the move-to-ff tick
+        # loops); HTTP fallback otherwise. Behaviour-identical — see
+        # device.mount_client.
+        return get_mount_client(
+            self.telescope_id,
+            host=self._alpaca_host,
+            port=self._alpaca_port,
+        )
 
     def _run(self) -> None:
         cli = self._connect_mount()
