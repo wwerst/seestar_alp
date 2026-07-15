@@ -141,9 +141,13 @@ class _Resp:
 
 @pytest.fixture(autouse=True)
 def _isolate_registry():
-    """Snapshot/restore the process-global device registry so these tests
-    (which register fakes) never leak into or inherit from other tests, and
-    wire up the loggers the real server path expects."""
+    """Snapshot/restore the process-global device registry AND the module
+    loggers so these tests (which register fakes and wire the loggers the
+    real server path expects) never leak into or inherit from other tests."""
+    from device import shr as device_shr
+
+    saved_shr_logger = device_shr.logger
+    saved_exc_logger = device_exceptions.logger
     set_shr_logger(logging.getLogger("test-mount-client"))
     device_exceptions.logger = _NullLogger()
     saved = dict(telescope.seestar_dev)
@@ -153,6 +157,8 @@ def _isolate_registry():
     finally:
         telescope.seestar_dev.clear()
         telescope.seestar_dev.update(saved)
+        set_shr_logger(saved_shr_logger)
+        device_exceptions.logger = saved_exc_logger
 
 
 def _http_value(dev, method, params):
