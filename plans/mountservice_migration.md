@@ -568,15 +568,49 @@ Open firmware questions:
 
 ## 9. What other docs already track, and what is stale
 
-*Pending: an item-by-item audit of which of the items above the existing
-`plans/` and `docs/` files already track (and where they record a wrong
-status) is being added in a follow-up commit.* What is already known: the
-repo has no GitHub issues; before this file, the only mention of the
-MountService anywhere in the docs was the one-paragraph "direction" in
-`docs/operations_runbook.md` §1; and the 12-step audit plan existed only in
-a chat transcript.
+This section records where each item above stood before this file was added
+(`d2d9130`).
+- **What was searched:**
+  - every tracked `.md`/`.txt` file
+  - code comments, docstrings and TODOs
+  - the PR #1–#26 bodies and the commit messages
+- **Method:** four independent checkers, then an adversarial re-check of
+  every classification.
+- **GitHub issues:** the repo has none, open or closed.
+- **Before this file:** the only written mention of the MountService was
+  the one-paragraph "direction" in `docs/operations_runbook.md` §1. The
+  12-step audit plan existed only in a chat transcript.
 
-<!-- TRACKING-AUDIT -->
+| Status before this file | Count (per plan ID; F5 appears twice) | Items |
+|---|---|---|
+| Tracked as open work | 3 | B5, B8, B16, all in `plans/velocity_controller_research_plan.md` |
+| Tracked, but with a wrong status | 1 | B3 (gain bump recorded as "applied"; never landed) |
+| Partially tracked: only the MountService "direction" (runbook §1, PR #23 body, commit 32ca25a) or an old plan bullet | 19 | S15, M3–M13, F0, F1, B2, B6, B9, B10, B18 |
+| **Documented as intended:** existing text presents the current behaviour as correct, which hides the gap | 15 | S2, S3, S4, S7, S8, S9, S11, S12, S13, M2, F4, F5 (user_hooks part), F6, B1, B4 |
+| Untracked anywhere | 22 | H0, S1, S5, S6, S10, S14, M1, M14, F2, F3, F5, F7, F8, F9, U1, B7, B11, B12, B13, B14, B15, B17 |
+
+### Statements elsewhere that are now known to be wrong
+
+Fix each one in the same PR that fixes its item, or under B12.
+
+| Where | What it says | What is true | Item |
+|---|---|---|---|
+| `device/sun_safety.py:686-688`, `device/seestar_device.py:1118-1124`, `docs/operations_runbook.md:34-37` | Encoder az/el used as sky is "exact after rotation calibration, conservative otherwise" | The cone is *displaced* by the tripod yaw, not widened | S2 |
+| `docs/operations_runbook.md:38-41`, `device/live_tracker_service.py:137-144` | The watchdog "aborts every active session" | The scheduler, mosaic and in-flight firmware gotos survive a trip | S7 |
+| `docs/operations_runbook.md:51-53`, `device/velocity_controller.py:139-142` | The monitor is the sole/single privileged motion source during a jog | The joystick, gotos and raw `method_sync` are not gated | S1, S6, S11 |
+| `docs/operations_runbook.md:68-75` | An unset 0,0 site fails closed | After an IP-guess or a config edit, pre-flights allow motion while the monitor keeps the old site | S9 |
+| `device/streaming_controller.py:573-579`, `front/app.py:5906-5909`, `device/calibrate_motion.py:99-104` | The reference-sample sun check and the (0,0) seed are deliberate and adequate | The check looks at the wrong point | S3, S4 |
+| `device/calibrate_motion.py:593-599`, `device/rotation_calibration.py:1849-1856` | The calibrate-motion / rotation-calibration pair is "documented allowed concurrency" | It can co-drive during the fallback `move_to_ff` *(inferred)* | S13 |
+| `tests/test_manager_toctou.py:1135-1153`, PR #24 body, runbook nighttime-auto section | Auto-run is refused while interactive nighttime runs, and the button works | The route requires an interactive session, so auto-run can never start | B1 |
+| `device/mount_client.py:14-24`, `device/config.toml.example:92-100` | The transports are "behaviour-identical", with ~10–30 ms in-process latency | Latency was never measured; logging and `action_*` callbacks differ | M1, H0, F5 |
+| `device/velocity_controller.py:79` (`VC_LOOP_DT_S`) | "Real dt is HTTP-bound" | Stale for in-process sessions | F1 |
+| `device/live_tracker.py:1632-1633` | The pre-check refuses trajectories that saturate the FF rate | `feasible` ignores saturation (`device/streaming_controller.py:216-220`) | B10 |
+| `device/streaming_controller.py:344-351` | Absolute sky pointing is "not a success criterion" | Needed once a 3-DOF calibration exists | B4 |
+| PR #23 body, commit c99e228 | The threaded WSGI server unblocks websockets | WSGI has no upgrade path | M5 |
+| `plans/velocity_controller_research_plan.md:1838-1847` | τ 0.348→0.55 and kp 0.5→1.0 "applied" | Code still has 0.348 / 0.5 | B3 |
+| `plans/velocity_controller_research_plan.md:312-314` | Usable elevation ±70.8° | Code uses ±85.0 (hard-coded) | S15, B12 |
+| Commit 10f46c7 message | Nighttime and visibility acquire via `get_mount_client` | They don't. Commit messages are immutable; the PR #26 body is corrected. | F0 |
+| `docs/operations_runbook.md:175`, `change_log.txt` | §6 heading says "(this PR)"; changelog ends June 2024 | Stale | B12 |
 
 ## 10. Resuming this plan in a new session
 
