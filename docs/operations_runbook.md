@@ -50,7 +50,9 @@ behind a **single always-on MountService** that owns the mount and arbitrates
 motion + safety centrally, so sessions request motion from one authority
 instead of each grabbing the mount and being torn down by callbacks. The
 sun-safety monitor — already always-on and already the sole authority allowed
-to move during an emergency jog — is the seed of that service.
+to move during an emergency jog — is the seed of that service. The step-by-step
+migration plan, its current status, and the known safety gaps on the way there
+are tracked in `plans/mountservice_migration.md`.
 
 ---
 
