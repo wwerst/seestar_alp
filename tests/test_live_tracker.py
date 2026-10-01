@@ -303,8 +303,8 @@ class _StationaryProvider:
 def test_live_track_manager_start_stop_roundtrip(tmp_path, monkeypatch):
     """End-to-end session lifecycle with a fake mount and a stationary
     provider. Verifies start → status.active → stop → status.exit_reason."""
-    # Patch AlpacaClient inside the live_tracker module so the session
-    # thread doesn't try to hit a real HTTP endpoint.
+    # Patch the mount-client factory inside the live_tracker module so the
+    # session thread uses our fake instead of acquiring a real transport.
     import device.live_tracker as lt
 
     class _FakeCli:
@@ -316,7 +316,7 @@ def test_live_track_manager_start_stop_roundtrip(tmp_path, monkeypatch):
                 }
             return {"result": None}
 
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: _FakeCli())
 
     offsets = AtomicOffsets()
     provider = _StationaryProvider(t0=time.time() + 0.2)
@@ -357,7 +357,7 @@ def test_live_track_manager_set_offsets_when_running(tmp_path, monkeypatch):
                 return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
             return {"result": None}
 
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: _FakeCli())
 
     session = LiveTrackSession(
         telescope_id=100,
@@ -447,7 +447,7 @@ def test_auto_slew_refuses_when_target_inside_sun_cone(monkeypatch):
                     }
                 return {"result": None}
 
-        monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+        monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: _FakeCli())
 
         session = LiveTrackSession(
             telescope_id=77,
@@ -499,7 +499,7 @@ def test_live_track_manager_double_start_refuses(tmp_path, monkeypatch):
                 return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
             return {"result": None}
 
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: _FakeCli())
 
     def make_session():
         return LiveTrackSession(
@@ -727,7 +727,7 @@ def test_live_track_manager_rejects_infeasible_trajectory(tmp_path, monkeypatch)
         def method_sync(self, method, params=None):
             return {"result": None}
 
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: _FakeCli())
 
     session = LiveTrackSession(
         telescope_id=120,
@@ -810,7 +810,7 @@ def test_run_preslew_sun_refusal_is_terminal(tmp_path, monkeypatch):
                 return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
             return {"result": None}
 
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: _FakeCli())
 
     session = LiveTrackSession(
         telescope_id=140,
@@ -840,7 +840,7 @@ def test_run_direct_motor_stop_bypasses_sun_lockout(tmp_path, monkeypatch):
 
     cli = FakeMountClient()
     cli.set_position(az_deg=0.0, el_deg=45.0)
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: cli)
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: cli)
 
     session = LiveTrackSession(
         telescope_id=150,
@@ -1190,7 +1190,7 @@ def test_run_direct_motor_stop_skipped_while_sun_jog_in_progress(tmp_path, monke
 
     cli = FakeMountClient()
     cli.set_position(az_deg=0.0, el_deg=45.0)
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: cli)
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: cli)
 
     session = LiveTrackSession(
         telescope_id=151,

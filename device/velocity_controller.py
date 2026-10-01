@@ -52,6 +52,7 @@ from device.geometry import (
     unwrap_az_series,  # noqa: F401 — re-exported for external importers
     wrap_pm180,
 )
+from device.servo_core import AngleConv, AxisMode, MagFn, servo_tick
 
 
 logger = logging.getLogger(__name__)
@@ -543,39 +544,37 @@ def move_azimuth_to_ff(
             else:
                 position_error = wrap_pm180(ref.pos - measured_az)
 
-            # P-term feedback with clamp.
-            v_corr = kp_pos * position_error
-            if v_corr > v_corr_max:
-                v_corr = v_corr_max
-            elif v_corr < -v_corr_max:
-                v_corr = -v_corr_max
+            # Shared FF+FB control law + quantization (device.servo_core).
+            # Feedforward inverts the first-order plant lag (v_cmd leads the
+            # reference by τ·a; for a 1/(τs+1) plant v_ref + τ·a_ref tracks
+            # v_ref exactly, VC_TAU_S = 0.348s from Phase 1 sysid). The command
+            # is clamped at the PLANT's max rate (MAIN_RATE_DEGS), not the
+            # planner cruise speed (v_max) — the τ·a_ref term can briefly push
+            # v_ff above v_max during accel (≈ 0.348 × 4.0 = 1.4°/s); the 6°/s
+            # clamp caps at the plant limit and preserves the 1°/s FB headroom.
+            # AZ axis: angle 0 (+az) / 180 (−az); fine floor keeps the angle.
+            cmd, diag = servo_tick(
+                ref_vel_az=ref.vel,
+                ref_acc_az=ref.acc,
+                err_az=position_error,
+                ref_vel_el=0.0,
+                ref_acc_el=0.0,
+                err_el=0.0,
+                kp_pos=kp_pos,
+                v_corr_max=v_corr_max,
+                tau_s=VC_TAU_S,
+                v_limit=MAIN_RATE_DEGS,
+                axis_mode=AxisMode.AZ,
+                fine_min_speed=VC_FINE_MIN_SPEED,
+                dur_sec=VC_CMD_DUR_S,
+            )
+            v_corr = diag.v_corr_az
+            v_ff = diag.v_ff_az
+            cmd_vel = diag.v_cmd_az
+            speed_cmd = cmd.speed
+            angle_cmd = cmd.angle
 
-            # Feedforward: invert the first-order plant lag so the commanded
-            # velocity leads the reference by τ·a. For a plant with transfer
-            # function 1/(τs+1), v_cmd = v_ref + τ·a_ref makes the output
-            # track v_ref exactly. VC_TAU_S = 0.348s from Phase 1 sysid.
-            v_ff = ref.vel + VC_TAU_S * ref.acc
-            cmd_vel = v_ff + v_corr
-            # Clamp at the PLANT's max rate (MAIN_RATE_DEGS), not the planner's
-            # cruise speed (v_max). The τ·a_ref term can briefly push v_ff above
-            # v_max during accel phases (≈ 0.348 × 4.0 = 1.4°/s); the 6°/s clamp
-            # caps at the plant limit and preserves the 1°/s FB headroom.
-            if cmd_vel > MAIN_RATE_DEGS:
-                cmd_vel = MAIN_RATE_DEGS
-            elif cmd_vel < -MAIN_RATE_DEGS:
-                cmd_vel = -MAIN_RATE_DEGS
-
-            # Convert to firmware (speed, angle).
-            if abs(cmd_vel) < 1e-6:
-                speed_cmd = 0
-                angle_cmd = 0
-            else:
-                speed_cmd = _rate_to_speed(abs(cmd_vel))
-                if speed_cmd < VC_FINE_MIN_SPEED:
-                    speed_cmd = 0
-                angle_cmd = 0 if cmd_vel > 0 else 180
-
-            speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
+            speed_move(cli, speed_cmd, angle_cmd, cmd.dur_sec)
             stats["commands_issued"] += 1
 
             tracking_errs.append(abs(position_error))
@@ -980,31 +979,32 @@ def move_elevation_to_ff(
             ref = traj.sample(t_plant_clamped)
             position_error = ref.pos - measured_alt  # no wrap for el
 
-            v_corr = kp_pos * position_error
-            if v_corr > v_corr_max:
-                v_corr = v_corr_max
-            elif v_corr < -v_corr_max:
-                v_corr = -v_corr_max
+            # Shared FF+FB control law + quantization (device.servo_core).
+            # Feedforward plant-inversion v_cmd = v_ref + τ·a_ref + FB; see the
+            # matching call in move_azimuth_to_ff for the derivation. EL axis:
+            # angle 90 (+el) / 270 (−el); fine floor keeps the angle.
+            cmd, diag = servo_tick(
+                ref_vel_az=0.0,
+                ref_acc_az=0.0,
+                err_az=0.0,
+                ref_vel_el=ref.vel,
+                ref_acc_el=ref.acc,
+                err_el=position_error,
+                kp_pos=kp_pos,
+                v_corr_max=v_corr_max,
+                tau_s=VC_TAU_S,
+                v_limit=MAIN_RATE_DEGS,
+                axis_mode=AxisMode.EL,
+                fine_min_speed=VC_FINE_MIN_SPEED,
+                dur_sec=VC_CMD_DUR_S,
+            )
+            v_corr = diag.v_corr_el
+            v_ff = diag.v_ff_el
+            cmd_vel = diag.v_cmd_el
+            speed_cmd = cmd.speed
+            angle_cmd = cmd.angle
 
-            # Feedforward plant-inversion: v_cmd = v_ref + τ·a_ref + FB. See the
-            # matching block in move_azimuth_to_ff for the derivation.
-            v_ff = ref.vel + VC_TAU_S * ref.acc
-            cmd_vel = v_ff + v_corr
-            if cmd_vel > MAIN_RATE_DEGS:
-                cmd_vel = MAIN_RATE_DEGS
-            elif cmd_vel < -MAIN_RATE_DEGS:
-                cmd_vel = -MAIN_RATE_DEGS
-
-            if abs(cmd_vel) < 1e-6:
-                speed_cmd = 0
-                angle_cmd = 0
-            else:
-                speed_cmd = _rate_to_speed(abs(cmd_vel))
-                if speed_cmd < VC_FINE_MIN_SPEED:
-                    speed_cmd = 0
-                angle_cmd = 90 if cmd_vel > 0 else 270
-
-            speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
+            speed_move(cli, speed_cmd, angle_cmd, cmd.dur_sec)
             stats["commands_issued"] += 1
 
             position_errs_abs.append(abs(position_error))
@@ -1302,39 +1302,46 @@ def move_to_ff(
                 err_az = ref_az.pos - az_tracker.cum_az_deg
             else:
                 err_az = wrap_pm180(ref_az.pos - measured_az)
-            v_corr_az = max(-v_corr_max, min(v_corr_max, kp_pos * err_az))
-            v_ff_az = ref_az.vel + VC_TAU_S * ref_az.acc
-            v_cmd_az = v_ff_az + v_corr_az
 
-            # El reference + feedforward + feedback.
+            # El reference + error.
             t_el = max(0.0, min(t_plant, traj_el.total_duration))
             ref_el = traj_el.sample(t_el)
             err_el = ref_el.pos - measured_alt
-            v_corr_el = max(-v_corr_max, min(v_corr_max, kp_pos * err_el))
-            v_ff_el = ref_el.vel + VC_TAU_S * ref_el.acc
-            v_cmd_el = v_ff_el + v_corr_el
 
-            # Clamp each axis independently at v_max. The firmware clamps
-            # per-axis at speed=1440 internally, so the total speed CAN exceed
-            # 1440 for diagonal moves (e.g. speed=2036 at angle=45° gives each
-            # axis its full 6°/s). We mirror that here by clamping per-axis
-            # rather than the magnitude.
-            v_cmd_az = max(-MAIN_RATE_DEGS, min(MAIN_RATE_DEGS, v_cmd_az))
-            v_cmd_el = max(-MAIN_RATE_DEGS, min(MAIN_RATE_DEGS, v_cmd_el))
-            v_mag = math.sqrt(v_cmd_az * v_cmd_az + v_cmd_el * v_cmd_el)
+            # Shared FF+FB control law + quantization (device.servo_core).
+            # 2-axis vector form: clamp EACH axis independently at
+            # MAIN_RATE_DEGS. The firmware clamps per-axis at speed=1440
+            # internally, so the total speed CAN exceed 1440 for diagonal moves
+            # (e.g. speed=2036 at angle=45° gives each axis its full 6°/s); we
+            # mirror that by clamping per-axis rather than the magnitude.
+            # Magnitude via sum-of-squares, angle via round(deg(atan2))%360;
+            # fine floor keeps the angle.
+            cmd, diag = servo_tick(
+                ref_vel_az=ref_az.vel,
+                ref_acc_az=ref_az.acc,
+                err_az=err_az,
+                ref_vel_el=ref_el.vel,
+                ref_acc_el=ref_el.acc,
+                err_el=err_el,
+                kp_pos=kp_pos,
+                v_corr_max=v_corr_max,
+                tau_s=VC_TAU_S,
+                v_limit=MAIN_RATE_DEGS,
+                axis_mode=AxisMode.VECTOR,
+                angle_conv=AngleConv.SIGNED_MOD360,
+                mag_fn=MagFn.SUMSQ,
+                fine_min_speed=VC_FINE_MIN_SPEED,
+                dur_sec=VC_CMD_DUR_S,
+            )
+            v_ff_az = diag.v_ff_az
+            v_ff_el = diag.v_ff_el
+            v_cmd_az = diag.v_cmd_az
+            v_cmd_el = diag.v_cmd_el
+            v_mag = diag.v_mag
+            speed_cmd = cmd.speed
+            angle_cmd = cmd.angle
 
-            if v_mag < 1e-6:
-                speed_cmd = 0
-                angle_cmd = 0
-            else:
-                speed_cmd = _rate_to_speed(v_mag)
-                if speed_cmd < VC_FINE_MIN_SPEED:
-                    speed_cmd = 0
-                angle_cmd = (
-                    int(round(math.degrees(math.atan2(v_cmd_el, v_cmd_az)))) % 360
-                )
-
-            speed_move(cli, speed_cmd, angle_cmd, VC_CMD_DUR_S)
+            speed_move(cli, speed_cmd, angle_cmd, cmd.dur_sec)
             stats["commands_issued"] += 1
 
             if abs(err_az) > stats["max_pos_err_az_deg"]:

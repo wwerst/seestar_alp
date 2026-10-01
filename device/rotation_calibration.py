@@ -47,6 +47,7 @@ from device.calibration_targets import (
     PlateSolveOutcome,
     TargetKind,
 )
+from device.mount_client import get_mount_client
 from device.target_frame import MountFrame
 from scripts.trajectory.faa_dof import Landmark
 from scripts.trajectory.observer import ObserverSite, haversine_m
@@ -1267,14 +1268,16 @@ class CalibrationSession:
                         pass
 
     def _connect_mount(self):
-        """Import lazily so unit tests that stub AlpacaClient via the
-        module-level symbol pick up the stub without a prior import
-        side-effect."""
-        from device.alpaca_client import AlpacaClient
-        from device.config import Config
-
-        port = self._alpaca_port if self._alpaca_port is not None else int(Config.port)
-        cli = AlpacaClient(self._alpaca_host, port, self.telescope_id)
+        # In-process when this telescope is registered+connected here (skips
+        # the per-tick localhost HTTP round-trip in the jog/move loops); HTTP
+        # fallback otherwise. Behaviour-identical, and the factory does the
+        # same _alpaca_port-or-Config.port defaulting AlpacaClient did here.
+        # See device.mount_client.
+        cli = get_mount_client(
+            self.telescope_id,
+            host=self._alpaca_host,
+            port=self._alpaca_port,
+        )
         if self.dry_run:
             return cli
         try:

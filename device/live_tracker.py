@@ -33,9 +33,9 @@ import numpy as np
 import requests
 from astropy.coordinates import EarthLocation
 
-from device.alpaca_client import AlpacaClient
 from device.config import Config
 from device.geometry import unwrap_az_series
+from device.mount_client import get_mount_client
 from device.plant_limits import AzimuthLimits, CumulativeAzTracker
 from device.reference_provider import (
     DEFAULT_EXTRAPOLATION_S,
@@ -1387,7 +1387,15 @@ class LiveTrackSession:
         return False
 
     def _run(self) -> None:
-        cli = AlpacaClient(self._alpaca_host, self._alpaca_port, self.telescope_id)
+        # In-process when this telescope is registered+connected here (skips
+        # the per-tick localhost HTTP round-trip in the FF/FB servo loop);
+        # HTTP fallback otherwise. Behaviour-identical — see
+        # device.mount_client.
+        cli = get_mount_client(
+            self.telescope_id,
+            host=self._alpaca_host,
+            port=self._alpaca_port,
+        )
         site = build_site()
         loc = EarthLocation.from_geodetic(
             lon=site.lon_deg,

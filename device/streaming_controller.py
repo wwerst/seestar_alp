@@ -35,10 +35,10 @@ from astropy.coordinates import EarthLocation
 
 from device.plant_limits import AzimuthLimits, CumulativeAzTracker
 from device.reference_provider import ReferenceProvider
+from device.servo_core import AngleConv, AxisMode, MagFn, servo_tick
 from device.sun_safety import SunSafetyLocked, is_sun_safe as _is_sun_safe
 from device.velocity_controller import (
     MAIN_RATE_DEGS,
-    SPEED_PER_DEG_PER_SEC,
     VC_TAU_S,
     MountClient,
     measure_altaz_timed,
@@ -520,23 +520,45 @@ def track(
 
             # 3. Controller math. Apply the start-of-track anchor offset +
             #    user bias so the mount tracks deltas regardless of its
-            #    arbitrary encoder origin.
+            #    arbitrary encoder origin, then the shared FF+FB law +
+            #    quantization (device.servo_core). 2-axis VECTOR form: per-axis
+            #    clamp at v_max, magnitude via hypot, angle via the
+            #    round((deg(atan2)+360)%360) convention, and NO fine-speed floor
+            #    (the streaming loop issues only speed>0 commands — see step 6).
             eff_ref_az = ref.az_cum_deg + az_offset + d_az
             eff_ref_el = ref.el_deg + el_offset + d_el
             err_az = eff_ref_az - cur_cum_az
             err_el = eff_ref_el - cur_el
-            v_corr_az = _clip_scalar(kp_pos * err_az, -v_corr_max, v_corr_max)
-            v_corr_el = _clip_scalar(kp_pos * err_el, -v_corr_max, v_corr_max)
-            v_ff_az = ref.v_az_degs + tau_s * ref.a_az_degs2
-            v_ff_el = ref.v_el_degs + tau_s * ref.a_el_degs2
-            raw_az = v_ff_az + v_corr_az
-            raw_el = v_ff_el + v_corr_el
-            if abs(raw_az) > v_max:
+            cmd, diag = servo_tick(
+                ref_vel_az=ref.v_az_degs,
+                ref_acc_az=ref.a_az_degs2,
+                err_az=err_az,
+                ref_vel_el=ref.v_el_degs,
+                ref_acc_el=ref.a_el_degs2,
+                err_el=err_el,
+                kp_pos=kp_pos,
+                v_corr_max=v_corr_max,
+                tau_s=tau_s,
+                v_limit=v_max,
+                axis_mode=AxisMode.VECTOR,
+                angle_conv=AngleConv.POS_ADD360_MOD,
+                mag_fn=MagFn.HYPOT,
+                fine_min_speed=None,
+                dur_sec=TICK_CMD_DUR_S,
+            )
+            v_corr_az = diag.v_corr_az
+            v_corr_el = diag.v_corr_el
+            v_ff_az = diag.v_ff_az
+            v_ff_el = diag.v_ff_el
+            v_cmd_az = diag.v_cmd_az
+            v_cmd_el = diag.v_cmd_el
+            # Saturation counters use the pre-clamp command (abs(raw) > v_max),
+            # tallied before the cable-wrap / sun gates below just as the
+            # open-coded law did.
+            if diag.sat_az:
                 sat_az += 1
-            if abs(raw_el) > v_max:
+            if diag.sat_el:
                 sat_el += 1
-            v_cmd_az = _clip_scalar(raw_az, -v_max, v_max)
-            v_cmd_el = _clip_scalar(raw_el, -v_max, v_max)
 
             # 4. Cable-wrap runtime check (compare current cum_az, not command).
             if az_limits is not None and not az_limits.contains_cum(cur_cum_az):
@@ -575,16 +597,9 @@ def track(
                 errors.append(sun_reason)
                 break
 
-            # 5. Compose firmware command.
-            v_mag = float(np.hypot(v_cmd_az, v_cmd_el))
-            speed = int(round(v_mag * SPEED_PER_DEG_PER_SEC))
-            if v_mag > 1e-6:
-                angle = int(
-                    round((np.degrees(np.arctan2(v_cmd_el, v_cmd_az)) + 360.0) % 360.0)
-                )
-            else:
-                angle = 0
-                speed = 0
+            # 5. Firmware command (computed by servo_tick above).
+            speed = cmd.speed
+            angle = cmd.angle
 
             # 6. Issue and log.
             if not dry_run and speed > 0:
@@ -698,14 +713,6 @@ def track(
 
 
 # ---------- helpers ---------------------------------------------------
-
-
-def _clip_scalar(x: float, lo: float, hi: float) -> float:
-    if x < lo:
-        return lo
-    if x > hi:
-        return hi
-    return x
 
 
 def _mount_azel_to_sky(

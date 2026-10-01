@@ -86,8 +86,12 @@ def _install_fakes(monkeypatch, cli: _FakeCli, *, neutralise_sun=False):
     """
     import device.rotation_calibration as rc
 
+    # Patch the factory the session acquires its client through. Patching
+    # here (rather than the AlpacaClient fallback) keeps the stub in force
+    # regardless of whether a live Seestar object is registered in
+    # device.telescope.seestar_dev by another test in the same process.
     monkeypatch.setattr(
-        "device.alpaca_client.AlpacaClient",
+        "device.rotation_calibration.get_mount_client",
         lambda *a, **kw: cli,
     )
 
@@ -530,7 +534,7 @@ def test_manager_refuses_while_tracker_running(monkeypatch, tmp_path):
     import device.live_tracker as lt
 
     monkeypatch.setattr(lt, "_MANAGER", tracker_mgr)
-    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: cli)
+    monkeypatch.setattr(lt, "get_mount_client", lambda *a, **kw: cli)
     tracker_mgr.start(tracker)
     try:
         cal_mgr = CalibrationManager()

@@ -88,6 +88,18 @@ jog_speed = 1440
 # 6s × 6°/s ≈ 36° single-shot exit against a 30° cone + 5° safety margin.
 jog_duration_s = 6
 
+[mount_client]
+# Transport for the servo control loops (live-tracking, calibrate-motion,
+# rotation-calibration). By default the control loop talks to the mount
+# in-process when the telescope is registered and connected in this
+# process, skipping the localhost Alpaca HTTP round-trip it otherwise pays
+# on every servo tick. The choice is behaviour-identical — the HTTP path is
+# a pure identity transform on the RPC payload. Set force_http = true to
+# always use the HTTP transport instead (escape hatch for debugging or if a
+# transport-specific issue is ever suspected). Default false (in-process
+# when available).
+force_http = false
+
 [logging]
 log_level = 'INFO'   #'WARN' only if trouble    #'INFO' to output more logging      #'DEBUG' still more output
 log_prefix = ''
