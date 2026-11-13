@@ -40,6 +40,9 @@ async def read_settings_tool(telescope_id: int = 1) -> dict[str, Any]:
         result = await call(telescope_id, factory)
         if _is_error(result):
             errors[key] = result["error"]
+        elif (rejection := _inline_rejection(result)) is not None:
+            # firmware without this method answers with an inline error envelope
+            errors[key] = rejection
         else:
             out[key] = result
     if errors:
