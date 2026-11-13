@@ -131,4 +131,10 @@ def build_config_toml(
             "device_num": 1,
         }
     ]
+    if target.kind == "emulator":
+        # The emulator has no real sun: the sun-safety monitor would poll it
+        # and could jog it or refuse gotos depending on the wall-clock time,
+        # making the emulator lanes flaky. A real scope keeps the default
+        # (enabled) sun avoidance; never disable it there.
+        doc["sun_avoidance"] = {"enabled": False}
     return tomlkit.dumps(doc)

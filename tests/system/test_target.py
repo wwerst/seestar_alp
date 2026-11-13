@@ -83,3 +83,40 @@ def test_build_config_toml_produces_parseable_toml_with_expected_fields(tmp_path
     assert doc["seestar_initialization"]["interop_pem"] == str(tmp_path / "key.pem")
     assert doc["seestars"][0]["ip_address"] == "127.0.0.1"
     assert doc["seestars"][0]["device_num"] == 1
+
+
+def _target(kind, tmp_path):
+    return SystemTestTarget(
+        kind=kind,
+        host="127.0.0.1",
+        pem_path=str(tmp_path / "key.pem"),
+        goto_target_name="Vega",
+        goto_ra="279.2347",
+        goto_dec="38.7836",
+        capture_duration_s=120,
+        renderer_shared_dir=None,
+    )
+
+
+def test_build_config_toml_disables_sun_avoidance_for_emulator(tmp_path):
+    text = build_config_toml(
+        _target("emulator", tmp_path),
+        frontend="v2",
+        uiport=15432,
+        imgport=17556,
+        alpaca_port=15555,
+    )
+    doc = tomlkit.parse(text)
+    assert doc["sun_avoidance"]["enabled"] is False
+
+
+def test_build_config_toml_keeps_sun_avoidance_default_for_real_scope(tmp_path):
+    text = build_config_toml(
+        _target("real", tmp_path),
+        frontend="v2",
+        uiport=15432,
+        imgport=17556,
+        alpaca_port=15555,
+    )
+    doc = tomlkit.parse(text)
+    assert "sun_avoidance" not in doc

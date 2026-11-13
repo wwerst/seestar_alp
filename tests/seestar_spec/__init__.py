@@ -19,7 +19,11 @@ METHODS = CATALOG["methods"]
 # AGENTS.md requires keeping these compatibility fallbacks, so they are
 # accepted by name and their params are not checked.
 LEGACY_COMPAT_METHODS = frozenset(
-    {"get_stack_setting", "set_stack_setting", "set_stack_settings"}
+    {
+        "get_stack_setting",
+        "set_stack_setting",
+        "set_stack_settings",
+    }
 )
 
 

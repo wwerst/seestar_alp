@@ -21,9 +21,12 @@ SCANNED = ["device", "front", "lib", "cli/ssalp_api_client", "mcp/seestar_mcp"]
 
 # Helpers whose first positional argument is a firmware method name, and
 # where their params come from: a "params" keyword, or a positional index.
+# method_sync/method_async accept both: front/app.py passes params=...; the
+# fork's AlpacaClient / MountClient callers (velocity controller, live
+# tracker, calibration) pass method_sync(method, params) positionally.
 METHOD_HELPERS = {
-    "method_sync": {"keyword": "params"},
-    "method_async": {"keyword": "params"},
+    "method_sync": {"keyword": "params", "positional": 1},
+    "method_async": {"keyword": "params", "positional": 1},
     "json_message": {},
     "_auth_rpc_sync": {"positional": 1},
 }
@@ -59,7 +62,9 @@ def _literal(node):
 
 def _requests_in(path):
     rel = path.relative_to(ROOT).as_posix()
-    tree = ast.parse(path.read_text(), filename=str(path))
+    # utf-8 explicitly: the platform default (cp1252 on Windows) cannot decode
+    # the non-ASCII comments in some scanned files.
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
             value = _literal(node)
@@ -93,7 +98,18 @@ def _requests_in(path):
                 for kw in node.keywords:
                     if kw.arg == how["keyword"]:
                         request["params"] = _literal(kw.value)
-            elif "positional" in how and len(node.args) > how["positional"]:
+            # Positional params only on a client method call (cli.method_sync(
+            # method, params)); front/app.py's bare method_sync(method,
+            # telescope_id, **kwargs) has the telescope id in that slot.
+            positional_ok = name not in ("method_sync", "method_async") or (
+                isinstance(func, ast.Attribute)
+            )
+            if (
+                "params" not in request
+                and positional_ok
+                and "positional" in how
+                and len(node.args) > how["positional"]
+            ):
                 request["params"] = _literal(node.args[how["positional"]])
             yield f"{rel}:{node.lineno}", request
 
@@ -110,6 +126,23 @@ def _all_requests():
 
 ALL_REQUESTS = _all_requests()
 
+# Fork-only methods that are not in seestar-spec, exempted only at the source
+# files known to send them (files, not line numbers, which drift). This is
+# deliberately narrower than tests.seestar_spec.LEGACY_COMPAT_METHODS, which
+# exempts a method everywhere, including the integration lane's run-time check.
+KNOWN_OFF_SPEC = {
+    # Sent by the unified calibration capture thunk
+    # (front/app.py _calibration_capture_image_fn), used only when a plate
+    # solver is configured. Unverified on firmware 9.75 (it may not exist on
+    # any firmware); the spec has no equivalent single-frame capture method.
+    "iscope_capture_image": frozenset({"front/app.py"}),
+}
+
+
+def _is_known_off_spec(where, request_):
+    path = where.rsplit(":", 1)[0]
+    return path in KNOWN_OFF_SPEC.get(request_["method"], ())
+
 
 def test_scan_finds_requests():
     # Guards against the scanner silently matching nothing after a refactor.
@@ -118,8 +151,24 @@ def test_scan_finds_requests():
     assert len(ALL_REQUESTS) > 150
 
 
+@pytest.mark.parametrize("method", sorted(KNOWN_OFF_SPEC))
+def test_known_off_spec_exemption_still_needed(method):
+    # Keeps KNOWN_OFF_SPEC from rotting: drop an entry once the method joins
+    # seestar-spec, or once a listed file stops sending it.
+    assert validate_request({"method": method}) == [
+        f"method {method!r} is not in seestar-spec"
+    ]
+    senders = {w.rsplit(":", 1)[0] for w, r in ALL_REQUESTS if r["method"] == method}
+    assert KNOWN_OFF_SPEC[method] <= senders, (
+        f"{method} is no longer sent from "
+        f"{sorted(KNOWN_OFF_SPEC[method] - senders)}; remove the exemption"
+    )
+
+
 @pytest.mark.parametrize(
     "where,request_", ALL_REQUESTS, ids=[w for w, _ in ALL_REQUESTS]
 )
 def test_literal_request_matches_spec(where, request_):
+    if _is_known_off_spec(where, request_):
+        pytest.skip(f"known off-spec fork method {request_['method']!r}")
     assert validate_request(request_) == []
