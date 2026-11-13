@@ -29,6 +29,18 @@ class DummyLogger:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _pin_site_unset(monkeypatch):
+    """Pin the observer site to the unset 0/0 pair for every test here.
+
+    With no start-up frame and no configured site, the goto sun pre-flight
+    falls through, so tests that run a real goto never depend on where the
+    real sun is. Sun pre-flight tests set the frame or site explicitly.
+    """
+    monkeypatch.setattr(Config, "init_lat", 0, raising=False)
+    monkeypatch.setattr(Config, "init_long", 0, raising=False)
+
+
 @pytest.fixture
 def seestar():
     return Seestar(DummyLogger(), "127.0.0.1", 4700, "TestScope", 1, True)
@@ -318,6 +330,11 @@ def test_stop_scheduler_transitions_and_calls_ops(seestar):
     assert called == {"slew": 1, "stack": 1, "sound": 1}
 
 
+# Stand-in for the EarthLocation start-up caches; tests that stub
+# get_altaz_from_eq only need the "frame present" branch of the pre-flight.
+_STARTUP_FRAME = object()
+
+
 def test_slew_to_ra_dec_refuses_inside_sun_cone(monkeypatch, seestar):
     """Spec: _slew_to_ra_dec converts (ra, dec) to sky (az, alt) and
     refuses (returns False, no scope_goto sent) when the target is
@@ -325,6 +342,7 @@ def test_slew_to_ra_dec_refuses_inside_sun_cone(monkeypatch, seestar):
     from device import sun_safety as ss
 
     # Have the method's altaz conversion return a concrete (alt, az).
+    seestar.site_altaz_frame = _STARTUP_FRAME
     seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
     # Force is_sun_safe to refuse.
     monkeypatch.setattr(
@@ -351,6 +369,7 @@ def test_slew_to_ra_dec_proceeds_when_altaz_conversion_unavailable(
     up yet), the pre-flight check falls through and the slew still
     goes out — the SunSafetyMonitor is the runtime backstop."""
     # Sentinel return from get_altaz_from_eq.
+    seestar.site_altaz_frame = _STARTUP_FRAME
     seestar.get_altaz_from_eq = lambda *_a, **_kw: [9999.9, 9999.9]
     seestar.mark_op_state = lambda *_a, **_kw: None
     seestar.wait_end_op = lambda *_a, **_kw: True
@@ -375,6 +394,7 @@ def test_slew_to_ra_dec_refuses_when_altaz_conversion_raises(seestar):
     def _boom(*_a, **_kw):
         raise RuntimeError("astropy transform exploded")
 
+    seestar.site_altaz_frame = _STARTUP_FRAME
     seestar.get_altaz_from_eq = _boom
     seestar.mark_op_state = lambda *_a, **_kw: None
     seestar.wait_end_op = lambda *_a, **_kw: True
@@ -394,6 +414,7 @@ def test_slew_to_ra_dec_refuses_when_is_sun_safe_raises(monkeypatch, seestar):
     a bad config) must refuse the slew, not fall through."""
     from device import sun_safety as ss
 
+    seestar.site_altaz_frame = _STARTUP_FRAME
     seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
 
     def _boom(*_a, **_kw):
@@ -444,6 +465,213 @@ def test_goto_target_sends_expected_request(monkeypatch, seestar):
     assert req["method"] == "iscope_start_view"
     assert req["params"]["target_ra_dec"] == [1.5, 22.25]
     assert req["params"]["target_name"] == "M42"
+
+
+def _goto_target_sun_preflight(monkeypatch, seestar):
+    """Wire goto_target with a fixed parsed coordinate; return the sent list.
+
+    Uses the real mark_op_state so the AutoGoto state can be checked, and
+    marks the start-up site frame as present."""
+
+    class FakeCoord:
+        ra = SimpleNamespace(hour=5.0)
+        dec = SimpleNamespace(deg=30.0)
+
+    seestar.site_altaz_frame = _STARTUP_FRAME
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+    monkeypatch.setattr(
+        "device.seestar_device.Util.parse_coordinate", lambda *args, **kwargs: FakeCoord
+    )
+    return sent
+
+
+_GOTO_PARAMS = {"is_j2000": False, "ra": 5.0, "dec": 30.0, "target_name": "x"}
+
+
+def test_goto_target_refuses_inside_sun_cone(monkeypatch, seestar):
+    """goto_target (web UI / ASCOM slews) runs the same sun pre-flight as
+    _slew_to_ra_dec: no iscope_start_view when the target is in the cone, and
+    the AutoGoto start it marked is undone so the next goto is accepted."""
+    from device import sun_safety as ss
+
+    sent = _goto_target_sun_preflight(monkeypatch, seestar)
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
+    monkeypatch.setattr(
+        ss, "is_sun_safe", lambda *a, **kw: (False, "sun_avoidance: forced by test")
+    )
+
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is False
+    assert sent == [], "iscope_start_view must not be sent when sun-safety refuses"
+    assert seestar.is_goto() is False
+
+
+def test_goto_target_refuses_when_altaz_conversion_raises(monkeypatch, seestar):
+    sent = _goto_target_sun_preflight(monkeypatch, seestar)
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("astropy transform exploded")
+
+    seestar.get_altaz_from_eq = _boom
+
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is False
+    assert sent == []
+    assert seestar.is_goto() is False
+
+
+def test_goto_target_refuses_when_is_sun_safe_raises(monkeypatch, seestar):
+    from device import sun_safety as ss
+
+    sent = _goto_target_sun_preflight(monkeypatch, seestar)
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("ephem exploded")
+
+    monkeypatch.setattr(ss, "is_sun_safe", _boom)
+
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is False
+    assert sent == []
+
+
+def test_goto_target_proceeds_when_sun_safe_or_frame_not_ready(monkeypatch, seestar):
+    from device import sun_safety as ss
+
+    sent = _goto_target_sun_preflight(monkeypatch, seestar)
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
+    monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **kw: (True, ""))
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is True
+    assert [p["method"] for p in sent] == ["iscope_start_view"]
+
+    # 9999.9 sentinel (astropy frame not ready): falls through, as in
+    # _slew_to_ra_dec.
+    sent.clear()
+    seestar.mark_goto_status_as_stopped()
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [9999.9, 9999.9]
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is True
+    assert [p["method"] for p in sent] == ["iscope_start_view"]
+
+
+# June solstice noon at Greenwich: the sun is ~62 deg up in the south, at
+# roughly RA 6h / Dec +23.4 (JNow). The opposite point (RA 18h / Dec -23.4)
+# is below the horizon, ~180 deg from the sun.
+_SOLSTICE_NOON = "2026-06-21T12:00:00"
+_SUN_RADEC = (6.0, 23.4)
+_ANTI_SUN_RADEC = (18.0, -23.4)
+
+
+@pytest.fixture
+def no_startup_frame_site(monkeypatch, seestar):
+    """No start-up frame, site configured in Config, clock frozen at noon.
+
+    Runs the real astropy conversion and the real is_sun_safe, both pinned
+    to _SOLSTICE_NOON so the result never depends on the real sun. Returns
+    the list of (az, alt, safe) results is_sun_safe produced.
+    """
+    from datetime import datetime, timezone
+
+    from astropy.time import Time
+    from astropy.utils import iers
+
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(iers.conf, "auto_download", False)
+    monkeypatch.setattr(Config, "init_lat", 51.48)
+    monkeypatch.setattr(Config, "init_long", -0.01)
+    frozen = Time(_SOLSTICE_NOON, scale="utc")
+    monkeypatch.setattr(Time, "now", classmethod(lambda cls: frozen))
+    when = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+    real_is_sun_safe = ss.is_sun_safe
+    results = []
+
+    def _pinned(az, el, **kw):
+        out = real_is_sun_safe(az, el, when=when, **kw)
+        results.append((az, el, out[0]))
+        return out
+
+    monkeypatch.setattr(ss, "is_sun_safe", _pinned)
+    seestar.site_altaz_frame = None
+    seestar.mark_op_state = lambda *_a, **_kw: None
+    seestar.wait_end_op = lambda *_a, **_kw: True
+    return results
+
+
+def test_slew_refuses_sun_target_without_startup_frame(seestar, no_startup_frame_site):
+    """Start-up never ran but the site is configured: the frame is built
+    from Config on demand and a target at the sun is refused."""
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+
+    assert seestar._slew_to_ra_dec(list(_SUN_RADEC)) is False
+    assert sent == []
+    assert len(no_startup_frame_site) == 1
+    _az, alt, safe = no_startup_frame_site[0]
+    assert safe is False
+    assert 55.0 < alt < 70.0  # the real transform ran: target ~ sun altitude
+    # The on-demand site is not cached; start-up still owns site_altaz_frame.
+    assert seestar.site_altaz_frame is None
+
+
+def test_slew_allows_far_target_without_startup_frame(seestar, no_startup_frame_site):
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+
+    assert seestar._slew_to_ra_dec(list(_ANTI_SUN_RADEC)) is True
+    assert [p["method"] for p in sent] == ["scope_goto"]
+    assert len(no_startup_frame_site) == 1
+    assert no_startup_frame_site[0][2] is True
+
+
+def test_goto_target_refuses_sun_target_without_startup_frame(
+    seestar, no_startup_frame_site
+):
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+    params = {
+        "is_j2000": False,
+        "ra": _SUN_RADEC[0],
+        "dec": _SUN_RADEC[1],
+        "target_name": "sun",
+    }
+
+    assert seestar.goto_target(params) is False
+    assert sent == []
+    assert seestar.is_goto() is False
+    assert [r[2] for r in no_startup_frame_site] == [False]
+
+
+def test_slew_falls_through_without_startup_frame_or_site(monkeypatch, seestar):
+    """Compatibility: no start-up frame and the site unset (0/0) must not
+    block the goto; the check is skipped with a warning instead."""
+    from device import sun_safety as ss
+
+    warnings = []
+    seestar.logger.warning = lambda msg, *a, **_kw: warnings.append(msg % a)
+    seestar.site_altaz_frame = None
+    seestar.mark_op_state = lambda *_a, **_kw: None
+    seestar.wait_end_op = lambda *_a, **_kw: True
+
+    def _not_called(*_a, **_kw):
+        raise AssertionError("no altaz/sun check with the site unset")
+
+    seestar.get_altaz_from_eq = _not_called
+    monkeypatch.setattr(ss, "is_sun_safe", _not_called)
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+
+    assert seestar._slew_to_ra_dec(list(_SUN_RADEC)) is True
+    assert [p["method"] for p in sent] == ["scope_goto"]
+    assert any("location is not set" in w for w in warnings)
 
 
 def test_parse_dec_to_float_positive_and_negative(seestar):
@@ -4119,6 +4347,32 @@ def test_move_scope_falls_through_when_horiz_coord_unavailable(seestar):
         set_sun_monitor(prev)
 
 
+def test_move_scope_refuses_jog_whose_path_enters_sun_cone(monkeypatch, seestar):
+    """The current pointing is just outside the cone (sun at az 180 / alt 30,
+    mount at az 180 / el 65: 35° away). A full-speed jog toward the sun
+    (270° = -el, ~18° in 3 s) would enter the cone and is refused; the same
+    jog away from the sun (90° = +el) goes out."""
+    from device import sun_safety as ss
+    from device.sun_safety import get_sun_monitor, set_sun_monitor
+
+    monkeypatch.setattr(Config, "init_lat", 33.96)
+    monkeypatch.setattr(Config, "init_long", -118.46)
+    monkeypatch.setattr(ss, "compute_sun_altaz", lambda **_kw: (180.0, 30.0))
+    prev = get_sun_monitor()
+    set_sun_monitor(None)
+    sent = []
+    seestar.send_message_param_sync = _horiz_coord_sync(sent, alt=65.0, az=180.0)
+    try:
+        assert seestar.move_scope(270, 1440) is False
+        assert not any(p["method"] == "scope_speed_move" for p in sent)
+
+        sent.clear()
+        assert seestar.move_scope(90, 1440) is True
+        assert any(p["method"] == "scope_speed_move" for p in sent)
+    finally:
+        set_sun_monitor(prev)
+
+
 # --- P1: cmdid allocation is atomic under concurrent senders --------------
 
 
@@ -4220,6 +4474,8 @@ def test_move_scope_zero_speed_stop_passes_without_jog(seestar, monkeypatch):
     monkeypatch.setattr(ss, "sun_safety_is_locked_out", lambda: True)
     assert seestar.move_scope(0, 0, 1) is True
     assert sent and sent[0]["params"]["speed"] == 0
+
+
 # ---------------------------------------------------------------------------
 # start_stack – stack_type / set_stack_type
 # ---------------------------------------------------------------------------

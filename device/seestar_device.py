@@ -1412,15 +1412,21 @@ class Seestar:
             client_master = self.event_state["Client"].get("is_master", True)
         return client_master
 
-    def get_altaz_from_eq(self, in_ra, in_dec, obs_time):
-        if self.site_altaz_frame is None:
+    def get_altaz_from_eq(self, in_ra, in_dec, obs_time, location=None):
+        """(alt, az) in degrees for JNow (ra, dec) at ``obs_time``.
+
+        ``location`` overrides the cached ``site_altaz_frame`` (used by the
+        sun pre-flight when start-up has not run yet). With neither, returns
+        the [9999.9, 9999.9] "frame not ready" sentinel.
+        """
+        if location is None:
+            location = self.site_altaz_frame
+        if location is None:
             self.logger.warning("SCC has a rouge thread trying to call BPA error!")
             return [9999.9, 9999.9]
         radec = Util.parse_coordinate(is_j2000=False, in_ra=in_ra, in_dec=in_dec)
         # Convert RA/Dec to Alt/Az
-        altaz = radec.transform_to(
-            AltAz(obstime=obs_time, location=self.site_altaz_frame)
-        )
+        altaz = radec.transform_to(AltAz(obstime=obs_time, location=location))
         self.logger.info(f"coord in az-alt: {altaz.az.deg}, {altaz.alt.deg}")
         return [altaz.alt.deg, altaz.az.deg]
 
@@ -1686,6 +1692,13 @@ class Seestar:
             in_dec,
         )
 
+        # Pre-flight sun-avoidance check, same as _slew_to_ra_dec. On a
+        # refusal, undo the AutoGoto "start" marked above so is_goto()
+        # does not block the next goto.
+        if not self._radec_sun_safe(in_ra, in_dec, "goto_target"):
+            self.mark_goto_status_as_stopped()
+            return False
+
         data: MessageParams = {
             "method": "iscope_start_view",
             "params": {
@@ -1704,36 +1717,58 @@ class Seestar:
         result = self.send_message_param_sync(data)
         return "error" not in result
 
-    # {"method":"scope_goto","params":{"ra":1.2345,"dec":75.0}}
-    def _slew_to_ra_dec(self, params):
-        in_ra = params[0]
-        in_dec = params[1]
-        self.logger.info(f"slew to {in_ra}, {in_dec}")
+    def _radec_sun_safe(self, in_ra, in_dec, label="scope_goto") -> bool:
+        """Pre-flight sun-avoidance check for a goto to (ra, dec).
 
-        # Pre-flight sun-avoidance check. Convert (ra, dec) → sky
-        # (az, alt) via the already-wired astropy frame, then refuse
-        # if inside the sun cone.
-        #
-        # Fail-safe: any unexpected exception refuses the slew — better
-        # a false refusal than a sun-pointing slew. The only genuine
-        # fall-through is the [9999.9, 9999.9] sentinel from
-        # get_altaz_from_eq (signals the astropy frame has not yet been
-        # initialised during boot); during that window the
-        # SunSafetyMonitor is the runtime backstop. Mirrors the
-        # fail-safe pattern used by the other pre-flight sites
-        # (streaming_controller.track, live_tracker._auto_slew,
-        # rotation_calibration._slew_to_target, and the runtime
-        # velocity_controller.speed_move wrapper).
+        Converts (ra, dec) → sky (az, alt) via the already-wired astropy
+        frame and returns False (refuse) if the target is inside the sun
+        cone. ``label`` only names the caller in log lines.
+
+        Fail-safe: any unexpected exception refuses — better a false
+        refusal than a sun-pointing slew. When the start-up sequence has
+        not run (``site_altaz_frame`` is None) the site is built on demand
+        from Config.init_lat / init_long, so the check still runs. The only
+        genuine fall-through is a truly unset site (the 0/0 sentinel) or
+        the [9999.9, 9999.9] sentinel from get_altaz_from_eq; the
+        SunSafetyMonitor is then the runtime backstop. Mirrors the
+        fail-safe pattern used by the other pre-flight sites
+        (streaming_controller.track, live_tracker._auto_slew,
+        rotation_calibration._slew_to_target, and the runtime
+        velocity_controller.speed_move wrapper).
+        """
         try:
             from astropy.time import Time as _AstropyTime
 
-            alt_az = self.get_altaz_from_eq(in_ra, in_dec, _AstropyTime.now())
+            altaz_kwargs = {}
+            if self.site_altaz_frame is None:
+                from device.sun_safety import _location_is_unset
+
+                lat = float(Config.init_lat)
+                lon = float(Config.init_long)
+                if _location_is_unset(lat, lon):
+                    # Compatibility: no site configured, so do not block the
+                    # goto; the SunSafetyMonitor is the runtime backstop.
+                    self.logger.warning(
+                        "%s sun pre-flight skipped: observer location is not "
+                        "set (lat/long = 0,0) and start-up has not run; set "
+                        "your site location to enable the sun check",
+                        label,
+                    )
+                    return True
+                altaz_kwargs["location"] = EarthLocation(
+                    lat=lat * u.deg, lon=lon * u.deg, height=10 * u.m
+                )
+
+            alt_az = self.get_altaz_from_eq(
+                in_ra, in_dec, _AstropyTime.now(), **altaz_kwargs
+            )
             alt_deg = float(alt_az[0])
             az_deg = float(alt_az[1])
         except Exception as exc:
             self.logger.warning(
-                "scope_goto refused (ra=%s dec=%s): sun-safety pre-flight "
+                "%s refused (ra=%s dec=%s): sun-safety pre-flight "
                 "failed to compute altaz: %s",
+                label,
                 in_ra,
                 in_dec,
                 exc,
@@ -1743,34 +1778,47 @@ class Seestar:
             # 9999.9 sentinel: astropy frame not yet initialised. The
             # SunSafetyMonitor is the runtime backstop in this window.
             self.logger.info(
-                "scope_goto sun pre-flight skipped (astropy frame not ready)"
+                "%s sun pre-flight skipped (astropy frame not ready)", label
             )
-        else:
-            try:
-                from device.sun_safety import is_sun_safe as _is_sun_safe
+            return True
+        try:
+            from device.sun_safety import is_sun_safe as _is_sun_safe
 
-                sun_safe, sun_reason = _is_sun_safe(az_deg % 360.0, alt_deg)
-            except Exception as exc:
-                self.logger.warning(
-                    "scope_goto refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): "
-                    "is_sun_safe raised: %s",
-                    in_ra,
-                    in_dec,
-                    az_deg,
-                    alt_deg,
-                    exc,
-                )
-                return False
-            if not sun_safe:
-                self.logger.warning(
-                    "scope_goto refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): %s",
-                    in_ra,
-                    in_dec,
-                    az_deg,
-                    alt_deg,
-                    sun_reason,
-                )
-                return False
+            sun_safe, sun_reason = _is_sun_safe(az_deg % 360.0, alt_deg)
+        except Exception as exc:
+            self.logger.warning(
+                "%s refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): "
+                "is_sun_safe raised: %s",
+                label,
+                in_ra,
+                in_dec,
+                az_deg,
+                alt_deg,
+                exc,
+            )
+            return False
+        if not sun_safe:
+            self.logger.warning(
+                "%s refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): %s",
+                label,
+                in_ra,
+                in_dec,
+                az_deg,
+                alt_deg,
+                sun_reason,
+            )
+            return False
+        return True
+
+    # {"method":"scope_goto","params":{"ra":1.2345,"dec":75.0}}
+    def _slew_to_ra_dec(self, params):
+        in_ra = params[0]
+        in_dec = params[1]
+        self.logger.info(f"slew to {in_ra}, {in_dec}")
+
+        # Pre-flight sun-avoidance check (see _radec_sun_safe).
+        if not self._radec_sun_safe(in_ra, in_dec, "scope_goto"):
+            return False
 
         data: MessageParams = {
             "method": "scope_goto",
@@ -1815,11 +1863,15 @@ class Seestar:
         }
         return self.send_message_param_sync(data)
 
-    def _move_scope_sun_safe(self) -> bool:
+    def _move_scope_sun_safe(self, angle=None, speed=None, dur=None) -> bool:
         """Pre-flight sun-avoidance for manual (ASCOM MoveAxis) jogs.
 
         Reads the current encoder pointing (`scope_get_horiz_coord`) and
-        refuses the move when it lies inside the sun cone. Encoder (az, el)
+        refuses the move when it lies inside the sun cone. When the jog's
+        ``angle`` and ``speed`` are given (``dur`` defaults to 3 s), it also
+        forward-simulates the jog (`sun_safety.jog_path_points`, the same
+        model as `compute_jog_angle`) and refuses when any point of the path
+        enters the cone; a path that cannot be computed refuses. Encoder (az, el)
         approximates sky (az, el): exact after rotation calibration,
         conservative otherwise — the same convention as the other pre-flight
         sites (`_slew_to_ra_dec`, `live_tracker._pre_slew`). Returns True to
@@ -1859,6 +1911,41 @@ class Seestar:
                 sun_reason,
             )
             return False
+        if angle is None or speed is None:
+            return True
+        try:
+            from device.sun_safety import jog_path_points, path_is_sun_safe
+
+            path = jog_path_points(
+                az_deg % 360.0,
+                alt_deg,
+                angle,
+                speed,
+                3 if dur is None else dur,
+            )
+            path_safe, path_reason = path_is_sun_safe(path)
+        except Exception as exc:
+            self.logger.warning(
+                "move_scope refused: jog path sun check failed "
+                "(angle=%s speed=%s dur=%s): %s",
+                angle,
+                speed,
+                dur,
+                exc,
+            )
+            return False
+        if not path_safe:
+            self.logger.warning(
+                "move_scope refused (az=%.1f° alt=%.1f°, angle=%s speed=%s "
+                "dur=%s): jog path enters the sun cone: %s",
+                az_deg,
+                alt_deg,
+                angle,
+                speed,
+                dur,
+                path_reason,
+            )
+            return False
         return True
 
     # {"method":"scope_speed_move","params":{"speed":1440,"angle":270,"dur_sec":10}}
@@ -1877,7 +1964,8 @@ class Seestar:
 
         # Sun-safety: refuse manual jogs while the SunSafetyMonitor holds the
         # emergency lockout (it owns the mount during an active jog-away), and
-        # refuse when the current pointing is inside the sun-avoidance cone.
+        # refuse when the current pointing, or the forward-simulated jog path,
+        # is inside the sun-avoidance cone.
         # The goto path (`_slew_to_ra_dec`) and the velocity_controller
         # speed_move wrapper apply the same guard. A stop (speed 0) normally
         # must always pass: refusing it would keep the motor running on the
@@ -1893,7 +1981,7 @@ class Seestar:
                     "Failed to move scope: sun-safety emergency lockout active."
                 )
                 return False
-            if not self._move_scope_sun_safe():
+            if not self._move_scope_sun_safe(in_angle, in_speed, in_dur):
                 return False
         else:
             # in_speed == 0 is a stop. While the SunSafetyMonitor's emergency

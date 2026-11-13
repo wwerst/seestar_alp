@@ -266,6 +266,35 @@ def test_command_put_endpoints_success_paths():
         assert payload["ErrorNumber"] == 0, responder.__name__
 
 
+def test_slew_endpoints_report_a_refused_goto():
+    """goto_target returns False when the sun-avoidance pre-flight (or a
+    goto already in progress) refuses the slew. The ASCOM slew endpoints
+    must surface that as an error, not report that the slew started."""
+    set_shr_logger(logging.getLogger("test-telescope-props"))
+    device_exceptions.logger = DummyLogger()
+    telescope.seestar_dev.clear()
+    device = FakeDevice()
+    device.goto_target = lambda payload: False
+    telescope.seestar_dev[1] = device
+
+    refused_cases = [
+        (telescope.slewtocoordinates, {"RightAscension": "1.5", "Declination": "2.5"}),
+        (
+            telescope.slewtocoordinatesasync,
+            {"RightAscension": "1.5", "Declination": "2.5"},
+        ),
+        (telescope.slewtotarget, {}),
+        (telescope.slewtotargetasync, {}),
+    ]
+    for responder, media in refused_cases:
+        req = DummyReq(method="PUT", extra_media=media)
+        resp = DummyResp()
+        responder().on_put(req, resp, devnum=1)
+        payload = json.loads(resp.text)
+        assert payload["ErrorNumber"] != 0, responder.__name__
+        assert "refused" in payload["ErrorMessage"].lower(), responder.__name__
+
+
 def test_command_put_endpoints_invalid_number_inputs():
     set_shr_logger(logging.getLogger("test-telescope-props"))
     device_exceptions.logger = DummyLogger()

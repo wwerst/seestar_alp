@@ -25,7 +25,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 import ephem
 
@@ -183,6 +183,107 @@ def is_sun_safe(
     return True, ""
 
 
+# Upper bound on the number of samples `sample_azel_segment` will produce.
+# A legitimate slew or jog is at most a few hundred degrees (a few hundred
+# samples at the default 2° step); anything beyond this is a bad input, and
+# raising lets callers fail closed instead of looping for a long time.
+_MAX_PATH_SAMPLES = 20000
+
+
+def sample_azel_segment(
+    start_az_deg: float,
+    start_el_deg: float,
+    d_az_deg: float,
+    d_el_deg: float,
+    *,
+    step_deg: float = 2.0,
+) -> list[tuple[float, float]]:
+    """Sample a straight (az, el) segment, endpoints included.
+
+    The segment starts at ``(start_az_deg, start_el_deg)`` and moves by the
+    SIGNED deltas ``d_az_deg`` / ``d_el_deg``, so the caller picks the
+    azimuth direction (e.g. the wrap-aware delta a trajectory planner
+    chose). Consecutive samples are at most ``step_deg`` apart in each
+    coordinate. Returned az is wrapped to [0, 360); el is clamped to
+    [-90, 90].
+
+    Pure helper: raises ``ValueError`` on a non-finite input, a
+    non-positive ``step_deg`` or an absurdly long segment, so a caller
+    doing a safety check can fail closed.
+    """
+    values = (
+        float(start_az_deg),
+        float(start_el_deg),
+        float(d_az_deg),
+        float(d_el_deg),
+        float(step_deg),
+    )
+    if not all(math.isfinite(v) for v in values):
+        raise ValueError(f"sample_azel_segment: non-finite input {values!r}")
+    az0, el0, d_az, d_el, step = values
+    if step <= 0.0:
+        raise ValueError(f"sample_azel_segment: step_deg must be > 0, got {step}")
+    n = max(1, int(math.ceil(max(abs(d_az), abs(d_el)) / step)))
+    if n > _MAX_PATH_SAMPLES:
+        raise ValueError(
+            f"sample_azel_segment: segment needs {n} samples "
+            f"(> {_MAX_PATH_SAMPLES}); refusing"
+        )
+    points: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        frac = i / n
+        az = (az0 + d_az * frac) % 360.0
+        el = max(-90.0, min(90.0, el0 + d_el * frac))
+        points.append((az, el))
+    return points
+
+
+def path_is_sun_safe(
+    points: Iterable[tuple[float, float]],
+    *,
+    lat_deg: Optional[float] = None,
+    lon_deg: Optional[float] = None,
+    when: Optional[datetime] = None,
+    min_separation_deg: float = DEFAULT_MIN_SEPARATION_DEG,
+    alt_threshold_deg: float = DEFAULT_ALT_THRESHOLD_DEG,
+) -> tuple[bool, str]:
+    """Return ``(safe, reason)`` for a whole path of sky ``(az_deg, alt_deg)``.
+
+    Same keyword parameters and return convention as :func:`is_sun_safe`,
+    which it calls for every point (so it fails CLOSED on an unset site the
+    same way, and propagates the same exceptions). The path is unsafe if
+    ANY point is unsafe; the reason names the first offending point.
+    ``when`` is pinned once (default UTC now) so every point is judged
+    against the same sun position.
+
+    Also fails closed (returns unsafe) on an empty path or a non-finite
+    point: there is nothing trustworthy to verify.
+    """
+    pts = list(points)
+    if not pts:
+        return False, "sun_avoidance: empty path; nothing to verify"
+    if when is None:
+        when = datetime.now(tz=timezone.utc)
+    for az, el in pts:
+        az_f = float(az)
+        el_f = float(el)
+        if not (math.isfinite(az_f) and math.isfinite(el_f)):
+            return False, f"sun_avoidance: non-finite path point ({az!r}, {el!r})"
+        safe, reason = is_sun_safe(
+            az_f % 360.0,
+            el_f,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+            when=when,
+            min_separation_deg=min_separation_deg,
+            alt_threshold_deg=alt_threshold_deg,
+        )
+        if not safe:
+            where = f"az={az_f % 360.0:.1f}° el={el_f:.1f}°"
+            return False, f"{reason} at path point {where}"
+    return True, ""
+
+
 class SunSafetyLocked(RuntimeError):
     """Raised by the speed_move wrapper while the emergency jog is in progress.
 
@@ -196,6 +297,37 @@ class SunSafetyLocked(RuntimeError):
 # Duplicated here so the monitor module has no import-time dependency on
 # the velocity controller (which pulls in astropy and other heavy deps).
 _SPEED_PER_DEG_PER_SEC = 237.0
+
+
+def jog_path_points(
+    az_deg: float,
+    el_deg: float,
+    angle_deg: float,
+    speed: float,
+    dur_s: float,
+    *,
+    step_deg: float = 2.0,
+) -> list[tuple[float, float]]:
+    """Forward-simulate one ``scope_speed_move`` burst as sampled (az, el) points.
+
+    Uses the same model as :func:`compute_jog_angle`: travel
+    ``speed / 237 * dur_s`` degrees along ``angle_deg`` (0° = +az,
+    90° = +el), starting at ``(az_deg, el_deg)``. Points come from
+    :func:`sample_azel_segment` (start and end included).
+
+    A negative travel (negative speed or duration) has no documented
+    firmware meaning, so the path in BOTH directions is returned; a safety
+    check over it is then conservative. Raises ``ValueError`` on bad input
+    (see :func:`sample_azel_segment`).
+    """
+    travel = float(speed) / _SPEED_PER_DEG_PER_SEC * float(dur_s)
+    rad = math.radians(float(angle_deg))
+    d_az = abs(travel) * math.cos(rad)
+    d_el = abs(travel) * math.sin(rad)
+    points = sample_azel_segment(az_deg, el_deg, d_az, d_el, step_deg=step_deg)
+    if travel < 0.0:
+        points += sample_azel_segment(az_deg, el_deg, -d_az, -d_el, step_deg=step_deg)
+    return points
 
 
 def compute_jog_angle(
@@ -309,7 +441,9 @@ class SunSafetyMonitor:
          picked by `compute_jog_angle` — issued FIRST so the mount leaves
          the cone immediately, before any slow teardown.
       3. Calls `abort_active()` to stop in-flight tracking/calibration
-         (which may join worker threads and take several seconds).
+         (which may join worker threads and take several seconds), then
+         re-issues the same jog once so no late session command can
+         supersede it.
       4. Sleeps for jog_duration_s + margin, then clears the lockout
          so the user can drive the mount again.
       5. Leaves `last_trip` populated until the UI POSTs dismiss.
@@ -581,6 +715,22 @@ class SunSafetyMonitor:
                         self._abort_active()
                     except Exception:
                         logger.exception("abort_active callback failed")
+                    # 3b. Re-issue the same jog once now that the sessions are
+                    #     gone. A session command that passed its lockout
+                    #     check just before the trip can reach the firmware
+                    #     AFTER the first jog and supersede it ("last
+                    #     scope_speed_move wins"); abort joins those threads,
+                    #     so this re-issue is the last motion command.
+                    with self._lock:
+                        self._jog_until_ts = time.time() + self._jog_duration_s + 0.5
+                    try:
+                        self._jog_command(
+                            self._jog_speed,
+                            jog_angle,
+                            self._jog_duration_s,
+                        )
+                    except Exception:
+                        logger.exception("post-abort jog_command raised")
                 # 4. Wait for the jog to complete, plus a small margin so any
                 #    caller that races back in can see us already done.
                 time.sleep(self._jog_duration_s + 0.5)
@@ -772,7 +922,10 @@ __all__ = [
     "compute_sun_altaz",
     "get_sun_monitor",
     "is_sun_safe",
+    "jog_path_points",
     "make_scope_altaz_reader",
+    "path_is_sun_safe",
+    "sample_azel_segment",
     "set_sun_monitor",
     "sun_safety_is_locked_out",
     "sun_safety_jog_in_progress",
