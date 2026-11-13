@@ -1160,6 +1160,21 @@
     });
     document.body.addEventListener("htmx:afterRequest", function (evt) {
       clearLoading(evt.detail.target);
+      // /auth-status answers 204 + HX-Reswap: none once auth is no longer
+      // needed, so htmx never swaps; clear a stale warning here instead.
+      // Only a successful 204 from the container's own poll clears it --
+      // network errors, timeouts and 5xx leave the content in place.
+      const target = evt.detail.target;
+      const xhr = evt.detail.xhr;
+      if (
+        target &&
+        target.id === "auth-warning-container" &&
+        evt.detail.successful &&
+        xhr &&
+        xhr.status === 204
+      ) {
+        target.replaceChildren();
+      }
     });
     document.body.addEventListener("htmx:responseError", function (evt) {
       clearLoading(evt.detail.target);

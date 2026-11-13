@@ -5541,3 +5541,54 @@ def test_settings_post_sends_only_valid_dither_values(
     )
 
     assert _sent_stack_dither(calls) == {"enable": True, **expected}
+
+
+def test_auth_warning_clears_on_204_from_its_own_poll():
+    """The auth-warning container polls /auth-status, which answers 204 +
+    HX-Reswap: none once auth is no longer needed. htmx never swaps a 204, so
+    base.html clears the container itself -- only on a successful 204 from
+    that container's own poll (errors, timeouts and 5xx keep the content)."""
+    context = _minimal_context("stats")
+    context["needs_auth_warning"] = True
+    context["flashed_messages"] = []
+    context["messages"] = []
+    context["version"] = "test"
+    context["now"] = "now"
+    html = front_app.fetch_template("base.html").render(**context)
+    container = re.search(r'<div id="auth-warning-container"[^>]*>', html)
+    assert container is not None
+    assert 'hx-get="/1/auth-status"' in container.group(0)
+    assert 'hx-swap="innerHTML"' in container.group(0)
+    assert "no-htmx-fx" in container.group(0)
+    handler = re.search(
+        r'addEventListener\("htmx:afterRequest", function \(evt\) \{(.*?)\n    \}\);',
+        html,
+        re.S,
+    )
+    assert handler is not None
+    body = handler.group(1)
+    assert 'target.id === "auth-warning-container"' in body
+    assert "evt.detail.successful" in body
+    assert "xhr.status === 204" in body
+    assert "target.replaceChildren()" in body
+    # No literal root path or root-path attribute in the inline script:
+    # upstream's byte-level root-path test only lets URL attributes change.
+    assert '="/' not in body
+    assert "data-root-path" not in body
+
+
+def test_auth_status_transition_warning_then_204(monkeypatch):
+    """While auth is needed the poll returns the warning (200, swapped); once
+    it succeeds the same endpoint returns 204 + HX-Reswap: none, which the
+    base.html handler turns into a clear."""
+    state = {"needs": True}
+    monkeypatch.setattr(front_app, "check_needs_auth", lambda _tid: state["needs"])
+    client = testing.TestClient(_auth_status_app())
+    first = client.simulate_get("/1/auth-status")
+    assert first.status_code == 200
+    assert "Authentication required" in first.text
+    state["needs"] = False
+    second = client.simulate_get("/1/auth-status")
+    assert second.status_code == 204
+    assert second.headers.get("hx-reswap") == "none"
+    assert second.text == ""

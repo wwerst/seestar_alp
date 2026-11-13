@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger("ssalp_api_client.commands.info")
 
@@ -123,5 +124,30 @@ class InfoMixin:
         return await self.method_sync("pi_get_time")
 
     async def pi_set_time(self, iso_time: str) -> dict:
+        """Set the scope clock from an ISO 8601 string.
+
+        Aware times are converted to UTC; naive times are taken as UTC. The
+        firmware wants a bare object with a zone name (the same shape the
+        device's start-up sequence sends), not a list: on firmware >= 2582 the
+        app appends "verify" to list params and the scope rejects it (107).
+        """
         logger.info("pi_set_time time=%s", iso_time)
-        return await self.method_sync("pi_set_time", [iso_time])
+        text = iso_time.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            when = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(f"Invalid ISO 8601 time: {iso_time!r}") from exc
+        if when.tzinfo is not None:
+            when = when.astimezone(timezone.utc)
+        params = {
+            "year": when.year,
+            "mon": when.month,
+            "day": when.day,
+            "hour": when.hour,
+            "min": when.minute,
+            "sec": when.second,
+            "time_zone": "Etc/UTC",
+        }
+        return await self.method_sync("pi_set_time", params)

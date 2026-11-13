@@ -156,6 +156,44 @@ class TestInfoMixinCoverage:
             httpx_mock, client.pi_set_time("2024-01-01T00:00:00Z"), "pi_set_time"
         )
 
+    @pytest.mark.parametrize(
+        "iso_time,expected",
+        [
+            ("2024-01-02T03:04:05Z", (2024, 1, 2, 3, 4, 5)),
+            ("2024-01-02T03:04:05+01:30", (2024, 1, 2, 1, 34, 5)),
+            ("2024-01-01T00:30:00+01:00", (2023, 12, 31, 23, 30, 0)),
+            ("2024-01-02T03:04:05", (2024, 1, 2, 3, 4, 5)),  # naive -> UTC
+        ],
+    )
+    async def test_pi_set_time_sends_bare_object(
+        self, client, httpx_mock, iso_time, expected
+    ):
+        # A list param gets "verify" appended on firmware >= 2582 and the scope
+        # rejects it (code 107); the device start-up sequence sends a bare dict.
+        from urllib.parse import parse_qs
+
+        _stub(httpx_mock)
+        await client.pi_set_time(iso_time)
+        form = parse_qs(_body(httpx_mock))
+        payload = json.loads(form["Parameters"][0])
+        assert payload["method"] == "pi_set_time"
+        params = payload["params"]
+        assert isinstance(params, dict)
+        year, mon, day, hour, minute, sec = expected
+        assert params == {
+            "year": year,
+            "mon": mon,
+            "day": day,
+            "hour": hour,
+            "min": minute,
+            "sec": sec,
+            "time_zone": "Etc/UTC",
+        }
+
+    async def test_pi_set_time_rejects_bad_string(self, client):
+        with pytest.raises(ValueError):
+            await client.pi_set_time("not a time")
+
 
 # ── SystemMixin ───────────────────────────────────────────────────────────
 
@@ -579,6 +617,28 @@ class TestScheduleMixinCoverage:
         await _check_action(
             httpx_mock, client.start_mosaic("M42", 1.0, 2.0, 3600), "start_mosaic"
         )
+
+    @pytest.mark.parametrize(
+        "ra_num,dec_num,expected", [(1, 1, 3600), (2, 2, 900), (3, 1, 1200)]
+    )
+    async def test_start_mosaic_sends_panel_time_sec(
+        self, client, httpx_mock, ra_num, dec_num, expected
+    ):
+        # The device treats a bare session_time_sec as PER-PANEL time, so the
+        # client must send panel_time_sec = session/panels (as schedule_mosaic).
+        from urllib.parse import parse_qs
+
+        _stub(httpx_mock)
+        await client.start_mosaic(
+            "M42", 1.0, 2.0, session_time_sec=3600, ra_num=ra_num, dec_num=dec_num
+        )
+        form = parse_qs(_body(httpx_mock))
+        assert form["Action"] == ["start_mosaic"]
+        params = json.loads(form["Parameters"][0])
+        assert "session_time_sec" not in params
+        assert params["panel_time_sec"] == expected
+        assert params["ra_num"] == ra_num
+        assert params["dec_num"] == dec_num
 
     async def test_start_spectra(self, client, httpx_mock):
         await _check_action(

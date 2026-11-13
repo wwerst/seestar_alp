@@ -44,6 +44,45 @@ async def test_read_settings_tolerates_setting_path_error(mock_client):
     assert "setting" not in out
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "method": "get_stack_setting",
+            "error": "unknown method",
+            "code": 102,
+            "id": 6,
+        },
+        {"code": 102},
+        {"1": {"method": "get_stack_setting", "error": "unknown method", "code": 102}},
+    ],
+)
+async def test_read_settings_inline_stack_rejection_is_error(mock_client, payload):
+    setting = {"jsonrpc": "2.0", "method": "get_setting", "result": {"a": 1}, "code": 0}
+    mock_client.get_setting.return_value = setting
+    mock_client.get_stack_setting.return_value = payload
+    out = await read_settings_tool()
+    assert out == {
+        "setting": setting,
+        "errors": {"stack_setting": out["errors"]["stack_setting"]},
+    }
+    assert isinstance(out["errors"]["stack_setting"], str)
+    assert (
+        "unknown method" in out["errors"]["stack_setting"]
+        or "102" in (out["errors"]["stack_setting"])
+    )
+
+
+async def test_read_settings_inline_setting_rejection_is_error(mock_client):
+    mock_client.get_setting.return_value = {"error": "unknown method", "code": 102}
+    mock_client.get_stack_setting.return_value = {"b": 2, "code": 0}
+    out = await read_settings_tool()
+    assert out == {
+        "stack_setting": {"b": 2, "code": 0},
+        "errors": {"setting": "unknown method"},
+    }
+
+
 async def test_write_setting_auto_uses_plural_for_many_keys(mock_client):
     await write_setting_tool(values={"exp_ms": 10000, "gain": 80})
     mock_client.set_stack_settings.assert_awaited_once_with(exp_ms=10000, gain=80)
