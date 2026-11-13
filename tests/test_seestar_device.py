@@ -4095,6 +4095,216 @@ def test_schedule_item_guards_for_working_scheduler(seestar):
     assert seestar.schedule["list"][2]["params"]["timer_sec"] == 30
 
 
+def test_replace_schedule_item_after_non_first_current_item_returns(seestar):
+    # Current item is not list[0]: the "already executed" scan must advance,
+    # or the call spins forever.
+    seestar.schedule["list"] = collections.deque(
+        [
+            {"schedule_item_id": "a", "action": "wait_for", "params": {"timer_sec": 1}},
+            {"schedule_item_id": "b", "action": "wait_for", "params": {"timer_sec": 2}},
+            {"schedule_item_id": "c", "action": "wait_for", "params": {"timer_sec": 3}},
+        ]
+    )
+    seestar.schedule["state"] = "working"
+    seestar.schedule["current_item_id"] = "b"
+
+    worker = threading.Thread(
+        target=seestar.replace_schedule_item,
+        args=({"item_id": "c", "action": "wait_for", "params": {"timer_sec": 30}},),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive(), "replace_schedule_item hung"
+    items = list(seestar.schedule["list"])
+    assert [x["schedule_item_id"] for x in items[:2]] == ["a", "b"]
+    assert items[2]["params"]["timer_sec"] == 30
+    assert items[2]["schedule_item_id"] != "c"
+
+    # The current item itself still cannot be replaced.
+    seestar.replace_schedule_item(
+        {"item_id": "b", "action": "wait_for", "params": {"timer_sec": 99}}
+    )
+    assert seestar.schedule["list"][1]["params"]["timer_sec"] == 2
+
+
+@pytest.mark.parametrize("action", ["start_mosaic", "start_framed_mosaic"])
+def test_construct_schedule_item_fills_panel_time_from_session_time(seestar, action):
+    item = seestar.construct_schedule_item(
+        {
+            "action": action,
+            "params": {
+                "target_name": "t",
+                "ra": 10.0,
+                "dec": 20.0,
+                "session_time_sec": 120,
+            },
+        }
+    )
+    assert item["params"]["panel_time_sec"] == 120
+    assert item["params"]["session_time_sec"] == 120
+
+
+@pytest.mark.parametrize("action", ["start_mosaic", "start_framed_mosaic"])
+def test_construct_schedule_item_keeps_existing_panel_time(seestar, action):
+    item = seestar.construct_schedule_item(
+        {
+            "action": action,
+            "params": {
+                "target_name": "t",
+                "ra": 10.0,
+                "dec": 20.0,
+                "panel_time_sec": 60,
+                "session_time_sec": 999,
+            },
+        }
+    )
+    assert item["params"]["panel_time_sec"] == 60
+
+
+def _run_concurrently(fn, args_list, timeout=5):
+    results = [None] * len(args_list)
+
+    def run(i, args):
+        results[i] = fn(*args)
+
+    threads = [
+        threading.Thread(target=run, args=(i, a), daemon=True)
+        for i, a in enumerate(args_list)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout)
+        assert not t.is_alive(), "concurrent call did not finish"
+    return results
+
+
+def _wire_goto_target(monkeypatch, seestar, send):
+    class FakeCoord:
+        ra = SimpleNamespace(hour=1.5)
+        dec = SimpleNamespace(deg=22.25)
+
+    monkeypatch.setattr(
+        "device.seestar_device.Util.parse_coordinate", lambda *args, **kwargs: FakeCoord
+    )
+    seestar._radec_sun_safe = lambda *args, **kwargs: True
+    seestar.send_message_param_sync = send
+
+
+def test_concurrent_goto_target_admits_exactly_one(monkeypatch, seestar):
+    sent = []
+    sent_lock = threading.Lock()
+
+    def send(payload):
+        with sent_lock:
+            sent.append(payload["method"])
+        return {"result": "ok"}
+
+    _wire_goto_target(monkeypatch, seestar, send)
+    real_is_goto = seestar.is_goto
+
+    def slow_is_goto():
+        busy = real_is_goto()
+        time.sleep(0.05)  # widen the check-then-claim window
+        return busy
+
+    seestar.is_goto = slow_is_goto
+    params = {"is_j2000": True, "ra": "1h", "dec": "22d", "target_name": "M42"}
+
+    results = _run_concurrently(seestar.goto_target, [(params,), (params,)])
+
+    assert sorted(results) == [False, True]
+    assert sent.count("iscope_start_view") == 1
+
+
+def test_goto_target_does_not_hold_admission_lock_during_send(monkeypatch, seestar):
+    acquired = []
+
+    def send(payload):
+        def probe():
+            ok = seestar._admission_lock.acquire(timeout=1)
+            if ok:
+                seestar._admission_lock.release()
+            acquired.append(ok)
+
+        t = threading.Thread(target=probe, daemon=True)
+        t.start()
+        t.join(timeout=2)
+        return {"result": "ok"}
+
+    _wire_goto_target(monkeypatch, seestar, send)
+    ok = seestar.goto_target(
+        {"is_j2000": True, "ra": "1h", "dec": "22d", "target_name": "M42"}
+    )
+    assert ok is True
+    assert acquired == [True]
+
+
+def _wire_slow_scheduler(seestar):
+    runs = []
+    runs_lock = threading.Lock()
+
+    def slow_master():
+        time.sleep(0.05)  # widen the check-then-start window
+        return True
+
+    def fake_scheduler_fn():
+        with runs_lock:
+            runs.append(threading.current_thread().name)
+        time.sleep(0.3)
+
+    seestar.is_client_master = slow_master
+    seestar.scheduler_thread_fn = fake_scheduler_fn
+    seestar.schedule["state"] = "stopped"
+    return runs
+
+
+class _SlowStartItemParams(dict):
+    """Params that stall on the "start_item" lookup, which start_scheduler
+    makes after its busy checks and before creating the thread."""
+
+    def __contains__(self, key):
+        if key == "start_item":
+            time.sleep(0.05)
+        return super().__contains__(key)
+
+
+def test_concurrent_start_scheduler_starts_one_thread(seestar):
+    runs = _wire_slow_scheduler(seestar)
+
+    results = _run_concurrently(
+        seestar.start_scheduler,
+        [(_SlowStartItemParams(),), (_SlowStartItemParams(),)],
+    )
+
+    seestar.scheduler_thread.join(timeout=2)
+    assert len(runs) == 1
+    refused = [r for r in results if r is not seestar.schedule]
+    assert len(refused) == 1
+    assert refused[0]["code"] == -1
+
+
+def test_concurrent_start_mosaic_keeps_winner_item(seestar):
+    runs = _wire_slow_scheduler(seestar)
+
+    def mosaic(name):
+        return seestar.start_mosaic(
+            {"target_name": name, "ra": 10.0, "dec": 20.0, "panel_time_sec": 60}
+        )
+
+    results = _run_concurrently(mosaic, [("first",), ("second",)])
+
+    seestar.scheduler_thread.join(timeout=2)
+    assert len(runs) == 1
+    winners = [i for i, r in enumerate(results) if r is seestar.schedule]
+    assert len(winners) == 1
+    assert results[1 - winners[0]]["code"] == -1
+    items = list(seestar.schedule["list"])
+    assert len(items) == 1
+    assert items[0]["params"]["target_name"] == ["first", "second"][winners[0]]
+
+
 def test_get_events_focus_empty_queue_and_watch_firmware_init(monkeypatch, seestar):
     # Cover focus event formatting and timestamp stripping.
     seestar.event_queue = collections.deque(

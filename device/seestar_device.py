@@ -165,6 +165,16 @@ class Seestar:
         }
         self.lock = threading.RLock()
         self._plate_solve_sync_lock = threading.Lock()
+        # _admission_lock makes the check-then-claim step of goto_target,
+        # start_scheduler and the start_mosaic / start_framed_mosaic /
+        # start_spectra shortcuts atomic, so two concurrent requests cannot both
+        # pass the "already busy?" check. Re-entrant because the shortcuts call
+        # start_scheduler. Held only around in-memory checks and Thread.start():
+        # never across socket I/O, reconnects, sleeps or the sun pre-flight,
+        # and never taken by stop/abort/emergency paths. Lock order:
+        # _admission_lock may take event_state_lock (via mark_op_state), never
+        # the reverse.
+        self._admission_lock = threading.RLock()
         # The Alpaca server is threaded, so concurrent requests reach the send
         # path at once.
         #
@@ -1672,10 +1682,11 @@ class Seestar:
 
     # synchronise call. Will return only if there's result
     def goto_target(self, params):
-        if self.is_goto():
-            self.logger.info("Failed to goto target: mount is in goto routine.")
-            return False
-        self.mark_goto_status_as_start()
+        with self._admission_lock:
+            if self.is_goto():
+                self.logger.info("Failed to goto target: mount is in goto routine.")
+                return False
+            self.mark_goto_status_as_start()
 
         is_j2000 = params["is_j2000"]
         in_ra = params["ra"]
@@ -3405,6 +3416,23 @@ class Seestar:
                     mosaic_params["is_j2000"] = False
                 mosaic_params["ra"] = round(mosaic_params["ra"], 4)
                 mosaic_params["dec"] = round(mosaic_params["dec"], 4)
+        if item["action"] in ("start_mosaic", "start_framed_mosaic"):
+            # Legacy payloads send session_time_sec only. The schedule page
+            # renders panel_time_sec, so fill it in with the same per-panel
+            # meaning as start_mosaic_item's fallback (which stays, for
+            # imported schedule files that bypass this method).
+            mosaic_params = item.get("params")
+            if (
+                isinstance(mosaic_params, dict)
+                and "panel_time_sec" not in mosaic_params
+                and "session_time_sec" in mosaic_params
+            ):
+                self.logger.warning(
+                    "%s item has session_time_sec but no panel_time_sec; "
+                    "using it as panel_time_sec. Send panel_time_sec instead.",
+                    item["action"],
+                )
+                mosaic_params["panel_time_sec"] = mosaic_params["session_time_sec"]
         item["schedule_item_id"] = str(uuid.uuid4())
         return item
 
@@ -3430,6 +3458,7 @@ class Seestar:
                     return self.schedule
                 if item_id == active_schedule_item_id:
                     reached_cur_item = True
+                index += 1
 
         while index < len(self.schedule["list"]):
             item = self.schedule["list"][index]
@@ -3536,42 +3565,67 @@ class Seestar:
 
     # shortcut to start a new scheduler with only a mosaic request
     def start_mosaic(self, params):
-        if self.schedule["state"] != "stopped" and self.schedule["state"] != "complete":
-            return self.json_result(
-                "start_mosaic",
-                -1,
-                "An existing scheduler is active. Returned with no action.",
-            )
-        self.create_schedule(params)
-        schedule_item = {"action": "start_mosaic", "params": params}
-        self.add_schedule_item(schedule_item)
-        return self.start_scheduler(params)
+        # _admission_lock: in-memory check, create, add and thread start only.
+        with self._admission_lock:
+            if (
+                self.schedule["state"] != "stopped"
+                and self.schedule["state"] != "complete"
+            ):
+                return self.json_result(
+                    "start_mosaic",
+                    -1,
+                    "An existing scheduler is active. Returned with no action.",
+                )
+            if self._scheduler_thread_alive():
+                # A just-started run has not set state to "working" yet;
+                # refuse before create_schedule clears its list.
+                return self._scheduler_winding_down_result()
+            self.create_schedule(params)
+            schedule_item = {"action": "start_mosaic", "params": params}
+            self.add_schedule_item(schedule_item)
+            return self.start_scheduler(params)
 
     # shortcut to start a new scheduler with only a spectra request
     def start_spectra(self, params):
-        if self.schedule["state"] != "stopped" and self.schedule["state"] != "complete":
-            return self.json_result(
-                "start_spectra",
-                -1,
-                "An existing scheduler is active. Returned with no action.",
-            )
-        self.create_schedule(params)
-        schedule_item = {"action": "start_spectra", "params": params}
-        self.add_schedule_item(schedule_item)
-        return self.start_scheduler(params)
+        with self._admission_lock:
+            if (
+                self.schedule["state"] != "stopped"
+                and self.schedule["state"] != "complete"
+            ):
+                return self.json_result(
+                    "start_spectra",
+                    -1,
+                    "An existing scheduler is active. Returned with no action.",
+                )
+            if self._scheduler_thread_alive():
+                # A just-started run has not set state to "working" yet;
+                # refuse before create_schedule clears its list.
+                return self._scheduler_winding_down_result()
+            self.create_schedule(params)
+            schedule_item = {"action": "start_spectra", "params": params}
+            self.add_schedule_item(schedule_item)
+            return self.start_scheduler(params)
 
     # shortcut to start a new scheduler with only a framed mosaic request
     def start_framed_mosaic(self, params):
-        if self.schedule["state"] != "stopped" and self.schedule["state"] != "complete":
-            return self.json_result(
-                "start_framed_mosaic",
-                -1,
-                "An existing scheduler is active. Returned with no action.",
-            )
-        self.create_schedule(params)
-        schedule_item = {"action": "start_framed_mosaic", "params": params}
-        self.add_schedule_item(schedule_item)
-        return self.start_scheduler(params)
+        with self._admission_lock:
+            if (
+                self.schedule["state"] != "stopped"
+                and self.schedule["state"] != "complete"
+            ):
+                return self.json_result(
+                    "start_framed_mosaic",
+                    -1,
+                    "An existing scheduler is active. Returned with no action.",
+                )
+            if self._scheduler_thread_alive():
+                # A just-started run has not set state to "working" yet;
+                # refuse before create_schedule clears its list.
+                return self._scheduler_winding_down_result()
+            self.create_schedule(params)
+            schedule_item = {"action": "start_framed_mosaic", "params": params}
+            self.add_schedule_item(schedule_item)
+            return self.start_scheduler(params)
 
     def json_result(self, command_name, code, result):
         if code != 0:
@@ -3616,48 +3670,61 @@ class Seestar:
         }
         return
 
-    def start_scheduler(self, params):
-        if (
-            "schedule_id" in params
-            and params["schedule_id"] != self.schedule["schedule_id"]
-        ):
-            return self.json_result(
-                "start_scheduler",
-                0,
-                f"Schedule with id {params['schedule_id']} did not match this device's schedule. Returned with no action.",
-            )
-        if not self.is_client_master():
-            return self.json_result(
-                "start_scheduler",
-                -1,
-                "This device cannot be controlled. Grab the control first.",
-            )
-        if self.schedule["state"] != "stopped" and self.schedule["state"] != "complete":
-            return self.json_result(
-                "start_scheduler",
-                -1,
-                "An existing scheduler is active. Returned with no action.",
-            )
+    def _scheduler_thread_alive(self):
+        return self.scheduler_thread is not None and self.scheduler_thread.is_alive()
 
-        if self.scheduler_thread is not None and self.scheduler_thread.is_alive():
-            return self.json_result(
-                "start_scheduler",
-                -1,
-                "Scheduler thread is still winding down. Please wait a moment and try again.",
-            )
-
-        if "start_item" in params:
-            self.schedule["item_number"] = params["start_item"]
-        else:
-            self.schedule["item_number"] = 1
-
-        self.scheduler_thread = threading.Thread(
-            target=lambda: self.scheduler_thread_fn(), daemon=True
+    def _scheduler_winding_down_result(self):
+        return self.json_result(
+            "start_scheduler",
+            -1,
+            "Scheduler thread is still winding down. Please wait a moment and try again.",
         )
-        self.scheduler_thread.name = f"SchedulerThread:{self.device_name}"
-        self.scheduler_thread.start()
 
-        return self.schedule
+    def start_scheduler(self, params):
+        # _admission_lock: checks through Thread.start() are in-memory only.
+        # Once start() returns, is_alive() is True, so a concurrent caller is
+        # refused by the "winding down" check below.
+        with self._admission_lock:
+            if (
+                "schedule_id" in params
+                and params["schedule_id"] != self.schedule["schedule_id"]
+            ):
+                return self.json_result(
+                    "start_scheduler",
+                    0,
+                    f"Schedule with id {params['schedule_id']} did not match this device's schedule. Returned with no action.",
+                )
+            if not self.is_client_master():
+                return self.json_result(
+                    "start_scheduler",
+                    -1,
+                    "This device cannot be controlled. Grab the control first.",
+                )
+            if (
+                self.schedule["state"] != "stopped"
+                and self.schedule["state"] != "complete"
+            ):
+                return self.json_result(
+                    "start_scheduler",
+                    -1,
+                    "An existing scheduler is active. Returned with no action.",
+                )
+
+            if self._scheduler_thread_alive():
+                return self._scheduler_winding_down_result()
+
+            if "start_item" in params:
+                self.schedule["item_number"] = params["start_item"]
+            else:
+                self.schedule["item_number"] = 1
+
+            self.scheduler_thread = threading.Thread(
+                target=lambda: self.scheduler_thread_fn(), daemon=True
+            )
+            self.scheduler_thread.name = f"SchedulerThread:{self.device_name}"
+            self.scheduler_thread.start()
+
+            return self.schedule
 
     # scheduler state example: {"state":"working", "schedule_id":"abcdefg",
     #       "result":0, "error":"dummy error",
