@@ -1125,7 +1125,12 @@ def system_play_sound(ctx: click.Context, sound_id: int) -> None:
 
 
 @system.command("set-time")
-@click.option("--time", "iso_time", required=True, help="ISO 8601 datetime string.")
+@click.option(
+    "--time",
+    "iso_time",
+    required=True,
+    help="ISO 8601 datetime; offsets are converted to UTC, no offset means UTC.",
+)
 @click.pass_context
 def system_set_time(ctx: click.Context, iso_time: str) -> None:
     _run(ctx, ctx.obj["client"].pi_set_time(iso_time=iso_time))
