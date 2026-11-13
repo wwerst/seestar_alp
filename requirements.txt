@@ -11,7 +11,7 @@ humanize==4.12.3
 ephem==4.2
 pytz==2022.7.1
 numpy==2.3.2
-opencv-python==4.10.0.84
+opencv-python==4.11.0.86
 scikit-image==0.25.2
 scipy>=1.14.0,<2
 flask==3.1.1
@@ -32,11 +32,9 @@ sdnotify==0.3.2
 pyhocon==0.3.61
 pydantic==2.11.7
 cryptography>=39.0.0
-# Terrain line-of-sight: DEM tile I/O + WGS-84 geodesic paths.
-# See scripts/trajectory/terrain_los.py and plans/terrain_los.md.
-# These are the pyproject.toml optional "terrain" extra
-# (pip install seestar_alp[terrain]); kept here so CI and dev installs
-# always have them and the terrain tests run.
-rasterio==1.5.0
-pyproj==3.7.2
-geographiclib==2.1
+# Terrain line-of-sight (rasterio / pyproj / geographiclib) is NOT listed here:
+# this file is the core dependency list (pyproject.toml reads it via
+# [tool.setuptools.dynamic]) and every installer uses it -- Docker, riscv64,
+# Raspberry Pi, the .deb postinst. rasterio needs native GDAL, which has no
+# wheel on some of those platforms. Install the optional extra instead:
+#   pip install -r requirements-terrain.txt     (or: pip install '.[terrain]')

@@ -1,6 +1,8 @@
 import json
 import logging
 
+import pytest
+
 from device import exceptions as device_exceptions
 from device import telescope
 from device.shr import set_shr_logger
@@ -71,8 +73,8 @@ class FakeDevice:
         self.calls.append(("stop_slew", None))
         return {"ok": True}
 
-    def move_scope(self, axis, rate):
-        self.calls.append(("move_scope", axis, rate))
+    def move_scope(self, angle, speed):
+        self.calls.append(("move_scope", angle, speed))
         return {"ok": True}
 
     def goto_target(self, payload):
@@ -264,6 +266,35 @@ def test_command_put_endpoints_success_paths():
         assert payload["ErrorNumber"] == 0, responder.__name__
 
 
+def test_slew_endpoints_report_a_refused_goto():
+    """goto_target returns False when the sun-avoidance pre-flight (or a
+    goto already in progress) refuses the slew. The ASCOM slew endpoints
+    must surface that as an error, not report that the slew started."""
+    set_shr_logger(logging.getLogger("test-telescope-props"))
+    device_exceptions.logger = DummyLogger()
+    telescope.seestar_dev.clear()
+    device = FakeDevice()
+    device.goto_target = lambda payload: False
+    telescope.seestar_dev[1] = device
+
+    refused_cases = [
+        (telescope.slewtocoordinates, {"RightAscension": "1.5", "Declination": "2.5"}),
+        (
+            telescope.slewtocoordinatesasync,
+            {"RightAscension": "1.5", "Declination": "2.5"},
+        ),
+        (telescope.slewtotarget, {}),
+        (telescope.slewtotargetasync, {}),
+    ]
+    for responder, media in refused_cases:
+        req = DummyReq(method="PUT", extra_media=media)
+        resp = DummyResp()
+        responder().on_put(req, resp, devnum=1)
+        payload = json.loads(resp.text)
+        assert payload["ErrorNumber"] != 0, responder.__name__
+        assert "refused" in payload["ErrorMessage"].lower(), responder.__name__
+
+
 def test_command_put_endpoints_invalid_number_inputs():
     set_shr_logger(logging.getLogger("test-telescope-props"))
     device_exceptions.logger = DummyLogger()
@@ -404,3 +435,84 @@ def test_not_connected_on_put_responders_return_error():
         responder().on_put(req, resp, devnum=1)
         payload = json.loads(resp.text)
         assert payload["ErrorNumber"] != 0, responder.__name__
+
+
+def _fresh_device():
+    set_shr_logger(logging.getLogger("test-telescope-props"))
+    device_exceptions.logger = DummyLogger()
+    telescope.seestar_dev.clear()
+    device = FakeDevice()
+    telescope.seestar_dev[1] = device
+    return device
+
+
+def _put(responder, media):
+    resp = DummyResp()
+    responder().on_put(DummyReq(method="PUT", extra_media=media), resp, devnum=1)
+    return json.loads(resp.text)
+
+
+def _get(responder, **query):
+    req = DummyReq(method="GET")
+    req.params.update(query)
+    resp = DummyResp()
+    responder().on_get(req, resp, devnum=1)
+    return json.loads(resp.text)
+
+
+@pytest.mark.parametrize(
+    "axis, rate, angle, speed",
+    [
+        # scope_speed_move takes a direction in degrees and a native speed
+        # (seestar-spec, READ); the axis index is not an angle.
+        ("0", "2.5", 0, 2.5),
+        ("0", "-2.5", 180, 2.5),
+        ("1", "2.5", 90, 2.5),
+        ("1", "-2.5", 270, 2.5),
+        ("1", "0", 90, 0.0),
+    ],
+)
+def test_moveaxis_sends_a_direction_angle_and_speed(axis, rate, angle, speed):
+    device = _fresh_device()
+
+    payload = _put(telescope.moveaxis, {"Axis": axis, "Rate": rate})
+
+    assert payload["ErrorNumber"] == 0
+    assert device.calls == [("move_scope", angle, speed)]
+
+
+@pytest.mark.parametrize("axis, rate", [("2", "1"), ("0", "1440.5"), ("1", "-2000")])
+def test_moveaxis_rejects_unsupported_axis_or_rate(axis, rate):
+    device = _fresh_device()
+
+    payload = _put(telescope.moveaxis, {"Axis": axis, "Rate": rate})
+
+    assert payload["ErrorNumber"] == device_exceptions.InvalidValueException().number
+    assert device.calls == []
+
+
+@pytest.mark.parametrize("axis, expected", [("0", True), ("1", True), ("2", False)])
+def test_canmoveaxis_only_primary_and_secondary(axis, expected):
+    _fresh_device()
+
+    payload = _get(telescope.canmoveaxis, Axis=axis)
+
+    assert payload["ErrorNumber"] == 0
+    assert payload["Value"] is expected
+
+
+@pytest.mark.parametrize(
+    "axis, expected",
+    [
+        ("0", [{"Minimum": 0.0, "Maximum": 1440.0}]),
+        ("1", [{"Minimum": 0.0, "Maximum": 1440.0}]),
+        ("2", []),
+    ],
+)
+def test_axisrates_reports_native_speed_range(axis, expected):
+    _fresh_device()
+
+    payload = _get(telescope.axisrates, Axis=axis)
+
+    assert payload["ErrorNumber"] == 0
+    assert payload["Value"] == expected

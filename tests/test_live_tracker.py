@@ -1251,3 +1251,360 @@ def test_runtime_cable_wrap_check_fails_closed_on_measure_error(tmp_path):
     assert session._phase == "refused"
     assert session._stop_evt.is_set()
     assert any("could not be verified" in e for e in session._errors)
+
+
+# --------- persisted cable-wrap state is loaded, not discarded -----------
+
+
+def test_run_loads_persisted_cable_wrap_state(tmp_path, monkeypatch):
+    """_run must read the encoder az and pass it to
+    CumulativeAzTracker.load_or_fresh (whose current_wrapped_az_deg argument
+    is required). Before the fix the no-argument call always raised
+    TypeError and a fresh tracker silently replaced the persisted state."""
+    import types
+
+    import device.live_tracker as lt
+    from device.plant_limits import CumulativeAzTracker
+
+    state = tmp_path / "plant_limits_state.json"
+    state.write_text(
+        json.dumps({"cum_az_deg": 300.0, "wrapped_az_deg": -60.0}),
+        encoding="utf-8",
+    )
+    real_load = CumulativeAzTracker.load_or_fresh.__func__
+    seen: dict = {}
+
+    def _load(cls, current_wrapped_az_deg, path=None, tol_deg=2.0):
+        seen["current_wrapped_az_deg"] = current_wrapped_az_deg
+        return real_load(cls, current_wrapped_az_deg, path=str(state), tol_deg=tol_deg)
+
+    monkeypatch.setattr(CumulativeAzTracker, "load_or_fresh", classmethod(_load))
+    monkeypatch.setattr(
+        lt.LiveTrackSession, "_runtime_cable_wrap_check", lambda self, *a, **k: False
+    )
+
+    captured: dict = {}
+
+    def _fake_track(cli, provider, **kwargs):
+        captured["az_tracker"] = kwargs.get("az_tracker")
+        return types.SimpleNamespace(exit_reason="end_of_track", errors=[])
+
+    monkeypatch.setattr(lt, "track", _fake_track)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [45.0, -60.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+
+    session = LiveTrackSession(
+        telescope_id=190,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=_StationaryProvider(t0=time.time() + 0.2),
+        offsets=AtomicOffsets(),
+        dry_run=True,
+        auto_slew=False,
+        log_dir=tmp_path / "logs",
+    )
+    session._run()
+
+    assert seen["current_wrapped_az_deg"] == -60.0
+    tracker = captured["az_tracker"]
+    assert tracker is not None
+    assert abs(tracker.cum_az_deg - 300.0) < 1e-6
+
+
+# --------- terminal pre-slew failures (no track() from a failed slew) -----
+
+
+def _preslew_session(tid: int, tmp_path, provider=None) -> LiveTrackSession:
+    return LiveTrackSession(
+        telescope_id=tid,
+        target_kind="file",
+        target_id="fix",
+        target_display_name="Fix",
+        provider=provider or _StationaryProvider(t0=time.time() + 0.2),
+        offsets=AtomicOffsets(),
+        dry_run=False,
+        auto_slew=True,
+        log_dir=tmp_path / "logs",
+    )
+
+
+def test_run_preslew_move_failure_is_terminal(tmp_path, monkeypatch):
+    """A move_to_ff exception during the requested pre-slew must end the
+    session (exit_reason='pre_slew_failed') instead of proceeding into
+    track() anchored wherever the mount happened to stop."""
+    import device.live_tracker as lt
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    def _boom(cli, **kwargs):
+        raise RuntimeError("motor fault")
+
+    monkeypatch.setattr(lt, "move_to_ff", _boom)
+
+    track_calls: list = []
+    monkeypatch.setattr(lt, "track", lambda *a, **k: track_calls.append(1))
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [45.0, 0.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    monkeypatch.setattr(lt, "AlpacaClient", lambda *a, **kw: _FakeCli())
+
+    session = _preslew_session(191, tmp_path)
+    session._run()
+
+    assert track_calls == []
+    assert session._exit_reason == "pre_slew_failed"
+    assert session._phase == "error"
+    assert session._stop_evt.is_set()
+    assert any("move_to_ff failed" in e for e in session._errors)
+
+
+def test_auto_slew_measure_failure_is_terminal(monkeypatch, tmp_path):
+    import device.live_tracker as lt
+
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    class _BrokenCli:
+        def method_sync(self, method, params=None):
+            raise RuntimeError("scope unreachable")
+
+    session = _preslew_session(192, tmp_path)
+    session._auto_slew(_BrokenCli(), None)
+
+    assert session._exit_reason == "pre_slew_failed"
+    assert session._phase == "error"
+    assert session._stop_evt.is_set()
+
+
+def test_auto_slew_non_convergence_is_terminal(monkeypatch, tmp_path):
+    import device.live_tracker as lt
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    def _short_move(cli, **kwargs):
+        # Stops 10 deg short in az and reports no convergence.
+        return (
+            kwargs["target_el_deg"],
+            kwargs["target_az_deg"] - 10.0,
+            {"converged": False},
+        )
+
+    monkeypatch.setattr(lt, "move_to_ff", _short_move)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [45.0, 30.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    session = _preslew_session(193, tmp_path)
+    session._auto_slew(_FakeCli(), None)
+
+    assert session._exit_reason == "pre_slew_failed"
+    assert session._stop_evt.is_set()
+    assert any("did not converge" in e for e in session._errors)
+
+
+def test_auto_slew_converged_move_is_not_terminal(monkeypatch, tmp_path):
+    """Control: a converged pre-slew leaves the session free to track."""
+    import device.live_tracker as lt
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    def _fake_move(cli, **kwargs):
+        return (kwargs["target_el_deg"], kwargs["target_az_deg"], {"converged": True})
+
+    monkeypatch.setattr(lt, "move_to_ff", _fake_move)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [45.0, 30.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    session = _preslew_session(194, tmp_path)
+    session._auto_slew(_FakeCli(), None)
+
+    assert session._exit_reason is None
+    assert not session._stop_evt.is_set()
+
+
+# --------- pre-slew path (not just endpoint) sun check -------------------
+
+
+class _FixedAzElProvider:
+    """Stationary provider at a chosen (az_cum, el); no mount_frame, so the
+    sun checks see the mount az/el unchanged."""
+
+    def __init__(self, t0: float, az_cum_deg: float, el_deg: float):
+        self._t0 = t0
+        self._t1 = t0 + 3.0
+        self._az = float(az_cum_deg)
+        self._el = float(el_deg)
+
+    def sample(self, t):
+        return ReferenceSample(
+            t_unix=float(t),
+            az_cum_deg=self._az,
+            el_deg=self._el,
+            v_az_degs=0.0,
+            v_el_degs=0.0,
+            a_az_degs2=0.0,
+            a_el_degs2=0.0,
+            stale=False,
+            extrapolated=False,
+        )
+
+    def valid_range(self):
+        return (self._t0, self._t1)
+
+
+def _stub_sun_at_az(sun_az: float):
+    """is_sun_safe stub: unsafe within 10 deg of az ``sun_az``."""
+
+    def _stub(az, el, *a, **k):
+        d_az = ((float(az) - sun_az + 180.0) % 360.0) - 180.0
+        if abs(d_az) < 10.0:
+            return (False, f"sun_avoidance: stub cone at az {sun_az}")
+        return (True, "")
+
+    return _stub
+
+
+def test_auto_slew_refuses_when_path_crosses_sun_cone(monkeypatch, tmp_path):
+    """Mount at az 140, target at az 220 (both el 35); the short-way path
+    passes az 180, where the stub puts the sun. Both endpoints are safe, so
+    only the path check can refuse; move_to_ff must never be called."""
+    import device.live_tracker as lt
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "is_sun_safe", _stub_sun_at_az(180.0))
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    moves: list = []
+
+    def _fake_move(cli, **kwargs):
+        moves.append(kwargs)
+        return (kwargs["target_el_deg"], kwargs["target_az_deg"], {"converged": True})
+
+    monkeypatch.setattr(lt, "move_to_ff", _fake_move)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [35.0, 140.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    provider = _FixedAzElProvider(time.time() + 0.2, az_cum_deg=220.0, el_deg=35.0)
+    session = _preslew_session(195, tmp_path, provider=provider)
+    session._auto_slew(_FakeCli(), None)
+
+    assert moves == []
+    assert session._exit_reason == "sun_avoidance"
+    assert session._phase == "refused"
+    assert session._stop_evt.is_set()
+    assert any("path point" in e for e in session._errors)
+
+
+def test_auto_slew_path_clear_of_sun_proceeds(monkeypatch, tmp_path):
+    """Control: same geometry with the stub sun at az 0 (behind the mount)
+    leaves the path clear, so the slew is issued."""
+    import device.live_tracker as lt
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(ss, "is_sun_safe", _stub_sun_at_az(0.0))
+    monkeypatch.setattr(lt, "ensure_scenery_mode", lambda cli: None)
+
+    moves: list = []
+
+    def _fake_move(cli, **kwargs):
+        moves.append(kwargs)
+        return (kwargs["target_el_deg"], kwargs["target_az_deg"], {"converged": True})
+
+    monkeypatch.setattr(lt, "move_to_ff", _fake_move)
+
+    class _FakeCli:
+        def method_sync(self, method, params=None):
+            if method == "scope_get_horiz_coord":
+                return {"result": [35.0, 140.0], "Timestamp": f"{time.time():.6f}"}
+            return {"result": None}
+
+    provider = _FixedAzElProvider(time.time() + 0.2, az_cum_deg=220.0, el_deg=35.0)
+    session = _preslew_session(196, tmp_path, provider=provider)
+    session._auto_slew(_FakeCli(), None)
+
+    assert len(moves) == 1
+    assert session._exit_reason is None
+
+
+# --------- ADS-B feed sanitizing ------------------------------------------
+
+
+def test_poll_once_blanks_html_callsign(monkeypatch):
+    """A feed record whose 'flight' is markup must not reach display_name:
+    the callsign is blanked, so the UI falls back to the hex id."""
+    import device.live_tracker as lt
+
+    site = build_site()
+    ac = {
+        "hex": "abc124",
+        "lat": site.lat_deg + 0.05,
+        "lon": site.lon_deg,
+        "alt_geom": 10000.0,
+        "flight": "<img src=x onerror=alert(1)>",
+        "gs": 300.0,
+        "track": 90.0,
+    }
+    catalog = lt.TargetCatalog(live_enabled=False)
+    monkeypatch.setattr(lt, "poll_once_adsbfi", lambda *a, **k: [ac])
+    assert catalog._poll_once() is True
+    buf = catalog._live_buffers.get("abc124")
+    assert buf is not None
+    assert buf.callsign == ""
+
+
+def test_poll_once_drops_record_with_bad_hex(monkeypatch):
+    import device.live_tracker as lt
+
+    site = build_site()
+    ac = {
+        "hex": "<b>x</b>",
+        "lat": site.lat_deg + 0.05,
+        "lon": site.lon_deg,
+        "alt_geom": 10000.0,
+        "flight": "TEST1",
+        "gs": 300.0,
+        "track": 90.0,
+    }
+    catalog = lt.TargetCatalog(live_enabled=False)
+    monkeypatch.setattr(lt, "poll_once_adsbfi", lambda *a, **k: [ac])
+    assert catalog._poll_once() is True
+    assert len(catalog._live_buffers) == 0
+
+
+def test_sanitize_helpers_keep_valid_feed_values():
+    import device.live_tracker as lt
+
+    assert lt._sanitize_icao24("a1b2c3") == "a1b2c3"
+    assert lt._sanitize_icao24("~a1b2c3") == "~a1b2c3"
+    assert lt._sanitize_icao24("a1b2c") is None
+    assert lt._sanitize_icao24(None) is None
+    assert lt._sanitize_callsign("UAL123  ") == "UAL123"
+    assert lt._sanitize_callsign("UAL<123>") == ""
+    assert lt._sanitize_callsign(None) == ""

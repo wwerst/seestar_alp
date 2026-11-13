@@ -50,6 +50,56 @@ from device.velocity_controller import (  # noqa: E402
 )
 
 
+# Extra margin (deg) on the sun check's elevation band. The sweep is planned
+# in the mount frame; a tilted tripod (which is why auto-level runs) makes
+# the sky elevation differ from the mount elevation by up to the tilt, and
+# move_to_ff may overshoot slightly before converging.
+SUN_BAND_MARGIN_DEG = 5.0
+
+
+def sun_check_el_band(
+    el_a_deg: float,
+    el_b_deg: float,
+    *,
+    margin_deg: float = SUN_BAND_MARGIN_DEG,
+    when: datetime | None = None,
+) -> tuple[bool, str]:
+    """Sun pre-check for motion that may visit ANY azimuth at elevations
+    between ``el_a_deg`` and ``el_b_deg`` (widened by ``margin_deg``).
+
+    The auto-level sweep turns a full circle, and the encoder az origin is
+    not the sky's, so the check cannot rely on azimuth: it asks whether any
+    point of the elevation band is inside the sun cone. The band point
+    nearest the sun is at the sun's azimuth, at the sun's altitude clamped
+    into the band, so checking that one point with ``is_sun_safe`` covers
+    the whole band. Fails closed: an error in the check returns unsafe,
+    and ``is_sun_safe`` itself refuses an unset (0, 0) site.
+    """
+    from device import sun_safety
+
+    try:
+        lo, hi = sorted((float(el_a_deg), float(el_b_deg)))
+        lo -= float(margin_deg)
+        hi += float(margin_deg)
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            return False, "sun_avoidance: non-finite elevation band; refusing"
+        if when is None:
+            when = datetime.now(timezone.utc)
+        sun_az, sun_alt = sun_safety.compute_sun_altaz(when=when)
+        nearest_el = min(max(float(sun_alt), lo), hi)
+        safe, reason = sun_safety.is_sun_safe(
+            float(sun_az) % 360.0, nearest_el, when=when
+        )
+    except Exception as exc:  # noqa: BLE001 — refuse when unverifiable
+        return False, f"sun_avoidance: sun check failed ({exc}); refusing"
+    if not safe:
+        return False, (
+            f"{reason} — some azimuth at elevation "
+            f"{lo:.1f}°..{hi:.1f}° is inside the sun cone"
+        )
+    return True, ""
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -349,6 +399,18 @@ def _main_body(args, cli, loc, log_path, position_logger, tracker_holder):
         print(f"Current scope altitude {start_alt_deg:.1f}°; "
               f"holding at {target_alt:.1f}° during rotation.")
 
+    # Sun pre-flight before ANY motion. The unwind and the initial goto move
+    # between the start and sweep elevations, and the sweep turns a full
+    # circle at the sweep elevation (move_to_ff clamps it to [5, 85]), so
+    # every azimuth in that elevation band may be visited.
+    sweep_el = min(max(float(target_alt), 5.0), 85.0)
+    sun_ok, sun_reason = sun_check_el_band(start_alt_deg, sweep_el)
+    if not sun_ok:
+        print(f"ERROR: refusing to sweep: {sun_reason}", file=sys.stderr)
+        print("Wait until the sun is lower (or higher above the sweep "
+              "elevation), or pick another --alt.", file=sys.stderr)
+        return 2
+
     reads = args.reads_per_position
     azimuths = planned_azimuths(args.samples, start_deg=-180.0)
     print(f"Collecting {args.samples} positions × {reads} reads each "
@@ -627,6 +689,12 @@ def _main_body(args, cli, loc, log_path, position_logger, tracker_holder):
             label = "tilt-peak direction (pre-anchor)"
         try:
             cur_alt, cur_az = vc.measure_altaz(cli, loc)
+            # Re-check the sun: time has passed since the sweep pre-flight.
+            sun_ok, sun_reason = sun_check_el_band(
+                cur_alt, min(max(float(target_alt), 5.0), 85.0)
+            )
+            if not sun_ok:
+                raise RuntimeError(f"refused: {sun_reason}")
             print(f"Slewing to {label}: az={uphill_az:+.1f}° alt={target_alt:.1f}° "
                   f"(from cur_az={cur_az:+.2f}°)")
             vc.move_to_ff(
@@ -753,6 +821,12 @@ def _sign_anchor_prompt(cli, loc, fit, target_alt: float) -> bool | None:
 
     try:
         cur_alt, cur_az = vc.measure_altaz(cli, loc)
+        # Re-check the sun: the operator may have waited at the prompt.
+        sun_ok, sun_reason = sun_check_el_band(
+            cur_alt, min(max(float(target_alt), 5.0), 85.0)
+        )
+        if not sun_ok:
+            raise RuntimeError(f"refused: {sun_reason}")
         vc.move_to_ff(
             cli,
             target_az_deg=fit.tilt_mount_az_deg, target_el_deg=target_alt,

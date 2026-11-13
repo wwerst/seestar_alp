@@ -21,7 +21,10 @@ from device.sun_safety import (
     compute_jog_angle,
     compute_sun_altaz,
     is_sun_safe,
+    jog_path_points,
     make_scope_altaz_reader,
+    path_is_sun_safe,
+    sample_azel_segment,
 )
 
 
@@ -509,13 +512,15 @@ def test_monitor_trips_and_calls_abort_then_jog_then_releases():
         ss.compute_sun_altaz = real
 
     assert len(aborts) == 1, "abort_active should be called exactly once"
-    assert len(jog.calls) == 1, "jog_command should be called exactly once"
+    # One jog before abort_active, and the same jog re-issued once after it.
+    assert len(jog.calls) == 2, "jog_command: once, then re-issued after abort"
+    assert jog.calls[1] == jog.calls[0]
     speed, angle, dur = jog.calls[0]
     assert speed == 1440
     assert dur == 0
     assert 0 <= angle < 360
-    # Lockout should have been set during the jog call.
-    assert jog.was_locked_during_call == [True]
+    # Lockout should have been set during both jog calls.
+    assert jog.was_locked_during_call == [True, True]
     # After _trigger_emergency returns, lockout should be cleared.
     assert m.is_locked_out() is False
     trip = m.last_trip()
@@ -865,9 +870,77 @@ def test_trip_jogs_before_aborting():
         m._tick()
     finally:
         ss.compute_sun_altaz = real
-    assert order == ["jog", "abort"], (
-        "mount must jog out of the cone before slow abort_active teardown"
+    assert order == ["jog", "abort", "jog"], (
+        "mount must jog out of the cone before slow abort_active teardown, "
+        "then re-issue the jog once the sessions are gone"
     )
+
+
+def test_trip_reissued_jog_is_last_command_after_abort():
+    """Check-then-act race: a session command that passed its lockout check
+    just before the trip can reach the firmware after the first jog and
+    supersede it. abort_active joins those sessions, so the monitor re-issues
+    the same jog once afterwards; the jog must be the last command sent."""
+    from device import sun_safety as ss
+
+    sun_pos = (180.0, 30.0)
+    real = ss.compute_sun_altaz
+    ss.compute_sun_altaz = lambda **kw: sun_pos
+    try:
+        sent: list[tuple] = []
+
+        def _jog(speed, angle, dur):
+            sent.append(("jog", speed, angle, dur))
+
+        def _abort():
+            # A late controller scope_speed_move lands during teardown.
+            sent.append(("late_controller_move",))
+
+        def _reader():
+            jogs = [c for c in sent if c[0] == "jog"]
+            return (181.0, 31.0) if not jogs else (90.0, 10.0)
+
+        m = SunSafetyMonitor(
+            altaz_reader=_reader,
+            jog_command=_jog,
+            abort_active=_abort,
+            lat_deg=33.96,
+            lon_deg=-118.46,
+            jog_duration_s=0,
+        )
+        m._tick()
+    finally:
+        ss.compute_sun_altaz = real
+    assert [c[0] for c in sent] == ["jog", "late_controller_move", "jog"]
+    assert sent[-1] == sent[0], "the re-issued jog is the same jog"
+    assert m.is_locked_out() is False
+
+
+def test_trip_without_abort_callback_jogs_once():
+    """With no abort_active there is no teardown to wait for, so the jog is
+    not re-issued."""
+    from device import sun_safety as ss
+
+    sun_pos = (180.0, 30.0)
+    real = ss.compute_sun_altaz
+    ss.compute_sun_altaz = lambda **kw: sun_pos
+    try:
+        jog = _FakeJog()
+
+        def _reader():
+            return (181.0, 31.0) if not jog.calls else (90.0, 10.0)
+
+        m = SunSafetyMonitor(
+            altaz_reader=_reader,
+            jog_command=jog,
+            lat_deg=33.96,
+            lon_deg=-118.46,
+            jog_duration_s=0,
+        )
+        m._tick()
+    finally:
+        ss.compute_sun_altaz = real
+    assert len(jog.calls) == 1
 
 
 # --- P1: geometry consolidation -------------------------------------------
@@ -907,9 +980,10 @@ def test_monitor_rejogs_when_teardown_truncates_jog():
         jog = _FakeJog()
 
         def reader():
-            # Still inside the cone until the second jog lands (jog #1
-            # "truncated" by a teardown stop), then well clear.
-            return (181.0, 31.0) if len(jog.calls) < 2 else (90.0, 10.0)
+            # Still inside the cone after the first attempt (its jog and the
+            # post-abort re-issue both "truncated" by a teardown stop) until
+            # the re-sensed re-jog lands, then well clear.
+            return (181.0, 31.0) if len(jog.calls) < 3 else (90.0, 10.0)
 
         m = SunSafetyMonitor(
             altaz_reader=reader,
@@ -924,7 +998,8 @@ def test_monitor_rejogs_when_teardown_truncates_jog():
     finally:
         ss.compute_sun_altaz = real
 
-    assert len(jog.calls) == 2, "truncated jog must be re-issued once"
+    # Attempt 1: jog + post-abort re-issue; attempt 2: re-sensed re-jog.
+    assert len(jog.calls) == 3, "truncated jog must be re-jogged after re-sense"
     assert m.is_locked_out() is False
     assert m.is_jog_in_progress() is False
 
@@ -1003,3 +1078,109 @@ def test_jog_in_progress_unknown_jog_scope_matches_all():
         assert ss.sun_safety_jog_in_progress(7) is True
     finally:
         ss.set_sun_monitor(prev)
+
+
+# --- path helpers: sample_azel_segment / path_is_sun_safe / jog_path_points --
+
+
+def test_sample_azel_segment_includes_endpoints_and_steps():
+    pts = sample_azel_segment(100.0, 20.0, 10.0, -4.0, step_deg=2.0)
+    assert len(pts) == 6  # 10° / 2° = 5 steps, endpoints included
+    assert pts[0] == pytest.approx((100.0, 20.0))
+    assert pts[-1] == pytest.approx((110.0, 16.0))
+    for (a0, e0), (a1, e1) in zip(pts, pts[1:]):
+        assert abs(a1 - a0) <= 2.0 + 1e-9
+        assert abs(e1 - e0) <= 2.0 + 1e-9
+
+
+def test_sample_azel_segment_follows_signed_az_delta_across_wrap():
+    # +20° from 350° crosses north; -20° from 10° crosses it the other way.
+    fwd = sample_azel_segment(350.0, 10.0, 20.0, 0.0)
+    assert fwd[-1] == pytest.approx((10.0, 10.0))
+    assert all(a >= 350.0 or a <= 10.0 + 1e-9 for a, _ in fwd)
+    back = sample_azel_segment(10.0, 10.0, -20.0, 0.0)
+    assert back[-1] == pytest.approx((350.0, 10.0))
+    assert all(0.0 <= a < 360.0 for a, _ in back)
+
+
+def test_sample_azel_segment_zero_length_and_el_clamp():
+    assert sample_azel_segment(45.0, 30.0, 0.0, 0.0) == [(45.0, 30.0), (45.0, 30.0)]
+    pts = sample_azel_segment(0.0, 85.0, 0.0, 10.0)
+    assert pts[-1][1] == 90.0
+
+
+def test_sample_azel_segment_rejects_bad_input():
+    with pytest.raises(ValueError):
+        sample_azel_segment(0.0, 0.0, 10.0, 0.0, step_deg=0.0)
+    with pytest.raises(ValueError):
+        sample_azel_segment(float("nan"), 0.0, 10.0, 0.0)
+    with pytest.raises(ValueError):
+        sample_azel_segment(0.0, 0.0, float("inf"), 0.0)
+
+
+def _path_through_noon_sun():
+    """Straight az path at the sun's altitude, endpoints 50° of az either
+    side of the sun (each ~41° away, outside the 30° cone), midpoint on it."""
+    sun_az, sun_alt = compute_sun_altaz(
+        lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc()
+    )
+    return sample_azel_segment(sun_az - 50.0, sun_alt, 100.0, 0.0)
+
+
+def test_path_is_unsafe_when_midpoint_crosses_sun_though_endpoints_are_safe():
+    pts = _path_through_noon_sun()
+    for az, el in (pts[0], pts[-1]):
+        safe, _ = is_sun_safe(
+            az, el, lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc()
+        )
+        assert safe is True, "endpoints alone look safe"
+    safe, reason = path_is_sun_safe(
+        pts, lat_deg=SITE_LAT, lon_deg=SITE_LON, when=_noon_utc()
+    )
+    assert safe is False
+    assert "sun_avoidance" in reason
+    assert "path point" in reason
+
+
+def test_path_is_safe_when_sun_below_threshold():
+    safe, reason = path_is_sun_safe(
+        _path_through_noon_sun(),
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_midnight_utc(),
+    )
+    assert safe is True
+    assert reason == ""
+
+
+def test_path_is_sun_safe_fails_closed():
+    # Unset site (0/0 sentinel), same as is_sun_safe.
+    safe, reason = path_is_sun_safe([(10.0, 5.0)], lat_deg=0.0, lon_deg=0.0)
+    assert safe is False
+    assert "location is not set" in reason
+    # Nothing to verify.
+    safe, _ = path_is_sun_safe([], lat_deg=SITE_LAT, lon_deg=SITE_LON)
+    assert safe is False
+    # Non-finite point.
+    safe, _ = path_is_sun_safe(
+        [(10.0, float("nan"))],
+        lat_deg=SITE_LAT,
+        lon_deg=SITE_LON,
+        when=_midnight_utc(),
+    )
+    assert safe is False
+
+
+def test_jog_path_points_uses_compute_jog_angle_model():
+    # speed 237 = 1 deg/s, so 10 s travels 10°; 90° = +el, 0° = +az.
+    up = jog_path_points(100.0, 20.0, 90, 237, 10)
+    assert up[0] == pytest.approx((100.0, 20.0))
+    assert up[-1] == pytest.approx((100.0, 30.0))
+    right = jog_path_points(100.0, 20.0, 0, 237, 10)
+    assert right[-1] == pytest.approx((110.0, 20.0))
+
+
+def test_jog_path_points_negative_speed_covers_both_directions():
+    pts = jog_path_points(100.0, 20.0, 90, -237, 10)
+    assert any(p == pytest.approx((100.0, 30.0)) for p in pts)
+    assert any(p == pytest.approx((100.0, 10.0)) for p in pts)

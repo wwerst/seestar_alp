@@ -38,8 +38,10 @@
 #               var here. MIT license and module header. No mcast.
 #
 import sys
+import math
 import tomlkit
 import logging
+import secrets
 import shutil
 
 ### rwr
@@ -48,6 +50,81 @@ import os
 
 ### end rwr
 import typing
+
+
+class ConfigError(Exception):
+    """Raised when config.toml exists but cannot be parsed.
+
+    Carries a human-readable, actionable message (offending file, location, and
+    the common Windows-backslash fix) so the app can report it cleanly instead
+    of dying with a raw tomlkit traceback.
+    """
+
+
+def stage_file(path: str, text: str | bytes, encoding=None) -> str:
+    """Write ``text`` in full to a new temporary file next to ``path``, flushed
+    and fsynced; ``bytes`` are written as they are.
+
+    Returns its name, for ``os.replace`` onto ``path``. The name is
+    ``<path>.<random>.tmp``, created exclusively, so two writers of one file
+    never share a temporary file. When the write fails the temporary file is
+    removed and the error is raised again.
+    """
+    tmp_name = f"{path}.{secrets.token_hex(6)}.tmp"
+    binary = isinstance(text, bytes)
+    # Outside the try: a name that already exists is not ours to remove.
+    f = open(tmp_name, "xb" if binary else "x", encoding=None if binary else encoding)
+    try:
+        with f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        if os.path.exists(tmp_name):
+            os.remove(tmp_name)
+        raise
+    return tmp_name
+
+
+def write_file_atomic(path: str, text: str | bytes, encoding=None):
+    """Replace ``path`` with ``text`` in one step.
+
+    After a crash or a power loss the file holds either its former content or
+    the new one, never a truncated mix (see ``stage_file``). The temporary
+    file is removed when anything fails, and the error is raised again.
+    """
+    tmp_name = stage_file(path, text, encoding)
+    try:
+        os.replace(tmp_name, path)
+    except Exception:
+        if os.path.exists(tmp_name):
+            os.remove(tmp_name)
+        raise
+
+
+def _parse_toml(text: str, toml_path: str):
+    """Parse TOML text, converting tomlkit parse failures into a ConfigError
+    with an actionable message.
+
+    The usual culprit on Windows is a raw path such as ``"C:\\Users\\..."`` in a
+    double-quoted string: ``\\U`` (and friends) are read as string escapes and
+    the parse fails. The fix is single quotes, forward slashes, or doubled
+    backslashes, so the message spells that out.
+    """
+    try:
+        return tomlkit.loads(text)
+    except tomlkit.exceptions.ParseError as e:
+        # str(e) already reads e.g. "Invalid unicode value at line 63 col 18".
+        raise ConfigError(
+            f"Could not parse configuration file:\n  {toml_path}\n"
+            f"Error: {e}.\n\n"
+            "If this line contains a Windows path, the backslashes are being "
+            "read as string escapes. Fix it by using single quotes, e.g.\n"
+            "  save_frames_dir = 'C:\\Users\\you\\Images'\n"
+            "or forward slashes ('C:/Users/you/Images'), or doubled backslashes "
+            "('C:\\\\Users\\\\you\\\\Images')."
+        ) from e
+
 
 #
 # This slimy hack is for Sphinx which, despite the toml.load() being
@@ -62,10 +139,29 @@ else:
     search_path = path.join(path.dirname(__file__))
 
 
+def _resolve_config_path(search_path: str) -> str:
+    """Resolve the config.toml path, honoring SEESTAR_ALP_CONFIG_PATH for testability.
+
+    Set by system tests (tests/system/) to point at a scratch config without
+    touching the developer's real device/config.toml.
+    """
+    override = os.environ.get("SEESTAR_ALP_CONFIG_PATH")
+    if override:
+        override = os.path.abspath(override)
+        if not os.path.exists(override):
+            raise FileNotFoundError(
+                f"SEESTAR_ALP_CONFIG_PATH points at a missing file: {override}"
+            )
+        return override
+    return os.path.abspath(os.path.join(search_path, "config.toml"))
+
+
 class _Config:
     def __init__(self):
-        self.path_to_dat = os.path.abspath(os.path.join(search_path, "config.toml"))
-        if not os.path.exists(self.path_to_dat):
+        self.path_to_dat = _resolve_config_path(search_path)
+        if not os.environ.get("SEESTAR_ALP_CONFIG_PATH") and not os.path.exists(
+            self.path_to_dat
+        ):
             path_to_ex = os.path.abspath(
                 os.path.join(search_path, "config.toml.example")
             )
@@ -93,7 +189,11 @@ class _Config:
             self._dict = preloaded_dict
         else:
             with open(toml_path) as fp:
-                self._dict = tomlkit.loads(fp.read())
+                text = fp.read()
+            # _parse_toml raises ConfigError on a malformed file BEFORE this
+            # assignment runs, so self._dict keeps its last-good value (a failed
+            # reload must not leave the running app with an empty config).
+            self._dict = _parse_toml(text, toml_path)
         """
         Load a config.toml file into a Config object.
 
@@ -119,6 +219,28 @@ class _Config:
         # WebUI Section
         # --------------
         self.uiport: int = self.get_toml("webui_settings", "uiport", 5432)
+        # URL prefix when served under a reverse-proxy sub-path, e.g. "/ssc".
+        # A valid X-Forwarded-Prefix request header takes precedence.
+        root_path = self.get_toml("webui_settings", "root_path", "")
+        # Same shape front/app.py accepts: "" or "/seg[/seg...]" with plain segments.
+        value = root_path.strip().rstrip("/") if isinstance(root_path, str) else None
+        allowed = set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-"
+        )
+        if value and (
+            not value.startswith("/")
+            or any(
+                not s or s in (".", "..") or not set(s) <= allowed
+                for s in value.split("/")[1:]
+            )
+        ):
+            value = None
+        if value is None:
+            logging.getLogger(__name__).warning(
+                f"Ignoring invalid [webui_settings] root_path: {root_path!r}"
+            )
+            value = ""
+        self.root_path: str = value
         self.uitheme: str = self.get_toml("webui_settings", "uitheme", "dark")
         self.experimental: bool = self.get_toml("webui_settings", "experimental", False)
         self.confirm: bool = self.get_toml("webui_settings", "confirm", True)
@@ -207,6 +329,9 @@ class _Config:
         )
         self.init_lat: float = self.get_toml(section, "lat", 0)
         self.init_long: float = self.get_toml(section, "long", 0)
+        # IANA name of the telescope site's time zone, e.g. "Europe/Paris".
+        # Empty: the time zone of the computer running seestar_alp.
+        self.init_timezone: str = self.get_toml(section, "timezone", "")
         self.init_gain: int = self.get_toml(section, "gain", 80)
         self.init_expo_preview_ms: int = self.get_toml(
             section, "exposure_length_preview_ms", 500
@@ -231,6 +356,12 @@ class _Config:
         )
         # Path to PEM key used for Seestar firmware 7.18+ challenge-response authentication
         self.seestar_interop_pem: str = self.get_toml(section, "interop_pem", "")
+        # Local horizon profile, a N.I.N.A. .hrz file (see device/horizon.py)
+        self.horizon_file: str = self.get_toml(section, "horizon_file", "")
+        self.horizon_skip_hidden_targets: bool = self.get_toml(
+            section, "horizon_skip_hidden_targets", False
+        )
+        self.horizon_margin: float = self.get_toml(section, "horizon_margin", 0.0)
 
         # ---------------
         # sun_avoidance Section
@@ -255,6 +386,10 @@ class _Config:
         """
         Save the config html form into a toml file
         """
+        # Validated before anything is written, so a bad value cannot leave
+        # the settings half applied.
+        horizon_margin = self.horizon_margin_from_form(req.media.get("horizon_margin"))
+
         # Reset arrays
         self.seestars = []
         self._dict["seestars"] = tomlkit.aot()
@@ -358,6 +493,11 @@ class _Config:
         )
         self.set_toml("seestar_initialization", "lat", float(req.media["init_lat"]))
         self.set_toml("seestar_initialization", "long", float(req.media["init_long"]))
+        self.set_toml(
+            "seestar_initialization",
+            "timezone",
+            str(req.media.get("init_timezone", "")).strip(),
+        )
         self.set_toml("seestar_initialization", "gain", int(req.media["init_gain"]))
         self.set_toml(
             "seestar_initialization",
@@ -412,7 +552,46 @@ class _Config:
             "interop_pem",
             req.media["interop_pem"],
         )
+        self.set_toml(
+            "seestar_initialization",
+            "horizon_file",
+            req.media.get("horizon_file", "").strip(),
+        )
+        self.set_toml(
+            "seestar_initialization",
+            "horizon_skip_hidden_targets",
+            "horizon_skip_hidden_targets" in req.media,
+        )
+        self.set_toml(
+            "seestar_initialization",
+            "horizon_margin",
+            horizon_margin,
+        )
         self.load(self.path_to_dat, preloaded_dict=self._dict)
+
+    def horizon_margin_from_form(self, value):
+        """Horizon margin from the settings form, in degrees, 0 to 90.
+
+        Empty means 0. A decimal comma and a trailing degree sign are
+        accepted. Anything else (text, a negative, out of range or NaN
+        value) keeps the current margin, with a warning in the log, rather
+        than failing the whole save.
+        """
+        current = getattr(self, "horizon_margin", 0.0)
+        text = str(value if value is not None else "").strip().rstrip("°").strip()
+        if not text:
+            return 0.0
+        try:
+            margin = float(text.replace(",", "."))
+        except ValueError:
+            margin = math.nan
+        if not (math.isfinite(margin) and 0.0 <= margin <= 90.0):
+            logging.getLogger().warning(
+                f"Horizon margin {value!r} ignored: expected degrees from 0 to 90; "
+                f"keeping {current}"
+            )
+            return current
+        return margin
 
     def load_toml(self, load_name=None):
         """
@@ -435,18 +614,7 @@ class _Config:
         if save_name is None:
             save_name = self.path_to_dat
         print(f"save_toml: writing toml to {save_name}")
-
-        tmp_name = save_name + ".tmp"
-        try:
-            with open(tmp_name, "w") as toml_file:
-                toml_file.write(tomlkit.dumps(self._dict))
-                toml_file.flush()
-                os.fsync(toml_file.fileno())
-            os.replace(tmp_name, save_name)
-        except Exception:
-            if os.path.exists(tmp_name):
-                os.remove(tmp_name)
-            raise
+        write_file_atomic(save_name, tomlkit.dumps(self._dict))
 
     #
     # HTML config rendering
@@ -841,6 +1009,12 @@ class _Config:
                     "Your Longitude in decimal format",
                 )
                 + self.render_text(
+                    "init_timezone",
+                    "Time zone:",
+                    self.init_timezone,
+                    "Time zone of the telescope site, e.g. Europe/Paris. Leave empty to use the time zone of this computer.",
+                )
+                + self.render_text(
                     "init_gain",
                     "Gain:",
                     self.init_gain,
@@ -911,6 +1085,24 @@ class _Config:
                     "Interop PEM path:",
                     self.seestar_interop_pem,
                     "Path to PEM key for Seestar firmware 7.18+ authentication (e.g. /etc/seestar/seestar_client_key.pem)",
+                )
+                + self.render_text(
+                    "horizon_file",
+                    "Horizon file:",
+                    self.horizon_file,
+                    "Path to a N.I.N.A. horizon file (.hrz, one 'azimuth altitude' pair per line). Empty: flat horizon",
+                )
+                + self.render_checkbox(
+                    "horizon_skip_hidden_targets",
+                    "Skip hidden targets:",
+                    self.horizon_skip_hidden_targets,
+                    "Scheduler: skip a mosaic target that is below the horizon when its turn comes",
+                )
+                + self.render_text(
+                    "horizon_margin",
+                    "Horizon margin:",
+                    self.horizon_margin,
+                    "Degrees, 0 to 90, a target must clear above the horizon for the scheduler",
                 ),
             )
             + self.render_config_section(
@@ -920,4 +1112,12 @@ class _Config:
         return self._dict
 
 
-Config = _Config()
+try:
+    Config = _Config()
+except ConfigError as e:
+    # The config file exists but is broken. Report it cleanly and stop, rather
+    # than crashing the frozen app with a raw tomlkit traceback. Falling back to
+    # defaults is deliberately avoided: a later settings save would overwrite
+    # the user's real config.toml (including their [[seestars]] list).
+    print(f"\nFATAL: {e}\n", file=sys.stderr)
+    sys.exit(1)

@@ -1,17 +1,17 @@
 <!doctype html>
-<html lang="en" data-bs-theme="{{ webui_theme }}">
+<html lang="en" data-bs-theme="{{ webui_theme }}"{% if root_path %} data-root-path="{{ root_path }}"{% endif %}>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}{% endblock %} - SSC</title>
     {#    <link href="/public/xterm.css" rel="stylesheet">#}
-    <script src="/public/htmx.min.js"></script>
-    <script src="/public/sse.js"></script>
-    <script src="/public/nipplejs.min.js"></script>
-    <script src="/public/liveview.js"></script>
+    <script src="{{ root_path }}/public/htmx.min.js"></script>
+    <script src="{{ root_path }}/public/sse.js"></script>
+    <script src="{{ root_path }}/public/nipplejs.min.js"></script>
+    <script src="{{ root_path }}/public/liveview.js"></script>
     {#    <script src="/public/xterm.js"></script>#}
-    <link rel="icon" type="image/x-icon" href="/public/favicon.ico">
-    <link href="/public/bootstrap.min.css" rel="stylesheet">
+    <link rel="icon" type="image/x-icon" href="{{ root_path }}/public/favicon.ico">
+    <link href="{{ root_path }}/public/bootstrap.min.css" rel="stylesheet">
     {% if webui_font_url %}
     <link href="{{ webui_font_url }}" rel="stylesheet">
     {% endif %}
@@ -32,6 +32,7 @@
             --ui-primary: {{ accent_color or "#2cb1ff" }};
             --ui-primary-hover: color-mix(in srgb, var(--ui-primary) 82%, #ffffff);
             --ui-body: {{ webui_text_color or "#e7edf7" }};
+            --ui-muted: {{ webui_text_color or "rgba(231, 237, 247, 0.75)" }};
             --ui-link: {{ webui_link_color or (accent_color or "#6fc9ff") }};
 
             --bs-primary: var(--ui-primary);
@@ -39,6 +40,7 @@
             --bs-link-color: var(--ui-link);
             --bs-link-hover-color: var(--ui-link);
             --bs-body-color: var(--ui-body);
+            --bs-secondary-color: var(--ui-muted);
             --bs-border-radius: var(--ui-radius);
             --bs-border-radius-sm: 0.6rem;
             --bs-border-radius-lg: 1rem;
@@ -78,6 +80,7 @@
                            radial-gradient(120% 90% at 96% 8%, #ffe4c1 0%, transparent 52%),
                            linear-gradient(135deg, #f6fbff 0%, #eef5ff 55%, #e9f2ff 100%);
             --ui-body: {{ webui_text_color or "#1b2a42" }};
+            --ui-muted: {{ webui_text_color or "rgba(27, 42, 66, 0.75)" }};
         }
 
         body {
@@ -1094,12 +1097,19 @@
         {% for message in messages %}
             <div class="alert alert-primary" role="alert">{{ message }}</div>
         {% endfor %}
+        <div id="auth-warning-container"
+             class="no-htmx-fx"
+             hx-get="{{ root }}/auth-status"
+             hx-trigger="every 15s"
+             hx-swap="innerHTML">
+            {% include 'partials/auth_warning.html' %}
+        </div>
         {% block content %}{% endblock %}
     </section>
 </main>
 
-<script src="/public/bootstrap.bundle.min.js"></script>
-<script src="/public/main.js"></script>
+<script src="{{ root_path }}/public/bootstrap.bundle.min.js"></script>
+<script src="{{ root_path }}/public/main.js"></script>
 <script>
   document.addEventListener("DOMContentLoaded", function () {
     const hoistModalsToBody = function (root) {

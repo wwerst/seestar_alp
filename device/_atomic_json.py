@@ -28,8 +28,33 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
+
+# os.replace attempts before giving up, and the base back-off between them.
+_REPLACE_ATTEMPTS = 8
+_REPLACE_BACKOFF_S = 0.005
+
+
+def _replace_with_retry(tmp: Path, dest: Path) -> None:
+    """``os.replace`` with a short retry on ``PermissionError``.
+
+    On Windows a rename onto ``dest`` fails with "Access is denied" while
+    another thread or process is itself mid-replace on the same file (or a
+    reader / virus scanner briefly holds it open). That is transient, so
+    retry a few times before letting the error out. On POSIX rename(2) does
+    not fail this way; a real permission problem still surfaces after the
+    retries (about 0.14 s later).
+    """
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, dest)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_S * (attempt + 1))
 
 
 def write_atomic_json(
@@ -67,7 +92,7 @@ def write_atomic_json(
                 json.dump(obj, f, indent=indent)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, p)
+        _replace_with_retry(tmp, p)
     except BaseException:
         # Any failure (serialization error, fsync/replace error): drop our
         # unique temp so a crashed write doesn't leak files, and leave the

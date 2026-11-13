@@ -3,7 +3,21 @@ import time
 import collections
 import uuid
 import json
+import socketserver
 from config import Config
+
+
+# Port of ZWO's on-device ASCOM Alpaca REST server (firmware v3.3.1+),
+# toggled via set_setting's alpaca_enable key. See _start_alpaca_server.
+ALPACA_SERVER_PORT = 32323
+
+
+class _AlpacaAcceptHandler(socketserver.BaseRequestHandler):
+    """Accepts and immediately closes connections -- enough to prove the
+    port is open, without emulating the real Alpaca HTTP protocol."""
+
+    def handle(self):
+        pass
 
 
 class SeestarSimulator:
@@ -15,6 +29,9 @@ class SeestarSimulator:
         self.device_num = device_num
         self.is_debug = is_debug
         self.cmdid = 10000
+        self._alpaca_server = None
+        self._alpaca_server_thread = None
+        self._alpaca_server_lock = threading.Lock()
         self.scope_radec = [0.0, 0.0]  # Simulated RA/Dec coordinates
         self.socket = None
         self.start_time = time.time()
@@ -38,8 +55,8 @@ class SeestarSimulator:
         self.state = {
             "device": {
                 "name": "ASI AIR imager",
-                "firmware_ver_int": 2470,
-                "firmware_ver_string": "4.70",
+                "firmware_ver_int": 2846,
+                "firmware_ver_string": "8.46",
                 "is_verified": True,
                 "sn": "simulated123",
                 "cpuId": "simcpu123",
@@ -55,6 +72,7 @@ class SeestarSimulator:
                 "lang": "en",
                 "center_xy": [540, 960],
                 "stack_lenhance": False,
+                "auto_lenhance": False,
                 "heater_enable": False,
                 "heater": {"state": False, "value": 0},
                 "expt_heater_enable": False,
@@ -65,9 +83,12 @@ class SeestarSimulator:
                 "stack_dither": {"pix": 50, "interval": 5, "enable": True},
                 "auto_3ppa_calib": True,
                 "auto_af": False,
+                "alpaca_enable": False,
                 "frame_calib": True,
                 "calib_location": 2,
                 "wide_cam": False,
+                "wide_4k": False,
+                "wide_focal_pos": 1500,
                 "stack_after_goto": False,
                 "guest_mode": False,
                 "user_stack_sim": False,
@@ -158,7 +179,9 @@ class SeestarSimulator:
             "save_discrete_frame": True,
             "save_discrete_ok_frame": True,
             "light_duration_min": 10,
+            "wide_denoise": False,
         }
+        self.state["stack_type"] = "DeepSky"
         self.filter_wheel = {
             "state": "idle",
             "position": 0,
@@ -190,6 +213,61 @@ class SeestarSimulator:
         """
         self.socket = sock
         self.logger.debug(f"Socket set in SeestarSimulator: {sock}")
+
+    def _start_alpaca_server(self):
+        """Bind a bare-accept TCP listener on the on-device Alpaca server's
+        port, mirroring the real firmware toggling alpaca_enable via
+        set_setting. Loopback-only and idempotent."""
+        with self._alpaca_server_lock:
+            if self._alpaca_server is not None:
+                return
+            try:
+                server = socketserver.TCPServer(
+                    ("127.0.0.1", ALPACA_SERVER_PORT), _AlpacaAcceptHandler
+                )
+            except OSError:
+                self.logger.warning(
+                    f"Could not bind simulated Alpaca server on port {ALPACA_SERVER_PORT}"
+                )
+                return
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self._alpaca_server = server
+            self._alpaca_server_thread = thread
+            self.logger.info(
+                f"Simulated Alpaca server listening on 127.0.0.1:{ALPACA_SERVER_PORT}"
+            )
+
+    def _stop_alpaca_server(self):
+        with self._alpaca_server_lock:
+            if self._alpaca_server is None:
+                return
+            self._alpaca_server.shutdown()
+            self._alpaca_server.server_close()
+            self._alpaca_server_thread.join(timeout=2)
+            self._alpaca_server = None
+            self._alpaca_server_thread = None
+            self.logger.info("Simulated Alpaca server stopped")
+
+    @staticmethod
+    def _extract_ra_dec(params):
+        """Mirror real firmware's Params::Params: accept a keyed {"ra","dec"}
+        object OR a positional [ra, dec, ...] list (extra trailing elements,
+        e.g. a "verify" flag, are ignored) -- reject anything else, including
+        a doubly-nested list like [[ra, dec], "verify"]."""
+
+        def _is_num(v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+        if isinstance(params, dict):
+            ra, dec = params.get("ra"), params.get("dec")
+        elif isinstance(params, list) and len(params) >= 2:
+            ra, dec = params[0], params[1]
+        else:
+            return None
+        if _is_num(ra) and _is_num(dec):
+            return (ra, dec)
+        return None
 
     # Simulate the main API methods
     def send_message_param_sync(self, data):
@@ -243,8 +321,30 @@ class SeestarSimulator:
                 "code": 0,
                 "id": cur_cmdid,
             }
+        elif method == "set_stack_type":
+            self.state["stack_type"] = data.get("params", {}).get("type", "DeepSky")
+            return {
+                "jsonrpc": "2.0",
+                "Timestamp": timestamp,
+                "method": "set_stack_type",
+                "result": 0,
+                "id": cur_cmdid,
+            }
         elif method == "set_setting":
-            self.state["setting"].update(data.get("params", {}))
+            params = data.get("params", {})
+            setting = self.state["setting"]
+            for key, value in params.items():
+                # The firmware applies object members one by one (stack,
+                # mosaic, ...), so a partial object updates, not replaces.
+                if isinstance(value, dict) and isinstance(setting.get(key), dict):
+                    setting[key].update(value)
+                else:
+                    setting[key] = value
+            if "alpaca_enable" in params:
+                if params["alpaca_enable"]:
+                    self._start_alpaca_server()
+                else:
+                    self._stop_alpaca_server()
             return {
                 "jsonrpc": "2.0",
                 "Timestamp": timestamp,
@@ -393,6 +493,15 @@ class SeestarSimulator:
                 "id": cur_cmdid,
             }
         elif method == "scope_goto":
+            if self._extract_ra_dec(data.get("params")) is None:
+                return {
+                    "jsonrpc": "2.0",
+                    "Timestamp": timestamp,
+                    "method": "scope_goto",
+                    "error": "expected float param",
+                    "code": 108,
+                    "id": cur_cmdid,
+                }
             # Simulate slewing
             self.state["mount"]["move_type"] = "goto"
             return {
@@ -402,8 +511,22 @@ class SeestarSimulator:
                 "id": cur_cmdid,
             }
         elif method == "scope_sync":
+            if self._extract_ra_dec(data.get("params")) is None:
+                return {
+                    "jsonrpc": "2.0",
+                    "Timestamp": timestamp,
+                    "method": "scope_sync",
+                    "error": "expected float param",
+                    "code": 108,
+                    "id": cur_cmdid,
+                }
             # Simulate sync
-            return {"jsonrpc": "2.0", "result": 0, "id": cur_cmdid}
+            return {
+                "jsonrpc": "2.0",
+                "method": "scope_sync",
+                "result": 0,
+                "id": cur_cmdid,
+            }
         elif method == "scope_speed_move":
             # Simulate move
             return {
@@ -508,8 +631,22 @@ class SeestarSimulator:
                 "id": cur_cmdid,
             }
         elif method == "pi_set_time":
+            params = data.get("params")
+            if isinstance(params, list) and params:
+                # Real firmware's json_array2obj unwraps a single-element
+                # array to its first element before requiring an object.
+                params = params[0]
+            if not isinstance(params, dict):
+                return {
+                    "jsonrpc": "2.0",
+                    "Timestamp": timestamp,
+                    "method": "pi_set_time",
+                    "error": "expected object param",
+                    "code": 107,
+                    "id": cur_cmdid,
+                }
             # Simulate setting time
-            self.scope_time = data.get("params", {})
+            self.scope_time = params
             return {
                 "jsonrpc": "2.0",
                 "Timestamp": timestamp,

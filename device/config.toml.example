@@ -11,11 +11,17 @@ rtsp_udp = true
 
 [webui_settings]
 uiport = 5432
+# Serving the web UI under a reverse-proxy sub-path (e.g. https://host/ssc/)?
+# Set the prefix here. A proxy can instead send it per request in the
+# X-Forwarded-Prefix header, which takes precedence. Leave empty otherwise.
+#root_path = "/ssc"
 # light/dark theme
 uitheme = "dark" #all lower case
 #experimental = true
 confirm = true	# Enable/Disable the Commands page confirmation dialog
 # save_frames = false
+# For a Windows path use SINGLE quotes so backslashes aren't read as escapes:
+# save_frames_dir = 'C:\Users\you\Images'
 # save_frames_dir = "."
 
 # CSS overrides
@@ -51,6 +57,7 @@ save_good_frames = true
 save_all_frames = false             # including good and bad frames
 lat = 37.12                         # telescope location (lat), set to 0 if you want to guess from IP address
 long = -123.45                      # telescope location (long), set to 0 if you want to guess from IP address
+timezone = ""                       # telescope site time zone, e.g. "Europe/Paris"; empty = this computer's time zone
 gain = 80
 exposure_length_preview_ms = 500
 exposure_length_stack_ms = 10000
@@ -70,7 +77,17 @@ is_frame_calibrated = true
 # device via the challenge-response authentication required by firmware 7.18+.
 # The legality of key use varies by jurisdiction. You are solely responsible for ensuring
 # compliance with the laws of your region.
-interop_pem = ""  # e.g. "/etc/seestar/seestar_client_key.pem"
+# Path to the PEM key. Windows paths contain backslashes, so use SINGLE quotes
+# (a TOML literal string) to avoid "\U"/"\s" escape errors that crash startup.
+# e.g. 'C:\Users\you\seestar_client_key.pem'  or  '/etc/seestar/seestar_client_key.pem'
+interop_pem = ''
+
+# Local horizon profile: a N.I.N.A. horizon file (.hrz), one "azimuth altitude"
+# pair per line, in degrees. Drawn in the planner's AstroMosaic day chart.
+# Empty: flat horizon. Single quotes for Windows paths, as above.
+horizon_file = ''
+horizon_skip_hidden_targets = false # scheduler: skip a mosaic target below the horizon when its turn comes
+horizon_margin = 0.0                # degrees a target must clear above the horizon for the scheduler
 
 [sun_avoidance]
 # Always-on safety check: refuse to point the optical axis within
@@ -101,6 +118,12 @@ name = "Seestar Alpha"
 # ip_address should not have to be changed unless you have more than 1 seestar
 ip_address = "seestar.local"
 device_num = 1
+# Set to true when this entry points at the QEMU emulator (emulator/), not real
+# hardware, to suppress the firmware-auth warning banner. The emulator always
+# reports unverified -- its license signature check can only pass with a real
+# device's captured signing key, which can't be shipped in this repo (see
+# emulator/README.md) -- so the warning can never clear on its own there.
+#is_emulator = true
 #[[seestars]]
 #name = "Seestar Beta"
 #ip_address = "192.168.110.36"

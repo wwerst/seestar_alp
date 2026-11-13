@@ -11,6 +11,7 @@ import uuid
 from time import sleep
 import collections
 import copy
+import itertools
 from typing import Optional, Any, TypedDict, NotRequired
 
 import pydash
@@ -26,6 +27,7 @@ from pyhocon import ConfigFactory
 
 from device.abstract_device import MessageParams, StartStackParams, Schedule
 from device.config import Config
+from device import horizon
 from device.version import Version  # type: ignore
 from device.seestar_util import Util
 from device.event_callbacks import *
@@ -96,7 +98,6 @@ class Seestar:
         self.port: int = port
         self.device_name: str = device_name
         self.device_num: int = device_num
-        self.cmdid: int = 10000
         self.site_latitude: float = Config.init_lat
         self.site_longitude: float = Config.init_long
         self.site_elevation: float = 0
@@ -122,6 +123,24 @@ class Seestar:
         self.is_connected: bool = False
         # PEM key bytes (lazy loaded)
         self._interop_pem: Optional[bytes] = None
+        # Socket bytes read during the inline auth handshake, preserved for
+        # the receive_message_thread to process once it starts.
+        self._auth_leftover: str = ""
+        # Firmware 7.18+ auth is opt-in (interop_pem configured) and self-healing:
+        # the socket stays up even while unauthenticated (the event stream flows
+        # fine without auth), and the heartbeat loop retries auth until it lands.
+        self.is_authenticated: bool = False
+        self._last_auth_attempt: float = 0.0
+        # Tracks whether THIS connection has ever gotten a sync reply, and how
+        # many consecutive sync timeouts have piled up since.  Old pre-auth
+        # firmware answers something quickly; firmware that requires auth but
+        # isn't authenticated silently ignores every command while still
+        # streaming async events, so a connection that has never once gotten a
+        # reply back is a strong signal of that -- not just a busy scope (see
+        # issue #759: interop_pem missing or wrong looks exactly like this).
+        self._connection_had_sync_reply: bool = False
+        self._consecutive_sync_timeouts: int = 0
+        self._auth_gap_logged: bool = False
         self.is_slewing: bool = False
         self.target_dec: float = 0
         self.target_ra: float = 0
@@ -146,20 +165,42 @@ class Seestar:
         }
         self.lock = threading.RLock()
         self._plate_solve_sync_lock = threading.Lock()
-        # Serializes cmdid allocation + socket send so two concurrent callers
-        # can't hand out the same id or interleave bytes on the wire. In the
-        # common case it is held only across the send, never across the
-        # caller's response wait. Reentrant because send_message() recovers
-        # from a socket error by calling reconnect() while still holding this
-        # lock, and reconnect()'s auth handshake issues its own
-        # send_message_param_sync calls (get_verify_str / verify_client) on
-        # this same thread — a plain Lock would self-deadlock there. On that
-        # reconnect-inside-send path the lock IS held across the handshake's
-        # synchronous response waits, so every other sender is serialized
-        # behind the reconnect for its full duration (accepted cost; the
-        # locking is deliberately not restructured here).
-        self._send_lock = threading.RLock()
+        # The Alpaca server is threaded, so concurrent requests reach the send
+        # path at once.
+        #
+        # Command ids: replies are matched by id in response_dict, so every
+        # auto-allocated id (from _cmdids) must be unique. A caller may pin its
+        # own id instead (the heartbeat's 420, an explicit 0); a pinned id that
+        # falls inside the auto range is reserved so the counter skips it.
+        # _cmdid_lock makes that skip-or-reserve step atomic.
+        self._cmdids = itertools.count(self._FIRST_AUTO_CMDID)
+        self._reserved_cmdids: set[int] = set()
+        self._cmdid_lock = threading.Lock()
+        # _socket_write_lock keeps each message's bytes contiguous on the
+        # single scope socket, and guards every close and swap of self.s, so
+        # the socket is never closed or replaced mid-sendall. It is held only
+        # for that instant -- never across reconnect/re-auth, which waits on
+        # the scope.
+        self._socket_write_lock = threading.Lock()
+        # Single-flight reconnect. _reconnect_leader is the thread running a
+        # reconnect (disconnect, connect, firmware handshake), or None. While it
+        # is set, ordinary senders wait on _conn_cond (bounded), so no command
+        # reaches the scope before the handshake is done. The leader itself and
+        # the receive thread (which must keep draining the socket so the
+        # handshake reply can arrive) never wait. Neither _socket_write_lock nor
+        # _conn_cond is held while taking the other, or across a reconnect.
+        self._conn_cond = threading.Condition()
+        self._reconnect_leader: Optional[threading.Thread] = None
         self.is_cur_scheduler_item_working: bool = False
+
+        # Guards insertion/removal of top-level event_state keys. IncomingMsgThread
+        # inserts a new key for every previously-unseen firmware "Event" name, which
+        # can race with get_event_state() iterating the same dict on the ALP request
+        # thread (RuntimeError: dictionary changed size during iteration) -- a real,
+        # reproducible crash during an active goto's event burst, not just a rare
+        # theoretical race. Value-only mutations of already-existing keys don't need
+        # this (dict size doesn't change), so most call sites are left as-is.
+        self.event_state_lock = threading.Lock()
 
         self.event_state: dict[str, Any] = {}
         self.update_scheduler_state_obj({}, result=0)
@@ -175,6 +216,7 @@ class Seestar:
         self.event_queue = collections.deque(maxlen=20)
         self.eventbus = signal(f"{self.device_name}.eventbus")
         self.is_EQ_mode: bool = False  # updated from device state on startup
+        self.is_EQ_mode_confirmed: bool = False  # True once read from the device
         # self.trace = MessageTrace(self.device_num, self.port)
 
     def _load_interop_pem(self) -> None:
@@ -227,47 +269,175 @@ class Seestar:
         )
         return base64.b64encode(signature).decode("utf-8")
 
+    def _auth_rpc_sync(self, method: str, params=None, timeout: float = 8.0):
+        """Send one RPC and read its reply directly off the socket.
+
+        authenticate() runs inline from reconnect(), which is called *before*
+        start_watch_thread() starts the receive_message_thread.  During the
+        handshake nothing is draining the socket, so send_message_param_sync()
+        (which waits on response_dict, populated only by the receive thread)
+        can never see the reply and always times out.  We therefore read the
+        socket ourselves here.  Any other lines seen while waiting (unsolicited
+        events, etc.) are preserved in self._auth_leftover, in order, so the
+        receive thread can process them once it starts.
+        """
+        msg: dict[str, Any] = {"id": None, "method": method}
+        if params is not None:
+            msg["params"] = params
+        cur_cmdid, sent = self._send_json(msg)
+        if not sent:
+            return None
+
+        # When the receive thread is already draining the socket (mid-session
+        # re-auth from the heartbeat loop or send_message error recovery),
+        # reading the socket here too would race it: each byte goes to exactly
+        # one reader, so events could be stranded in _auth_leftover (which the
+        # receive thread only drains once, at startup) and a single JSON line
+        # could be torn between the two readers.  Wait on response_dict instead,
+        # which the receive thread populates.
+        # (If we ARE the receive thread — its socket-error recovery path calls
+        # reconnect() — nobody else is reading, so fall through to the raw read.)
+        rx_thread = self.get_msg_thread
+        if (
+            rx_thread is not None
+            and rx_thread.is_alive()
+            and rx_thread is not threading.current_thread()
+        ):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if cur_cmdid in self.response_dict:
+                    return self.response_dict[cur_cmdid]
+                time.sleep(0.1)
+            return None
+
+        with self._socket_write_lock:
+            sock = self.s
+        prev_timeout = sock.gettimeout() if sock else None
+        deadline = time.monotonic() + timeout
+        buf = self._auth_leftover  # unprocessed bytes (may hold a partial line)
+        carry = ""  # complete, non-matching lines to hand back to the reader
+        self._auth_leftover = ""
+        try:
+            if sock:
+                sock.settimeout(1.0)
+            while time.monotonic() < deadline:
+                # During a mid-session re-auth (e.g. reconnect from the
+                # heartbeat thread) the receive thread is already running and
+                # may consume our reply into response_dict before we can read
+                # it off the socket.  Accept it from either place.
+                if cur_cmdid in self.response_dict:
+                    self._auth_leftover = carry + buf
+                    return self.response_dict[cur_cmdid]
+                while "\r\n" in buf:
+                    line, buf = buf.split("\r\n", 1)
+                    parsed = None
+                    if line.strip():
+                        try:
+                            parsed = json.loads(line)
+                        except Exception:
+                            parsed = None
+                    if (
+                        isinstance(parsed, dict)
+                        and parsed.get("id") == cur_cmdid
+                        and "Event" not in parsed
+                    ):
+                        self._auth_leftover = carry + buf
+                        return parsed
+                    carry += line + "\r\n"
+                try:
+                    chunk = sock.recv(1024 * 60) if sock else b""
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                buf += chunk.decode("utf-8", errors="replace")
+        finally:
+            if sock and prev_timeout is not None:
+                try:
+                    sock.settimeout(prev_timeout)
+                except OSError:
+                    pass  # closed underneath us by a reconnect
+            if not self._auth_leftover:
+                self._auth_leftover = carry + buf
+        return None
+
     def authenticate(self) -> bool:
         """Perform 2-step authentication expected by firmware 7.18+.
 
         Returns True if authentication succeeded.
         """
+        # Buffer used to carry socket bytes read during the handshake over to
+        # the receive_message_thread (started after reconnect() returns).
+        # Inline auth runs right after a fresh socket was created, so any
+        # leftover from a previous connection is stale — discard it rather
+        # than replaying possibly-partial old-session bytes into the new
+        # stream.  (Heartbeat-driven retries never populate this buffer: with
+        # the receive thread running, _auth_rpc_sync waits on response_dict
+        # instead of reading the socket.)
+        self._auth_leftover = ""
         try:
-            self.logger.info("Requesting authentication challenge (get_verify_str)")
-            resp = self.send_message_param_sync({"method": "get_verify_str"})
+            self.logger.debug("Requesting authentication challenge (get_verify_str)")
+            resp = self._auth_rpc_sync("get_verify_str")
             challenge_str = ""
-            if isinstance(resp, dict):
-                challenge_str = resp.get("result", {}).get("str", "")
+            if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
+                challenge_str = resp["result"].get("str", "")
 
             if not challenge_str:
-                self.logger.warning(f"No challenge string received: {resp}")
+                # debug: the busy-scope case repeats on every throttled retry;
+                # reconnect() already warns once per connection.
+                self.logger.debug(
+                    f"No auth challenge yet (scope busy?); will retry. response={resp}"
+                )
                 return False
 
-            self.logger.info("Signing challenge and sending verify_client")
+            self.logger.debug("Signing challenge and sending verify_client")
             signed = self._sign_challenge(challenge_str)
             verify_params = {"sign": signed, "data": challenge_str}
-            verify_resp = self.send_message_param_sync(
-                {"method": "verify_client", "params": verify_params}
-            )
+            verify_resp = self._auth_rpc_sync("verify_client", verify_params)
 
-            # Accept either result==0 or code==0 depending on firmware responses
+            # Accept either result==0 or code==0 depending on firmware responses.
+            # Firmware 9.75+ (app 3.4.0) replies with result={"key_envelope":
+            # {...}} (the wrapped session key for its encrypted-RPC layer)
+            # instead of result==0; success is then signalled by code==0.
             ok = False
+            has_envelope = False
             if isinstance(verify_resp, dict):
-                if verify_resp.get("result", verify_resp.get("code", -1)) == 0:
+                result = verify_resp.get("result", verify_resp.get("code", -1))
+                if result == 0:
                     ok = True
+                elif (
+                    isinstance(result, dict)
+                    and "key_envelope" in result
+                    and verify_resp.get("code", 0) == 0
+                ):
+                    ok = True
+                    has_envelope = True
 
             if not ok:
                 self.logger.warning(f"verify_client failed: {verify_resp}")
                 return False
 
+            # The envelope is only ever returned for a client the device has
+            # just verified, and pi_is_verified on 9.75+ also reflects the
+            # unit's hardware/licence check rather than this client, so it can
+            # read false for a verified connection.  Don't second-guess it.
+            if has_envelope:
+                self.logger.info("Authentication successful")
+                return True
+
             # sanity check
             try:
-                verified = self.send_message_param_sync({"method": "pi_is_verified"})
-                is_verified = (
-                    verified.get("result", {}).get("is_verified", False)
-                    if isinstance(verified, dict)
-                    else False
+                verified = self._auth_rpc_sync("pi_is_verified")
+                result_val = (
+                    verified.get("result") if isinstance(verified, dict) else None
                 )
+                # Firmware returns result: True (boolean) directly, not {"is_verified": true}
+                if isinstance(result_val, bool):
+                    is_verified = result_val
+                elif isinstance(result_val, dict):
+                    is_verified = result_val.get("is_verified", False)
+                else:
+                    is_verified = False
                 if not is_verified:
                     self.logger.warning(
                         f"Device did not report verified after verify_client: {verified}"
@@ -282,6 +452,69 @@ class Seestar:
         except Exception as e:
             self.logger.warning(f"Authentication error: {e}")
             return False
+
+    # Minimum seconds between auth attempts. A busy scope keeps timing out
+    # get_verify_str (~10s each); throttle so we don't hammer while waiting for
+    # it to go idle, but stay responsive enough to authenticate at the first gap.
+    _AUTH_RETRY_INTERVAL_S = 10.0
+
+    def _maybe_authenticate(self) -> None:
+        """Best-effort, self-healing firmware auth, driven by the heartbeat loop.
+
+        Never disconnects: an unauthenticated socket still carries the event
+        stream, so a busy scope that can't answer get_verify_str yet is simply
+        retried later (throttled) rather than dropped. No-op when no interop PEM
+        is configured (auth is opt-in) or once already authenticated.
+        """
+        if self.is_authenticated:
+            return
+        if not getattr(Config, "seestar_interop_pem", ""):
+            return
+        now = time.time()
+        if now - self._last_auth_attempt < self._AUTH_RETRY_INTERVAL_S:
+            return
+        with self._conn_cond:
+            if self._reconnect_leader is not None:
+                return  # a reconnect is handshaking; it authenticates
+            sock = self.s
+        self._last_auth_attempt = now
+        # debug level: this repeats every retry interval while the scope is
+        # busy, which can be a multi-hour imaging session.
+        self.logger.debug("Attempting firmware authentication")
+        # No reconnect leadership here: this socket already carries traffic, and
+        # a busy scope can stall get_verify_str for ~8 s of every retry interval.
+        # Ordinary commands keep going out meanwhile, as they did before the
+        # retry. Only a fresh socket (reconnect) holds commands back for auth.
+        try:
+            ok = self.authenticate()
+        except Exception as e:
+            # authenticate() already guards its own errors; this is a last-resort
+            # net so a surprise never takes down the heartbeat loop or the socket.
+            self.logger.warning(
+                f"Authentication attempt raised (staying connected, will retry): {e}"
+            )
+            ok = False
+        if not ok:
+            self.logger.debug(
+                "Firmware authentication still busy; staying connected, will retry"
+            )
+        elif self._publish_authenticated(sock):
+            self.logger.info("Firmware authentication succeeded")
+        else:
+            # The socket was retired or replaced mid-handshake; a reconnect
+            # authenticates the new one itself.
+            self.logger.debug("Socket replaced during authentication; not reusing it")
+
+    def _publish_authenticated(self, sock: Optional[socket.socket]) -> bool:
+        """Mark the connection authenticated if ``sock`` is still the current
+        socket. Checked and set under ``_socket_write_lock``, the lock every
+        retire/disconnect path resets auth state under, so a socket retired
+        after a successful handshake can never be reported authenticated."""
+        with self._socket_write_lock:
+            if sock is None or self.s is not sock:
+                return False
+            self.is_authenticated = True
+            return True
 
     # scheduler state example: {"state":"working", "schedule_id":"abcdefg",
     #       "result":0, "error":"dummy error",
@@ -309,50 +542,125 @@ class Seestar:
         }
         self.logger.info(f"scheduler event state: {self.event_state['scheduler']}")
 
-    def heartbeat(
-        self,
-    ):  # I noticed a lot of pairs of test_connection followed by a get if nothing was going on
-        #    json_message("test_connection")
+    def heartbeat(self):
+        # The firmware closes a LAN connection after 15 s without received
+        # bytes; the spec's recommended keepalive is test_connection.
+        # scope_get_equ_coord is used instead because its reply keeps
+        # self.ra/self.dec current for the Alpaca RightAscension/Declination
+        # properties, so one request serves both purposes. Tradeoff: it is a
+        # live mount read relayed to the guider, and repeated read failures
+        # there can stop capture or mark the mount disconnected (seestar-spec,
+        # scope_get_ra_dec, READ).
         self.json_message("scope_get_equ_coord", id=420)
 
     def send_message(self, data):
         try:
-            if self.s is None:
-                self.logger.warning("socket not initialized!")
-                time.sleep(3)
-                return False
-            # todo : don't send if not connected or socket is null?
-            if '"id":420' not in data:
-                self.logger.info(f"[{self.device_name}] scope send: {data.rstrip()}")
-            self.s.sendall(
-                data.encode()
-            )  # TODO: would utf-8 or unicode_escaped help here
-            return True
-        except socket.timeout:
-            return False
-        except socket.error as e:
-            # Don't bother trying to recover if watch events is False
-            self.logger.debug(f"Send socket error: {e}")
-            self.disconnect()
-            if self.is_watch_events and self.reconnect():
-                return self.send_message(data)
+            for attempt in (1, 2):
+                if not self._wait_for_reconnect():
+                    return False
+                # The check and the write share the lock, so a close or swap of
+                # self.s cannot land between them.
+                # Fork trace: every non-heartbeat command at INFO. The firmware
+                # handshake (challenge signature / key envelope) stays at DEBUG so
+                # auth material never lands in the persistent log.
+                if '"id": 420' in data or any(
+                    f'"{m}"' in data for m in self._AUTH_METHODS
+                ):
+                    self.logger.debug(f"sending: {data}")
+                else:
+                    self.logger.info(
+                        f"[{self.device_name}] scope send: {data.rstrip()}"
+                    )
+                failure: Optional[OSError] = None
+                with self._socket_write_lock:
+                    sock = self.s
+                    if sock is not None:
+                        try:
+                            sock.sendall(
+                                data.encode()
+                            )  # TODO: would utf-8 or unicode_escaped help here
+                            return True
+                        except OSError as e:
+                            # Retire the socket before releasing the lock, so no
+                            # waiting writer can append to a half-written stream.
+                            failure = e
+                            self._retire_socket_locked(sock)
+                if sock is None:
+                    # Another writer may have just retired a failed socket. Join
+                    # its single-flight reconnect and retry, rather than drop
+                    # the command.
+                    if attempt == 1 and self.is_watch_events and self.reconnect():
+                        continue
+                    self.logger.warning("socket not initialized!")
+                    time.sleep(3)
+                    return False
+                # The write failed, possibly after part of the message went out.
+                # That socket was retired under the lock; never write to it again.
+                self.logger.debug(f"Send socket error: {failure}")
+                if not (self.is_watch_events and self.reconnect()):
+                    return False
+                if isinstance(failure, socket.timeout):
+                    # A timed-out write may have reached the scope in part, so
+                    # report the failure rather than resend a possible duplicate.
+                    return False
             return False
         except Exception:
-            self.logger.error("General error trying to send message: ", data)
+            self.logger.error("General error trying to send message: %s", data)
             return False
 
     def socket_force_close(self) -> None:
-        if self.s:
-            try:
-                self.s.close()
-                self.s = None
-            except Exception:
-                pass
+        with self._socket_write_lock:
+            sock, self.s = self.s, None
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _reset_connection_state(self) -> None:
+        """Per-connection state. A fresh socket must re-authenticate, and gets a
+        fresh chance before the auth-gap warning fires."""
+        self.is_connected = False
+        self.is_authenticated = False
+        self._connection_had_sync_reply = False
+        self._consecutive_sync_timeouts = 0
+        self._auth_gap_logged = False
+        # Mount mode is per-connection too: the user can switch Alt/Az <-> EQ
+        # while the scope is powered off, so a reconnect must re-confirm it
+        # rather than keep reporting the previous session's mode.
+        with self.event_state_lock:
+            self.is_EQ_mode = False
+            self.is_EQ_mode_confirmed = False
+
+    def _retire_socket_locked(self, sock: socket.socket) -> None:
+        """Retire ``sock``; the caller holds ``_socket_write_lock``. Connection
+        state is reset only if it is still the current socket; a reconnect may
+        have replaced it."""
+        if self.s is sock:
+            self.s = None
+            self._reset_connection_state()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def _drop_socket(self, sock: socket.socket) -> None:
+        """Retire ``sock``, a dead or poisoned socket."""
+        with self._socket_write_lock:
+            self._retire_socket_locked(sock)
 
     def disconnect(self) -> None:
-        # Disconnect tries to clean up the socket if it exists
-        self.is_connected = False
-        self.socket_force_close()
+        # Reset and close in one step under the write lock, so a concurrent
+        # auth publish (_publish_authenticated) lands either before the reset
+        # or sees the socket gone.
+        with self._socket_write_lock:
+            self._reset_connection_state()
+            sock, self.s = self.s, None
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def send_udp_intro(self) -> None:
         # {"id":1,"method":"scan_iscope","params":""}
@@ -392,45 +700,107 @@ class Seestar:
             if sock is not None:
                 sock.close()
 
-    def reconnect(self) -> bool:
-        if self.is_connected:
+    # How long an ordinary caller waits for an in-flight reconnect (connect plus
+    # the firmware handshake, up to ~25 s) before giving up.
+    _RECONNECT_WAIT_S = 45.0
+
+    def _wait_for_reconnect(self) -> bool:
+        """Wait (bounded) while another thread's reconnect is in flight.
+
+        Returns True when the socket may be used. False means the wait timed out,
+        or the caller is the receive thread, which must never block here: it has
+        to keep reading the handshake reply.
+        """
+        me = threading.current_thread()
+        deadline = time.monotonic() + self._RECONNECT_WAIT_S
+        with self._conn_cond:
+            while self._reconnect_leader is not None:
+                if self._reconnect_leader is me:
+                    return True
+                remaining = deadline - time.monotonic()
+                if me is self.get_msg_thread or remaining <= 0:
+                    return False
+                self._conn_cond.wait(remaining)
             return True
 
+    def reconnect(self, wait: bool = True) -> bool:
+        """Bring the scope connection up, single-flight.
+
+        One thread at a time (the leader) disconnects, opens a new socket and runs
+        the firmware handshake. A caller that finds a reconnect already in flight
+        waits for it (bounded) when ``wait`` is set, and otherwise returns False
+        at once. The receive thread passes wait=False: it must keep draining the
+        socket so the leader's handshake reply can arrive.
+        """
+        me = threading.current_thread()
+        with self._conn_cond:
+            leader = self._reconnect_leader
+            if leader is me:
+                return self.is_connected
+            if leader is None:
+                if self.is_connected:
+                    return True
+                self._reconnect_leader = me
+        if leader is not None:
+            if not wait:
+                return False
+            return self._wait_for_reconnect() and self.is_connected
+        try:
+            return self._connect_and_authenticate()
+        finally:
+            with self._conn_cond:
+                self._reconnect_leader = None
+                self._conn_cond.notify_all()
+
+    def _connect_and_authenticate(self) -> bool:
+        """Leader-only body of reconnect(). Runs with no lock held: the receive
+        thread keeps reading while the handshake waits for its reply."""
         try:
             self.logger.info(f"RECONNECTING {self.device_name}")
-
             self.disconnect()
 
             # send a udp message to satisfy seestar's guest mode to gain control properly
             self.send_udp_intro()
 
-            # note: the below isn't thread safe!  (Reconnect can be called from different threads.)
-            self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.s.settimeout(Config.timeout)
-            self.s.connect((self.host, self.port))
-            # self.s.settimeout(None)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(Config.timeout)
+                sock.connect((self.host, self.port))
+            except Exception:
+                sock.close()
+                raise
+            # Published only once connected. Ordinary senders are held back until
+            # the handshake below finishes, so no command reaches the scope early.
+            with self._socket_write_lock:
+                self.s = sock
             self.is_connected = True
-            # If an interop PEM key is configured, attempt firmware 7.18+ authentication
+            # If an interop PEM key is configured, attempt firmware 7.18+ auth
+            # inline so a fresh connection is authenticated before
+            # start_watch_thread() issues get_device_state etc.  Failure is
+            # non-fatal: a busy scope (mid-imaging) can stall get_verify_str,
+            # and an unauthenticated socket still carries the event stream, so
+            # closing the socket here would trade a working-but-unauthenticated
+            # connection for a connect -> auth-fail -> disconnect loop that
+            # kills live telemetry.  Stay connected and let the heartbeat loop
+            # retry via _maybe_authenticate() once the scope idles.
             try:
                 if getattr(Config, "seestar_interop_pem", ""):
-                    ok = self.authenticate()
-                    if not ok:
+                    if self.authenticate():
+                        # Only if this socket survived the handshake.
+                        self._publish_authenticated(sock)
+                    else:
+                        # Scope is likely busy; throttle the heartbeat retry so
+                        # we don't immediately stall on another handshake.
+                        self._last_auth_attempt = time.time()
                         self.logger.warning(
-                            "Authentication failed after connect; closing socket"
+                            "Authentication failed after connect; staying connected, will retry from heartbeat"
                         )
-                        self.disconnect()
-                        return False
             except Exception as e:
-                self.logger.warning(f"Authentication raised exception: {e}")
-                self.disconnect()
-                return False
-
-            return True
-        except socket.error:
-            self.socket_force_close()
-            self.is_connected = False
-            sleep(1)
-            return False
+                self._last_auth_attempt = time.time()
+                self.logger.warning(
+                    f"Authentication raised after connect (staying connected, will retry): {e}"
+                )
+            return self.is_connected
         except Exception:
             self.socket_force_close()
             self.is_connected = False
@@ -438,27 +808,54 @@ class Seestar:
             return False
 
     def get_socket_msg(self) -> str | None:
+        with self._socket_write_lock:
+            sock = self.s
         try:
-            if self.s is None:
-                self.logger.warning("socket not initialized!")
+            if sock is None:
+                if self._reconnect_leader is not None:
+                    # A reconnect is installing the socket; the reader loops back.
+                    return None
+                # No socket and nobody reconnecting. Once the heartbeat thread
+                # runs, wait quietly for its backed-off reconnect. Before that
+                # (it starts only after the initial sync call returns or times
+                # out), nothing else retries: a drop that hit during another
+                # thread's reconnect, which then gave up, would sit unrecovered
+                # (issue #798). So reconnect from here until the heartbeat
+                # takes over; the sleep below still paces failed attempts.
+                heartbeat = self.heartbeat_msg_thread
+                if (
+                    self.is_watch_events
+                    and (heartbeat is None or not heartbeat.is_alive())
+                    and self.reconnect(wait=False)
+                    and self.s is not None
+                ):
+                    return None
+                self.logger.debug("socket not initialized!")
                 time.sleep(3)
                 return None
-            data = self.s.recv(1024 * 60)  # comet data is >50kb
+            data = sock.recv(1024 * 60)  # comet data is >50kb
         except socket.timeout:
             self.logger.warning("Socket timeout")
             return None
         except socket.error as e:
-            # todo : if general socket error, close socket, and kick off reconnect?
             # todo : no route to host...
             self.logger.debug(f"Read socket error: {e}")
-            # todo : handle message failure
-            self.disconnect()
-            if self.is_watch_events and self.reconnect():
-                return self.get_socket_msg()
+            self._drop_socket(sock)
+            # Returns at once if another thread is already reconnecting; the
+            # reader then picks up the new socket on its next loop.
+            if self.is_watch_events:
+                self.reconnect(wait=False)
             return None
 
         data = data.decode("utf-8")
         if len(data) == 0:
+            # Peer closed the socket: treat it as a disconnect
+            # (drop + reconnect) instead of spinning on a dead
+            # socket that still reads as connected.
+            self.logger.debug("peer closed the scope socket")
+            self._drop_socket(sock)
+            if self.is_watch_events:
+                self.reconnect(wait=False)
             return None
 
         return data
@@ -488,6 +885,10 @@ class Seestar:
                 sleep(5)
                 continue
 
+            # Auth failure never drops the socket; if the inline attempt in
+            # reconnect() couldn't land (scope busy), retry here, throttled,
+            # until the scope goes idle.
+            self._maybe_authenticate()
             self.heartbeat()
             time.sleep(3)
 
@@ -557,13 +958,25 @@ class Seestar:
             self._plate_solve_sync_lock.release()
 
     def receive_message_thread_fn(self) -> None:
-        msg_remainder = ""
+        # Pick up any bytes read during inline authentication (the handshake
+        # runs before this thread starts), so events streamed during auth
+        # aren't lost.
+        msg_remainder = self._auth_leftover
+        self._auth_leftover = ""
         while self.is_watch_events:
             threading.current_thread().last_run = datetime.now()
             # print("checking for msg")
             data = self.get_socket_msg()
-            if data:
-                msg_remainder += data
+            # get_socket_msg() may have reconnected on this thread, in which case
+            # the handshake read the new socket itself and parked whatever else
+            # arrived in _auth_leftover. Only this thread reads the socket now,
+            # so nobody else touches it. Those bytes come from the new socket, so
+            # any partial line still held from the old one is dropped.
+            leftover, self._auth_leftover = self._auth_leftover, ""
+            if leftover:
+                msg_remainder = leftover
+            if data or leftover:
+                msg_remainder += data or ""
                 first_index = msg_remainder.find("\r\n")
 
                 while first_index >= 0:
@@ -578,7 +991,12 @@ class Seestar:
 
                     if "jsonrpc" in parsed_data:
                         # {"jsonrpc":"2.0","Timestamp":"9507.244805160","method":"scope_get_equ_coord","result":{"ra":17.093056,"dec":34.349722},"code":0,"id":83}
-                        if parsed_data.get("method") != "scope_get_equ_coord":
+                        # Auth replies (challenge / key envelope) stay out of the INFO log.
+                        recv_method = parsed_data.get("method")
+                        if (
+                            recv_method != "scope_get_equ_coord"
+                            and recv_method not in self._AUTH_METHODS
+                        ):
                             self.logger.info(
                                 f"[{self.device_name}] scope recv: {parsed_data}"
                             )
@@ -586,6 +1004,12 @@ class Seestar:
                             self.update_equ_coord(parsed_data)
                         if parsed_data["method"] == "get_view_state":
                             self.update_view_state(parsed_data)
+                        # Refresh the cached mount mode from EVERY get_device_state
+                        # reply (sync, async, reauth wait, late after a sync
+                        # timeout), before publishing it below so a sync waiter
+                        # that wakes on response_dict already sees the update.
+                        if parsed_data["method"] == "get_device_state":
+                            self._update_eq_mode_from_device_state(parsed_data)
                         # keep a running queue of last 100 responses for sync call results
                         self.response_dict[parsed_data["id"]] = parsed_data
 
@@ -600,11 +1024,18 @@ class Seestar:
                         else:
                             self.logger.debug(f"received : {parsed_data}")
                         event_name = parsed_data["Event"]
-                        self.event_state[event_name] = parsed_data
+                        with self.event_state_lock:
+                            self.event_state[event_name] = parsed_data
 
                         # {'Event': 'EqModePA', 'Timestamp': '740.411562378', 'state': 'working', 'lapse_ms': 0, 'route': []}
                         # {'Event': 'EqModePA', 'Timestamp': '6359.231750447', 'state': 'fail', 'error': 'fail to operate', 'code': 207, 'lapse_ms': 80471, 'route': []}
                         # {'Event': 'EqModePA', 'Timestamp': '876.787472028', 'state': 'complete', 'lapse_ms': 80653, 'total': 2.256415, 'x': -1.041047, 'y': -2.001906, 'route': []}
+                        # Firmware sends a SECOND "complete" event after the
+                        # gyro-assist follow-up phase that carries no x/y at
+                        # all, e.g. {'Event': 'EqModePA', 'state': 'complete',
+                        # 'lapse_ms': 22437, 'route': []} - keep the
+                        # previously measured pa_error in that case instead
+                        # of crashing or clobbering it.
 
                         if event_name == "EqModePA" and "state" in parsed_data:
                             if parsed_data["state"] == "working":
@@ -614,21 +1045,23 @@ class Seestar:
                                 self.cur_pa_error_x = None
                                 self.cur_pa_error_y = None
                             elif parsed_data["state"] == "complete":
-                                self.cur_pa_error_x = parsed_data["x"]
-                                self.cur_pa_error_y = parsed_data["y"]
+                                if "x" in parsed_data and "y" in parsed_data:
+                                    self.cur_pa_error_x = parsed_data["x"]
+                                    self.cur_pa_error_y = parsed_data["y"]
                         elif (
                             event_name == "Simu_Stack"
                         ):  # The stack event is normally received in the imaging code, but the simulator will send them here
                             # Stack event is used to update the stack status from the simulator
-                            if "stack_status" in parsed_data:
-                                self.event_state["Stack"] = {
-                                    "Event": "Stack",
-                                    "stacked_frame": parsed_data["stacked_frame"],
-                                    "dropped_frame": parsed_data["dropped_frame"],
-                                }
-                            self.event_state.pop(
-                                "Simu_Stack", None
-                            )  # Remove the Simu_Stack event to avoid confusion
+                            with self.event_state_lock:
+                                if "stack_status" in parsed_data:
+                                    self.event_state["Stack"] = {
+                                        "Event": "Stack",
+                                        "stacked_frame": parsed_data["stacked_frame"],
+                                        "dropped_frame": parsed_data["dropped_frame"],
+                                    }
+                                self.event_state.pop(
+                                    "Simu_Stack", None
+                                )  # Remove the Simu_Stack event to avoid confusion
 
                         for cb in self.event_callbacks:
                             if (
@@ -642,21 +1075,44 @@ class Seestar:
                     first_index = msg_remainder.find("\r\n")
             time.sleep(0.1)
 
+    # Auto-allocated command ids start here. The ids callers pin themselves
+    # (the heartbeat's 420, an explicit 0) sit below it.
+    _FIRST_AUTO_CMDID = 10000
+
+    def _claim_cmdid(self, requested: Any) -> Any:
+        """Return the command id to send.
+
+        ``requested`` None gets the next auto id, skipping any id a caller has
+        pinned. Otherwise the caller's own id is used as-is (0 included); one
+        inside the auto range is reserved so the counter never hands it out.
+        """
+        with self._cmdid_lock:
+            if requested is None:
+                cmdid = next(self._cmdids)
+                while cmdid in self._reserved_cmdids:
+                    cmdid = next(self._cmdids)
+                return cmdid
+            if isinstance(requested, int) and requested >= self._FIRST_AUTO_CMDID:
+                self._reserved_cmdids.add(requested)
+        # A reply already stored under a pinned id answers an earlier message
+        # (the heartbeat re-sends 420 every few seconds). Drop it, so a sync
+        # caller waits for the reply to this message instead of returning that.
+        self.response_dict.pop(requested, None)
+        return requested
+
+    def _send_json(self, data: dict[str, Any]) -> tuple[int, bool]:
+        """Stamp a command id into ``data`` (see _claim_cmdid) and write it to
+        the scope. Returns (id, sent)."""
+        data["id"] = self._claim_cmdid(data.get("id"))
+        sent = self.send_message(json.dumps(data) + "\r\n")
+        return data["id"], sent
+
     def json_message(self, instruction: str, **kwargs):
-        with self._send_lock:
-            data = {"id": self.cmdid, "method": instruction, **kwargs}
-            self.cmdid += 1
-            json_data = json.dumps(data)
-            self.send_message(json_data + "\r\n")
+        self._send_json({"id": None, "method": instruction, **kwargs})
 
     def send_message_param(self, data: MessageParams) -> int:
         data = self.transform_message_for_verify(data)
-        with self._send_lock:
-            cur_cmdid = data.get("id") or self.cmdid
-            data["id"] = cur_cmdid
-            self.cmdid += 1  # can this overflow?  not in JSON...
-            json_data = json.dumps(data)
-            self.send_message(json_data + "\r\n")
+        cur_cmdid, _sent = self._send_json(data)
         return cur_cmdid
 
     def should_inject_verify(self) -> bool:
@@ -690,20 +1146,13 @@ class Seestar:
                     return data
 
                 if isinstance(existing_params, list):
-                    # Firmware 7.06+ (2706+) rejects verify wrapping on list
-                    # params too: scope_goto with [[ra, dec], "verify"] returns
-                    # code 108 "expected float param". The device is
-                    # SSL-authenticated (is_verified: True) so list-param
-                    # commands don't need verify injection on 7.06+ — same
-                    # rationale as the dict-params path above.
-                    if getattr(self, "firmware_ver_int", 0) >= 2706:
-                        return data
+                    # Positional params (e.g. scope_goto's [ra, dec] before task 2,
+                    # set_control_value's ["gain", value]) must stay a flat list with
+                    # "verify" appended. Wrapping them in another list (e.g.
+                    # [[ra, dec], "verify"]) makes firmware >= 2706 reject the whole
+                    # payload as "expected float/object param" (code 107/108).
                     if existing_params and existing_params[-1] == "verify":
                         return data
-
-                if data.get("method") == "set_wheel_position" and isinstance(
-                    existing_params, list
-                ):
                     data["params"] = existing_params + ["verify"]
                 else:
                     data["params"] = [existing_params, "verify"]
@@ -749,6 +1198,7 @@ class Seestar:
                         f"Failed to wait for message response.  {elapsed} seconds. {cur_cmdid=} {data=}"
                     )
                     data["result"] = "Error: Exceeded allotted wait time for result"
+                    self._note_sync_timeout()
                     return data
                 else:
                     self.logger.warning(
@@ -768,6 +1218,7 @@ class Seestar:
         # timeout path returns above without polluting the RTT samples.
         self._record_rtt(time.time() - start)
         self.logger.debug(f"response is {self.response_dict[cur_cmdid]}")
+        self._note_sync_reply()
         return self.response_dict[cur_cmdid]
 
     def _record_rtt(self, latency_s: float) -> None:
@@ -819,29 +1270,139 @@ class Seestar:
             "last_ms": last_ms,
         }
 
-    def get_event_state(self, params=None):
-        if "scheduler" not in self.event_state:
-            self.event_state["scheduler"] = {}
-        self.event_state["scheduler"]["Event"] = "Scheduler"
-        self.event_state["scheduler"]["state"] = self.schedule["state"]
-        self.event_state["scheduler"]["is_stacking"] = self.schedule.get(
-            "is_stacking", False
-        )
-        self.event_state["scheduler"]["is_stacking_paused"] = self.schedule.get(
-            "is_stacking_paused", False
-        )
+    def _update_eq_mode_from_device_state(self, response) -> bool:
+        """Cache mount mode from a get_device_state reply.
 
-        if "3PPA" in self.event_state:
-            self.event_state["3PPA"]["eq_offset_alt"] = self.cur_pa_error_y
-            self.event_state["3PPA"]["eq_offset_az"] = self.cur_pa_error_x
-        if params is not None and "event_name" in params:
-            event_name = params["event_name"]
-            if event_name in self.event_state:
-                result = self.event_state[event_name]
-            else:
-                result = {}
+        Confirms only when the reply actually carries a bool/int
+        ``mount.equ_mode``; an absent, empty, partial or malformed mount block
+        (e.g. ``null`` or the string ``"false"``, which is truthy) leaves the
+        mode unconfirmed, so get_event_state never exposes it as real. Returns
+        True if updated.
+        """
+        result = response.get("result") if isinstance(response, dict) else None
+        mount = result.get("mount") if isinstance(result, dict) else None
+        equ_mode = mount.get("equ_mode") if isinstance(mount, dict) else None
+        if not isinstance(equ_mode, int):  # bool is an int subclass
+            return False
+        # Under the lock get_event_state reads these with, so a poller never
+        # sees confirmed=True next to the previous mode.
+        with self.event_state_lock:
+            self.is_EQ_mode = bool(equ_mode)
+            self.is_EQ_mode_confirmed = True
+        return True
+
+    # No-reply sync timeouts on a fresh connection before we log the auth-gap
+    # diagnostic. This is 1, not several: a cold-start-busy scope and an
+    # unauthenticated one look identical no matter how many timeouts you
+    # count, and internal startup (guest_mode_init) only issues a single sync
+    # call before it gives up on firmware_ver_int == 0 -- waiting for more
+    # would mean this rarely fires without something else (a browser tab,
+    # an Alpaca/ASCOM client) also polling the device.
+    _AUTH_GAP_TIMEOUT_THRESHOLD = 1
+
+    def _note_sync_reply(self) -> None:
+        """Record that this connection got a sync reply; clears any auth-gap state."""
+        self._consecutive_sync_timeouts = 0
+        if not self._connection_had_sync_reply:
+            self._connection_had_sync_reply = True
+        if self._auth_gap_logged:
+            self._auth_gap_logged = False
+            self.logger.info(f"{self.device_name}: scope is answering commands again.")
+
+    def _note_sync_timeout(self) -> None:
+        """Track a sync-call timeout and, once this connection has strung
+        together several with zero replies, log a clear diagnostic instead of
+        timing out silently forever.  Gated on "never had a reply" so a scope
+        that's merely busy mid-imaging (which already had working replies
+        earlier in the connection) never trips this."""
+        if self._connection_had_sync_reply:
+            return
+        self._consecutive_sync_timeouts += 1
+        if (
+            self._auth_gap_logged
+            or self._consecutive_sync_timeouts < self._AUTH_GAP_TIMEOUT_THRESHOLD
+        ):
+            return
+        self._auth_gap_logged = True
+        if getattr(Config, "seestar_interop_pem", ""):
+            self.logger.error(
+                f"{self.device_name}: the scope has not answered a single command "
+                "since connecting, even though interop_pem is configured. "
+                "Authentication is likely failing (wrong key, or the firmware "
+                "rejected verify_client) -- check the interop_pem path/contents, "
+                "or authenticate via seestar-proxy and the Seestar app instead."
+            )
         else:
-            result = self.event_state
+            self.logger.error(
+                f"{self.device_name}: the scope has not answered a single command "
+                "since connecting -- it is only streaming events. Recent "
+                "firmware requires authentication before it will reply to "
+                "anything else. Set interop_pem in config.toml, or authenticate "
+                "via seestar-proxy and the Seestar app, to restore control. (If "
+                "the scope is genuinely just busy on a cold start, this clears "
+                "on its own once it answers anything.)"
+            )
+
+    def get_event_state(self, params=None):
+        with self.event_state_lock:
+            if "scheduler" not in self.event_state:
+                self.event_state["scheduler"] = {}
+            self.event_state["scheduler"]["Event"] = "Scheduler"
+            self.event_state["scheduler"]["state"] = self.schedule["state"]
+            self.event_state["scheduler"]["is_stacking"] = self.schedule.get(
+                "is_stacking", False
+            )
+            self.event_state["scheduler"]["is_stacking_paused"] = self.schedule.get(
+                "is_stacking_paused", False
+            )
+
+            # Mount mode is not carried by any firmware event, but we cache it from
+            # get_device_state (is_EQ_mode). Inject it here, like the scheduler
+            # block, so pollers get it without a blocking RPC to the scope
+            # (get_device_state times out during imaging). The block and its
+            # equ_mode key are always present for existing pollers, but equ_mode
+            # is None until actually read from the device (equ_mode_confirmed):
+            # never expose the unconfirmed default as a real mode.
+            if "mount" not in self.event_state:
+                self.event_state["mount"] = {}
+            self.event_state["mount"]["Event"] = "Mount"
+            self.event_state["mount"]["equ_mode"] = (
+                self.is_EQ_mode if self.is_EQ_mode_confirmed else None
+            )
+            self.event_state["mount"]["equ_mode_confirmed"] = self.is_EQ_mode_confirmed
+
+            if "EqModePA" in self.event_state:
+                self.event_state["3PPA"] = dict(self.event_state["EqModePA"])
+                # The source dict still carries its own "Event": "EqModePA" field.
+                # Classic UI's eventstatus.html matches cards via Jinja's
+                # selectattr('Event', 'equalto', '3PPA'), which inspects this
+                # embedded field rather than the event_state key -- so it must be
+                # corrected to "3PPA" or the PolarAlign card never matches, even
+                # after polar align genuinely completes.
+                self.event_state["3PPA"]["Event"] = "3PPA"
+            if "3PPA" in self.event_state:
+                self.event_state["3PPA"]["eq_offset_alt"] = self.cur_pa_error_y
+                self.event_state["3PPA"]["eq_offset_az"] = self.cur_pa_error_x
+            if params is not None and "event_name" in params:
+                event_name = params["event_name"]
+                if event_name in self.event_state:
+                    # Copy, not a reference -- callers (e.g. EventStatus.on_get)
+                    # must not hold a live view into event_state once the lock
+                    # is released.
+                    result = dict(self.event_state[event_name])
+                else:
+                    result = {}
+            else:
+                # A snapshot copy, not the live dict: EventStatus.on_get iterates
+                # this with .items() on the ALP request thread while
+                # IncomingMsgThread concurrently inserts new top-level keys for
+                # each previously-unseen firmware Event name -- iterating the
+                # live dict raises "RuntimeError: dictionary changed size during
+                # iteration" during an active goto's event burst (confirmed via
+                # tests/system/test_flow.py::test_goto failing every run against
+                # the emulator, event_state never reaching the caller as
+                # anything but an empty/partial render).
+                result = dict(self.event_state)
         return self.json_result("get_event_state", 0, result)
 
     # return if this device can control as master
@@ -851,17 +1412,84 @@ class Seestar:
             client_master = self.event_state["Client"].get("is_master", True)
         return client_master
 
-    def get_altaz_from_eq(self, in_ra, in_dec, obs_time):
-        if self.site_altaz_frame is None:
+    def get_altaz_from_eq(self, in_ra, in_dec, obs_time, location=None):
+        """(alt, az) in degrees for JNow (ra, dec) at ``obs_time``.
+
+        ``location`` overrides the cached ``site_altaz_frame`` (used by the
+        sun pre-flight when start-up has not run yet). With neither, returns
+        the [9999.9, 9999.9] "frame not ready" sentinel.
+        """
+        if location is None:
+            location = self.site_altaz_frame
+        if location is None:
             self.logger.warning("SCC has a rouge thread trying to call BPA error!")
             return [9999.9, 9999.9]
         radec = Util.parse_coordinate(is_j2000=False, in_ra=in_ra, in_dec=in_dec)
         # Convert RA/Dec to Alt/Az
-        altaz = radec.transform_to(
-            AltAz(obstime=obs_time, location=self.site_altaz_frame)
-        )
+        altaz = radec.transform_to(AltAz(obstime=obs_time, location=location))
         self.logger.info(f"coord in az-alt: {altaz.az.deg}, {altaz.alt.deg}")
         return [altaz.alt.deg, altaz.az.deg]
+
+    @staticmethod
+    def _at_current_position(params) -> bool:
+        """A mosaic item with RA and Dec -1 images where the scope already points."""
+        ra, dec = params["ra"], params["dec"]
+        return not isinstance(ra, str) and ra == -1 and dec == -1
+
+    def is_hidden_by_horizon(self, target_name, coord) -> bool:
+        """Whether the scheduler should skip ``target_name``, below the horizon now.
+
+        Only with ``horizon_skip_hidden_targets`` set. The horizon is the
+        configured profile, flat at 0 degrees without one, plus
+        ``horizon_margin``.
+        """
+        if not Config.horizon_skip_hidden_targets:
+            return False
+        # An unusable file is logged once by the horizon module, not per item.
+        profile, _error = horizon.configured_profile()
+        try:
+            result = horizon.visibility(coord, profile, Config.horizon_margin)
+        except Exception as e:
+            # Never let the check stop an unattended night: keep the target.
+            self.logger.warning(f"Horizon check failed, {target_name} kept: {e}")
+            return False
+        if result is None:
+            self.logger.warning(
+                "Horizon check skipped: the site location is not set (lat / long are 0)."
+            )
+            return False
+        if result["visible"]:
+            return False
+        self.logger.info(
+            f"{target_name} is below the horizon: altitude {result['altitude']}, "
+            f"azimuth {result['azimuth']}, horizon {result['horizon']} "
+            f"+ margin {result['margin']} degrees. Moving to next schedule item if any."
+        )
+        return True
+
+    def is_panel_hidden_by_horizon(self, panel_name, ra_hours, dec_deg) -> bool:
+        """``is_hidden_by_horizon`` for a mosaic panel centred on JNow
+        ``ra_hours``, ``dec_deg``; a panel whose position cannot be computed
+        is kept."""
+        if not Config.horizon_skip_hidden_targets:
+            return False
+        try:
+            coord = Util.parse_coordinate(False, ra_hours, dec_deg)
+        except Exception as e:
+            self.logger.warning(f"Horizon check failed, {panel_name} kept: {e}")
+            return False
+        return self.is_hidden_by_horizon(panel_name, coord)
+
+    def _publish_skipped_item(self, item_type, target_name):
+        """Show a schedule item skipped behind the horizon in the scheduler
+        state, until the next item starts."""
+        item_state: SchedulerItemState = {
+            "type": item_type,
+            "schedule_item_id": self.schedule.get("current_item_id", "UNKNOWN"),
+            "target_name": target_name,
+            "action": "skipped: below the local horizon",
+        }
+        self.update_scheduler_state_obj(item_state)
 
     def get_pa_error(self, param):
         if self.cur_pa_error_x is None or self.cur_pa_error_y is None:
@@ -902,10 +1530,12 @@ class Seestar:
         #    data = {"id":cmdid, "method":"set_setting", "params":{"exp_ms":{"stack_l":x_stack_l,"continuous":x_continuous}, "stack_dither":{"pix":d_pix,"interval":d_interval,"enable":d_enable}, "stack_lenhance":l_enhance, "heater_enable":heater_enable}}
         data: MessageParams = {
             "method": "set_setting",
-            "params": {"exp_ms": {"stack_l": x_stack_l, "continuous": x_continuous}},
-            "stack_lenhance": l_enhance,
-            "auto_3ppa_calib": True,
-            "auto_power_off": False,
+            "params": {
+                "exp_ms": {"stack_l": x_stack_l, "continuous": x_continuous},
+                "stack_lenhance": l_enhance,
+                "auto_3ppa_calib": True,
+                "auto_power_off": False,
+            },
         }
 
         result = self.send_message_param_sync(data)
@@ -945,6 +1575,75 @@ class Seestar:
         if self.is_goto():
             return self.stop_slew()
         return "goto stopped already: no action taken"
+
+    def force_stop_goto(self):
+        """Unconditional stop + force-clear of all goto state.
+
+        Use when the user-facing goto is wedged — e.g. AutoGoto plate-
+        solve has been retrying indefinitely (typical indoors / cloudy)
+        and the AutoGoto event state is stuck on ``working``, so
+        subsequent ``goto_target`` calls are rejected with "mount is in
+        goto routine". Sends the firmware ``iscope_stop_view`` and
+        force-clears every internal flag ``is_goto()`` /
+        ``goto_target()`` consult, so the next goto is accepted
+        immediately.
+
+        Returns ``{"ok": <bool>, "stop_slew_result": <firmware reply>}``
+        where ``ok`` is False if the firmware stop command could not be
+        sent. Idempotent: safe to call when no goto is in flight.
+        """
+        # Use the standard stop_slew (iscope_stop_view stage:AutoGoto).
+        # An earlier attempt to use iscope_stop_view WITHOUT stage as a
+        # "stronger" reset turned out to side-trigger the firmware's
+        # SecondView / Sleep mode, so the next iscope_start_view would
+        # silently go to ContinuousExposure (live preview) instead of
+        # firing AutoGoto. The narrower stage:AutoGoto stop avoids
+        # that. The key value-add of force_stop_goto is therefore
+        # NOT a different firmware command but the force-clearing of
+        # local Python-side state below, so that is_goto() returns
+        # False immediately and the next goto_target is accepted
+        # without waiting for firmware events to flow back.
+        result = None
+        try:
+            result = self.stop_slew()
+        except Exception as exc:
+            self.logger.warning("force_stop_goto: stop_slew raised %s", exc)
+        try:
+            self.mark_goto_status_as_stopped()
+        except Exception as exc:
+            self.logger.debug(
+                "force_stop_goto: mark_goto_status_as_stopped raised %s", exc
+            )
+        try:
+            self.mark_op_state("goto_target", "stopped")
+        except Exception as exc:
+            self.logger.debug("force_stop_goto: mark_op_state raised %s", exc)
+        # If state is somehow still stuck, overwrite the event dict
+        # directly so is_goto() returns False.
+        if self.is_goto():
+            try:
+                self.event_state["AutoGoto"]["state"] = "stopped"
+            except Exception as exc:
+                self.logger.debug(
+                    "force_stop_goto: clearing AutoGoto state raised %s", exc
+                )
+        # Also clear the cached "PlateSolve fail" indicator so the
+        # status panel doesn't keep showing stale red after the
+        # operator has explicitly unwound the goto. The firmware
+        # never resends a PlateSolve event in response to
+        # iscope_stop_view; it only updates when a new plate-solve
+        # runs. Same reasoning for the lingering Exposure-AutoGoto
+        # tag that the eventstatus widget surfaces.
+        for stale_key in ("PlateSolve", "Exposure", "ContinuousExposure"):
+            try:
+                if stale_key in self.event_state:
+                    self.event_state[stale_key]["state"] = "stopped"
+            except Exception as exc:
+                self.logger.debug(
+                    "force_stop_goto: clearing %s state raised %s", stale_key, exc
+                )
+        self.logger.info("force_stop_goto: cleared local goto state")
+        return {"ok": result is not None, "stop_slew_result": result}
 
     def mark_goto_status_as_start(self):
         self.mark_op_state("AutoGoto", "start")
@@ -993,6 +1692,13 @@ class Seestar:
             in_dec,
         )
 
+        # Pre-flight sun-avoidance check, same as _slew_to_ra_dec. On a
+        # refusal, undo the AutoGoto "start" marked above so is_goto()
+        # does not block the next goto.
+        if not self._radec_sun_safe(in_ra, in_dec, "goto_target"):
+            self.mark_goto_status_as_stopped()
+            return False
+
         data: MessageParams = {
             "method": "iscope_start_view",
             "params": {
@@ -1002,41 +1708,67 @@ class Seestar:
                 "lp_filter": False,
             },
         }
+        if params.get("mosaic"):
+            # The capture mosaic frame is set here, at the goto; capture setup
+            # resets it to scale 1 / angle 0 when the goto carries none.
+            data["params"]["mosaic"] = params["mosaic"]
         self.mark_op_state("goto_target", "stopped")
 
         result = self.send_message_param_sync(data)
         return "error" not in result
 
-    # {"method":"scope_goto","params":[1.2345,75.0]}
-    def _slew_to_ra_dec(self, params):
-        in_ra = params[0]
-        in_dec = params[1]
-        self.logger.info(f"slew to {in_ra}, {in_dec}")
+    def _radec_sun_safe(self, in_ra, in_dec, label="scope_goto") -> bool:
+        """Pre-flight sun-avoidance check for a goto to (ra, dec).
 
-        # Pre-flight sun-avoidance check. Convert (ra, dec) → sky
-        # (az, alt) via the already-wired astropy frame, then refuse
-        # if inside the sun cone.
-        #
-        # Fail-safe: any unexpected exception refuses the slew — better
-        # a false refusal than a sun-pointing slew. The only genuine
-        # fall-through is the [9999.9, 9999.9] sentinel from
-        # get_altaz_from_eq (signals the astropy frame has not yet been
-        # initialised during boot); during that window the
-        # SunSafetyMonitor is the runtime backstop. Mirrors the
-        # fail-safe pattern used by the other pre-flight sites
-        # (streaming_controller.track, live_tracker._auto_slew,
-        # rotation_calibration._slew_to_target, and the runtime
-        # velocity_controller.speed_move wrapper).
+        Converts (ra, dec) → sky (az, alt) via the already-wired astropy
+        frame and returns False (refuse) if the target is inside the sun
+        cone. ``label`` only names the caller in log lines.
+
+        Fail-safe: any unexpected exception refuses — better a false
+        refusal than a sun-pointing slew. When the start-up sequence has
+        not run (``site_altaz_frame`` is None) the site is built on demand
+        from Config.init_lat / init_long, so the check still runs. The only
+        genuine fall-through is a truly unset site (the 0/0 sentinel) or
+        the [9999.9, 9999.9] sentinel from get_altaz_from_eq; the
+        SunSafetyMonitor is then the runtime backstop. Mirrors the
+        fail-safe pattern used by the other pre-flight sites
+        (streaming_controller.track, live_tracker._auto_slew,
+        rotation_calibration._slew_to_target, and the runtime
+        velocity_controller.speed_move wrapper).
+        """
         try:
             from astropy.time import Time as _AstropyTime
 
-            alt_az = self.get_altaz_from_eq(in_ra, in_dec, _AstropyTime.now())
+            altaz_kwargs = {}
+            if self.site_altaz_frame is None:
+                from device.sun_safety import _location_is_unset
+
+                lat = float(Config.init_lat)
+                lon = float(Config.init_long)
+                if _location_is_unset(lat, lon):
+                    # Compatibility: no site configured, so do not block the
+                    # goto; the SunSafetyMonitor is the runtime backstop.
+                    self.logger.warning(
+                        "%s sun pre-flight skipped: observer location is not "
+                        "set (lat/long = 0,0) and start-up has not run; set "
+                        "your site location to enable the sun check",
+                        label,
+                    )
+                    return True
+                altaz_kwargs["location"] = EarthLocation(
+                    lat=lat * u.deg, lon=lon * u.deg, height=10 * u.m
+                )
+
+            alt_az = self.get_altaz_from_eq(
+                in_ra, in_dec, _AstropyTime.now(), **altaz_kwargs
+            )
             alt_deg = float(alt_az[0])
             az_deg = float(alt_az[1])
         except Exception as exc:
             self.logger.warning(
-                "scope_goto refused (ra=%s dec=%s): sun-safety pre-flight "
+                "%s refused (ra=%s dec=%s): sun-safety pre-flight "
                 "failed to compute altaz: %s",
+                label,
                 in_ra,
                 in_dec,
                 exc,
@@ -1046,36 +1778,52 @@ class Seestar:
             # 9999.9 sentinel: astropy frame not yet initialised. The
             # SunSafetyMonitor is the runtime backstop in this window.
             self.logger.info(
-                "scope_goto sun pre-flight skipped (astropy frame not ready)"
+                "%s sun pre-flight skipped (astropy frame not ready)", label
             )
-        else:
-            try:
-                from device.sun_safety import is_sun_safe as _is_sun_safe
+            return True
+        try:
+            from device.sun_safety import is_sun_safe as _is_sun_safe
 
-                sun_safe, sun_reason = _is_sun_safe(az_deg % 360.0, alt_deg)
-            except Exception as exc:
-                self.logger.warning(
-                    "scope_goto refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): "
-                    "is_sun_safe raised: %s",
-                    in_ra,
-                    in_dec,
-                    az_deg,
-                    alt_deg,
-                    exc,
-                )
-                return False
-            if not sun_safe:
-                self.logger.warning(
-                    "scope_goto refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): %s",
-                    in_ra,
-                    in_dec,
-                    az_deg,
-                    alt_deg,
-                    sun_reason,
-                )
-                return False
+            sun_safe, sun_reason = _is_sun_safe(az_deg % 360.0, alt_deg)
+        except Exception as exc:
+            self.logger.warning(
+                "%s refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): "
+                "is_sun_safe raised: %s",
+                label,
+                in_ra,
+                in_dec,
+                az_deg,
+                alt_deg,
+                exc,
+            )
+            return False
+        if not sun_safe:
+            self.logger.warning(
+                "%s refused (ra=%s dec=%s → az=%.1f° alt=%.1f°): %s",
+                label,
+                in_ra,
+                in_dec,
+                az_deg,
+                alt_deg,
+                sun_reason,
+            )
+            return False
+        return True
 
-        data: MessageParams = {"method": "scope_goto", "params": [in_ra, in_dec]}
+    # {"method":"scope_goto","params":{"ra":1.2345,"dec":75.0}}
+    def _slew_to_ra_dec(self, params):
+        in_ra = params[0]
+        in_dec = params[1]
+        self.logger.info(f"slew to {in_ra}, {in_dec}")
+
+        # Pre-flight sun-avoidance check (see _radec_sun_safe).
+        if not self._radec_sun_safe(in_ra, in_dec, "scope_goto"):
+            return False
+
+        data: MessageParams = {
+            "method": "scope_goto",
+            "params": {"ra": in_ra, "dec": in_dec},
+        }
         self.mark_op_state("goto_target", "stopped")
         result = self.send_message_param_sync(data)
         if "error" in result:
@@ -1096,7 +1844,10 @@ class Seestar:
         in_ra = params[0]
         in_dec = params[1]
         self.logger.info("%s: sync to target... %s %s", self.device_name, in_ra, in_dec)
-        data: MessageParams = {"method": "scope_sync", "params": [in_ra, in_dec]}
+        data: MessageParams = {
+            "method": "scope_sync",
+            "params": {"ra": in_ra, "dec": in_dec},
+        }
         result = self.send_message_param_sync(data)
         if "error" in result:
             self.logger.info(f"Failed to sync: {result}")
@@ -1112,11 +1863,15 @@ class Seestar:
         }
         return self.send_message_param_sync(data)
 
-    def _move_scope_sun_safe(self) -> bool:
+    def _move_scope_sun_safe(self, angle=None, speed=None, dur=None) -> bool:
         """Pre-flight sun-avoidance for manual (ASCOM MoveAxis) jogs.
 
         Reads the current encoder pointing (`scope_get_horiz_coord`) and
-        refuses the move when it lies inside the sun cone. Encoder (az, el)
+        refuses the move when it lies inside the sun cone. When the jog's
+        ``angle`` and ``speed`` are given (``dur`` defaults to 3 s), it also
+        forward-simulates the jog (`sun_safety.jog_path_points`, the same
+        model as `compute_jog_angle`) and refuses when any point of the path
+        enters the cone; a path that cannot be computed refuses. Encoder (az, el)
         approximates sky (az, el): exact after rotation calibration,
         conservative otherwise — the same convention as the other pre-flight
         sites (`_slew_to_ra_dec`, `live_tracker._pre_slew`). Returns True to
@@ -1156,9 +1911,45 @@ class Seestar:
                 sun_reason,
             )
             return False
+        if angle is None or speed is None:
+            return True
+        try:
+            from device.sun_safety import jog_path_points, path_is_sun_safe
+
+            path = jog_path_points(
+                az_deg % 360.0,
+                alt_deg,
+                angle,
+                speed,
+                3 if dur is None else dur,
+            )
+            path_safe, path_reason = path_is_sun_safe(path)
+        except Exception as exc:
+            self.logger.warning(
+                "move_scope refused: jog path sun check failed "
+                "(angle=%s speed=%s dur=%s): %s",
+                angle,
+                speed,
+                dur,
+                exc,
+            )
+            return False
+        if not path_safe:
+            self.logger.warning(
+                "move_scope refused (az=%.1f° alt=%.1f°, angle=%s speed=%s "
+                "dur=%s): jog path enters the sun cone: %s",
+                az_deg,
+                alt_deg,
+                angle,
+                speed,
+                dur,
+                path_reason,
+            )
+            return False
         return True
 
-    # {"method":"scope_speed_move","params":{"speed":4000,"angle":270,"dur_sec":10}}
+    # {"method":"scope_speed_move","params":{"speed":1440,"angle":270,"dur_sec":10}}
+    # angle: direction in degrees; speed: native units, firmware clamps at 1440.
     def move_scope(self, in_angle: int, in_speed: int, in_dur=3):
         self.logger.debug(
             "%s: moving slew angle: %s, speed: %s, dur: %s",
@@ -1173,7 +1964,8 @@ class Seestar:
 
         # Sun-safety: refuse manual jogs while the SunSafetyMonitor holds the
         # emergency lockout (it owns the mount during an active jog-away), and
-        # refuse when the current pointing is inside the sun-avoidance cone.
+        # refuse when the current pointing, or the forward-simulated jog path,
+        # is inside the sun-avoidance cone.
         # The goto path (`_slew_to_ra_dec`) and the velocity_controller
         # speed_move wrapper apply the same guard. A stop (speed 0) normally
         # must always pass: refusing it would keep the motor running on the
@@ -1189,7 +1981,7 @@ class Seestar:
                     "Failed to move scope: sun-safety emergency lockout active."
                 )
                 return False
-            if not self._move_scope_sun_safe():
+            if not self._move_scope_sun_safe(in_angle, in_speed, in_dur):
                 return False
         else:
             # in_speed == 0 is a stop. While the SunSafetyMonitor's emergency
@@ -1386,6 +2178,12 @@ class Seestar:
     def start_stack(self, params=None):
         if params is None:
             params = {"gain": Config.init_gain, "restart": True}
+        stack_type = params.get("stack_type")
+        if stack_type:
+            self.logger.info("Setting stack type: %s", stack_type)
+            self.send_message_param_sync(
+                {"method": "set_stack_type", "params": {"type": stack_type}}
+            )
         result = self.send_message_param_sync(
             {"method": "iscope_start_stack", "params": {"restart": params["restart"]}}
         )
@@ -1474,7 +2272,7 @@ class Seestar:
                 "sec": now.second,
                 "time_zone": tz_name,
             }
-            date_data: MessageParams = {"method": "pi_set_time", "params": [date_json]}
+            date_data: MessageParams = {"method": "pi_set_time", "params": date_json}
 
             do_AF = params.get("auto_focus", False)
             do_3PPA = params.get("3ppa", False)
@@ -1533,7 +2331,11 @@ class Seestar:
             self.logger.info(msg)
             self.event_state["scheduler"]["cur_scheduler_item"]["action"] = msg
 
-            self.logger.info(self.send_message_param_sync(date_data))
+            time_result = self.send_message_param_sync(date_data)
+            if "error" in time_result:
+                self.logger.warning(f"Failed to set scope time: {time_result}")
+            else:
+                self.logger.info(f"Set scope time: {time_result}")
             response = self.send_message_param_sync(loc_data)
             if "error" in response:
                 self.logger.error(f"Failed to set location: {response}")
@@ -1554,16 +2356,19 @@ class Seestar:
                 }
             )
 
-            # save frames setting
-            self.send_message_param_sync(
-                {
-                    "method": "set_stack_setting",
-                    "params": {
-                        "save_discrete_ok_frame": Config.init_save_good_frames,
-                        "save_discrete_frame": Config.init_save_all_frames,
-                    },
-                }
+            # save frames setting: set_setting {"stack": ...} is the documented
+            # path; set_stack_setting is kept as a fallback for older firmware.
+            save_frames = {
+                "save_discrete_ok_frame": Config.init_save_good_frames,
+                "save_discrete_frame": Config.init_save_all_frames,
+            }
+            response = self.send_message_param_sync(
+                {"method": "set_setting", "params": {"stack": save_frames}}
             )
+            if not isinstance(response, dict) or "error" in response:
+                self.send_message_param_sync(
+                    {"method": "set_stack_setting", "params": save_frames}
+                )
 
             # Put this here for people not running PA
             self.set_setting(
@@ -1581,11 +2386,9 @@ class Seestar:
             self.firmware_ver_int = response["result"]["device"]["firmware_ver_int"]
             self.logger.info(f"Firmware version: {self.firmware_ver_int}")
 
-            # Update EQ mode from actual device state; config value may not reflect the mount
-            if "mount" in response.get("result", {}):
-                self.is_EQ_mode = response["result"]["mount"].get(
-                    "equ_mode", self.is_EQ_mode
-                )
+            # EQ mode from actual device state; config value may not reflect the
+            # mount. The receive thread already cached it from this reply.
+            if self.is_EQ_mode_confirmed:
                 self.logger.info(f"EQ mode from device state: {self.is_EQ_mode}")
 
             if do_3PPA and not self.is_EQ_mode:
@@ -1818,9 +2621,10 @@ class Seestar:
 
     # {"method":"set_sequence_setting","params":[{"group_name":"Kai_goto_target_name"}]}
     def set_target_name(self, name):
-        req: MessageParams = {"method": "set_sequence_setting"}
-        params = {"group_name": name}
-        req["params"] = [params]
+        req: MessageParams = {
+            "method": "set_sequence_setting",
+            "params": [{"group_name": name}],
+        }
         return self.send_message_param_sync(req)
 
     # scheduler state example: {"state":"working", "schedule_id":"abcdefg",
@@ -1952,15 +2756,17 @@ class Seestar:
         save_target_name: str,
         is_use_autofocus: bool,
         is_use_LP_filter: bool,
+        mosaic: Optional[dict[str, float]] = None,
     ) -> bool:
-        result = self.goto_target(
-            {
-                "ra": cur_ra,
-                "dec": cur_dec,
-                "is_j2000": False,
-                "target_name": save_target_name,
-            }
-        )
+        goto_params: dict[str, Any] = {
+            "ra": cur_ra,
+            "dec": cur_dec,
+            "is_j2000": False,
+            "target_name": save_target_name,
+        }
+        if mosaic:
+            goto_params["mosaic"] = mosaic
+        result = self.goto_target(goto_params)
         if result:
             result = self.wait_end_op("goto_target")
 
@@ -2001,6 +2807,8 @@ class Seestar:
         selected_panels,
         num_tries,
         retry_wait_s,
+        stack_type="DeepSky",
+        check_horizon=False,
     ):
         try:
             spacing_result = Util.mosaic_next_center_spacing(
@@ -2057,6 +2865,22 @@ class Seestar:
                     # check if we are doing a subset of the panels
                     panel_string = str(index_ra + 1) + str(index_dec + 1)
                     if is_use_selected_panels and panel_string not in panel_set:
+                        cur_ra += delta_RA
+                        continue
+
+                    # The item check covers the centre; a panel of a larger
+                    # mosaic can still be hidden, and its goto or plate-solve
+                    # would fail: skip it, checked when its turn comes.
+                    if (
+                        check_horizon
+                        and nRA * nDec > 1
+                        and self.is_panel_hidden_by_horizon(
+                            f"{target_name}_{panel_string}", cur_ra, cur_dec
+                        )
+                    ):
+                        self.event_state["scheduler"]["cur_scheduler_item"][
+                            "action"
+                        ] = f"panel {panel_string} skipped: below the local horizon"
                         cur_ra += delta_RA
                         continue
 
@@ -2146,7 +2970,9 @@ class Seestar:
                     # be sure we are using the right target name before we stack
                     self.set_target_name(save_target_name)
 
-                    if not self.start_stack({"gain": gain, "restart": True}):
+                    if not self.start_stack(
+                        {"gain": gain, "restart": True, "stack_type": stack_type}
+                    ):
                         msg = "Failed to start stacking."
                         self.logger.warning(msg)
                         self.event_state["scheduler"]["cur_scheduler_item"][
@@ -2236,6 +3062,7 @@ class Seestar:
         selected_panels = params.get("selected_panels", "")
         num_tries = params.get("num_tries", 1)
         retry_wait_s = params.get("retry_wait_s", 300)
+        stack_type = params.get("stack_type", "DeepSky")
 
         # verify mosaic pattern
         if nRA < 1 or nDec < 0:
@@ -2252,6 +3079,12 @@ class Seestar:
         parsed_coord = Util.parse_coordinate(is_j2000, center_RA, center_Dec)
         center_RA = parsed_coord.ra.hour
         center_Dec = parsed_coord.dec.deg
+
+        if not self._at_current_position(params) and self.is_hidden_by_horizon(
+            target_name, parsed_coord
+        ):
+            self._publish_skipped_item("mosaic", target_name)
+            return
 
         response = self.send_message_param_sync({"method": "get_setting"})
         result = response["result"]
@@ -2302,11 +3135,237 @@ class Seestar:
                 selected_panels,
                 num_tries,
                 retry_wait_s,
+                stack_type,
+                check_horizon=not self._at_current_position(params),
             )
         )
         self.mosaic_thread.name = f"MosaicThread:{self.device_name}"
         self.mosaic_thread.start()
         return
+
+    def start_framed_mosaic_item(self, params: dict[str, Any]) -> None:
+        self.is_cur_scheduler_item_working = False
+
+        if self.schedule["state"] != "working":
+            self.logger.info("Run Scheduler is stopping")
+            self.schedule["state"] = "stopped"
+            return
+
+        target_name = params["target_name"]
+        center_RA = params["ra"]
+        center_Dec = params["dec"]
+        is_j2000 = params["is_j2000"]
+        is_use_LP_filter = params["is_use_lp_filter"]
+        panel_time_sec = params["panel_time_sec"]
+        mosaic_scale = params.get("mosaic_scale", 1.0)
+        mosaic_angle = params.get("mosaic_angle", 0.0)
+        gain = params["gain"]
+        is_use_autofocus = params.get("is_use_autofocus", False)
+        num_tries = params.get("num_tries", 1)
+        retry_wait_s = params.get("retry_wait_s", 300)
+        stack_type = params.get("stack_type", "DeepSky")
+
+        if mosaic_scale < 1.0 or mosaic_scale > 4.0:
+            self.logger.info(
+                "Framed mosaic scale is invalid. Moving to next schedule item if any."
+            )
+            return
+        if mosaic_angle < -90 or mosaic_angle > 90:
+            self.logger.info(
+                "Framed mosaic angle is invalid. Moving to next schedule item if any."
+            )
+            return
+
+        if not isinstance(center_RA, str) and center_RA == -1 and center_Dec == -1:
+            center_RA = self.ra
+            center_Dec = self.dec
+            is_j2000 = False
+
+        parsed_coord = Util.parse_coordinate(is_j2000, center_RA, center_Dec)
+        center_RA = parsed_coord.ra.hour
+        center_Dec = parsed_coord.dec.deg
+
+        if not self._at_current_position(params) and self.is_hidden_by_horizon(
+            target_name, parsed_coord
+        ):
+            self._publish_skipped_item("framed_mosaic", target_name)
+            return
+
+        self.logger.info("received framed mosaic parameters:")
+        self.logger.info("  target        : " + target_name)
+        self.logger.info("  RA            : %s", center_RA)
+        self.logger.info("  Dec           : %s", center_Dec)
+        self.logger.info("  scale         : %s", mosaic_scale)
+        self.logger.info("  angle         : %s", mosaic_angle)
+        self.logger.info("  panel time (s): %s", panel_time_sec)
+
+        self.is_cur_scheduler_item_working = True
+        self.framed_mosaic_thread = threading.Thread(
+            target=lambda: self.framed_mosaic_thread_fn(
+                target_name,
+                center_RA,
+                center_Dec,
+                is_use_LP_filter,
+                panel_time_sec,
+                mosaic_scale,
+                mosaic_angle,
+                gain,
+                is_use_autofocus,
+                num_tries,
+                retry_wait_s,
+                stack_type,
+            )
+        )
+        self.framed_mosaic_thread.name = f"FramedMosaicThread:{self.device_name}"
+        self.framed_mosaic_thread.start()
+
+    def framed_mosaic_thread_fn(
+        self,
+        target_name,
+        center_RA,
+        center_Dec,
+        is_use_LP_filter,
+        panel_time_sec,
+        mosaic_scale,
+        mosaic_angle,
+        gain,
+        is_use_autofocus,
+        num_tries,
+        retry_wait_s,
+        stack_type="DeepSky",
+    ):
+        try:
+            total_time_s = round(panel_time_sec)
+            item_state: SchedulerItemState = {
+                "type": "framed_mosaic",
+                "schedule_item_id": self.schedule["current_item_id"],
+                "target_name": target_name,
+                "action": "start",
+                "item_total_time_s": total_time_s,
+                "item_remaining_time_s": total_time_s,
+            }
+            self.update_scheduler_state_obj(item_state)
+
+            self.send_message_param_sync(
+                {
+                    "method": "set_setting",
+                    "params": {"stack_lenhance": is_use_LP_filter},
+                }
+            )
+
+            result = False
+            for try_index in range(num_tries):
+                try_count = try_index + 1
+                self.event_state["scheduler"]["cur_scheduler_item"]["action"] = (
+                    f"attempt #{try_count} slewing to target centered at "
+                    f"{center_RA:.2f}, {center_Dec:.2f}"
+                )
+                self.logger.info(f"Trying to reach target, attempt #{try_count}")
+                result = self.mosaic_goto_inner_worker(
+                    center_RA,
+                    center_Dec,
+                    target_name,
+                    is_use_autofocus,
+                    is_use_LP_filter,
+                    mosaic={
+                        "scale": mosaic_scale,
+                        "angle": mosaic_angle,
+                        "star_map_angle": 0.0,
+                    },
+                )
+                if result:
+                    break
+                if try_count < num_tries:
+                    for i in range(round(retry_wait_s / 5)):
+                        if self.schedule["state"] != "working":
+                            self.logger.info(
+                                "Scheduler was requested to stop. Stopping at current framed mosaic."
+                            )
+                            self.schedule["state"] = "stopped"
+                            return
+                        waited_time = i * 5
+                        msg = f"waited {waited_time}s of requested {retry_wait_s}s before retry GOTO target."
+                        self.logger.info(msg)
+                        self.event_state["scheduler"]["cur_scheduler_item"][
+                            "action"
+                        ] = msg
+                        time.sleep(5)
+
+            if not result:
+                msg = f"Failed to goto target after {num_tries} tries."
+                self.logger.warning(msg)
+                self.event_state["scheduler"]["cur_scheduler_item"]["action"] = msg
+                return
+
+            self.send_message_param_sync(
+                {
+                    "method": "set_setting",
+                    "params": {
+                        # Kept for older firmware. On 9.x this call only
+                        # estimates hours; the frame itself rides on the goto.
+                        "mosaic": {"scale": mosaic_scale, "angle": mosaic_angle}
+                    },
+                }
+            )
+            try:
+                msg = f"stacking the framed mosaic for {panel_time_sec} seconds"
+                self.logger.info(msg)
+                self.event_state["scheduler"]["cur_scheduler_item"]["action"] = msg
+
+                self.set_target_name(target_name)
+
+                if not self.start_stack(
+                    {"gain": gain, "restart": True, "stack_type": stack_type}
+                ):
+                    msg = "Failed to start stacking."
+                    self.logger.warning(msg)
+                    self.event_state["scheduler"]["cur_scheduler_item"]["action"] = msg
+                    return
+
+                remaining_time_s = round(panel_time_sec)
+                for i in range(round(panel_time_sec / 5)):
+                    self.event_state["scheduler"]["cur_scheduler_item"][
+                        "item_remaining_time_s"
+                    ] = remaining_time_s
+                    threading.current_thread().last_run = datetime.now()
+
+                    if self.schedule["state"] != "working":
+                        self.logger.info(
+                            "Scheduler was requested to stop. Stopping at current framed mosaic."
+                        )
+                        self.stop_stack()
+                        self.schedule["state"] = "stopped"
+                        self.event_state["scheduler"]["cur_scheduler_item"][
+                            "item_remaining_time_s"
+                        ] = 0
+                        return
+                    if self.schedule["is_skip_requested"]:
+                        self.logger.info(
+                            "current framed mosaic stacking was requested to skip."
+                        )
+                        return
+
+                    time.sleep(5)
+                    remaining_time_s -= 5
+
+                self.event_state["scheduler"]["cur_scheduler_item"][
+                    "item_remaining_time_s"
+                ] = 0
+                self.stop_stack()
+                msg = "Framed mosaic stacking operation finished " + target_name
+                self.logger.info(msg)
+                self.event_state["scheduler"]["cur_scheduler_item"]["action"] = msg
+            finally:
+                self.send_message_param_sync(
+                    {
+                        "method": "set_setting",
+                        "params": {"mosaic": {"scale": 1.0, "angle": 0.0}},
+                    }
+                )
+
+            self.event_state["scheduler"]["cur_scheduler_item"]["action"] = "complete"
+        finally:
+            self.is_cur_scheduler_item_working = False
 
     def get_schedule(self, params):
         if "schedule_id" in params:
@@ -2501,6 +3560,19 @@ class Seestar:
         self.add_schedule_item(schedule_item)
         return self.start_scheduler(params)
 
+    # shortcut to start a new scheduler with only a framed mosaic request
+    def start_framed_mosaic(self, params):
+        if self.schedule["state"] != "stopped" and self.schedule["state"] != "complete":
+            return self.json_result(
+                "start_framed_mosaic",
+                -1,
+                "An existing scheduler is active. Returned with no action.",
+            )
+        self.create_schedule(params)
+        schedule_item = {"action": "start_framed_mosaic", "params": params}
+        self.add_schedule_item(schedule_item)
+        return self.start_scheduler(params)
+
     def json_result(self, command_name, code, result):
         if code != 0:
             self.logger.warning(
@@ -2623,6 +3695,11 @@ class Seestar:
             action = cur_schedule_item["action"]
             if action == "start_mosaic":
                 self.start_mosaic_item(cur_schedule_item["params"])
+                while self.is_cur_scheduler_item_working:
+                    update_time()
+                    time.sleep(2)
+            elif action == "start_framed_mosaic":
+                self.start_framed_mosaic_item(cur_schedule_item["params"])
                 while self.is_cur_scheduler_item_working:
                     update_time()
                     time.sleep(2)
@@ -2810,7 +3887,8 @@ class Seestar:
             )
 
     def mark_op_state(self, in_op_name, state="stopped"):
-        self.event_state[in_op_name] = {"state": state}
+        with self.event_state_lock:
+            self.event_state[in_op_name] = {"Event": in_op_name, "state": state}
 
     def wait_end_op(self, in_op_name):
         self.logger.info(f"Waiting for {in_op_name} to finish.")
@@ -2910,20 +3988,6 @@ class Seestar:
         else:
             self.is_watch_events = True
 
-            # Start the receive thread before the first reconnect so that the
-            # firmware-7.18+ PEM auth handshake (issued inside reconnect()) can
-            # actually observe the device's replies — response_dict is populated
-            # only by this thread. get_socket_msg() handles self.s is None by
-            # sleeping, so starting early is safe.
-            try:
-                self.get_msg_thread = threading.Thread(
-                    target=self.receive_message_thread_fn, daemon=True
-                )
-                self.get_msg_thread.name = f"IncomingMsgThread:{self.device_name}"
-                self.get_msg_thread.start()
-            except Exception:
-                pass
-
             for i in range(3, 0, -1):
                 if self.reconnect():
                     self.logger.info(f"{self.device_name} Connected")
@@ -2939,6 +4003,14 @@ class Seestar:
                 )
 
             try:
+                # Start up heartbeat and receive threads
+
+                self.get_msg_thread = threading.Thread(
+                    target=self.receive_message_thread_fn, daemon=True
+                )
+                self.get_msg_thread.name = f"IncomingMsgThread:{self.device_name}"
+                self.get_msg_thread.start()
+
                 self.heartbeat_msg_thread = threading.Thread(
                     target=self.heartbeat_message_thread_fn, daemon=True
                 )
@@ -2966,10 +4038,11 @@ class Seestar:
                 self.guest_mode_init()
                 self.event_callbacks_init(initial_state["result"])
 
-            except Exception:
+            except Exception as ex:
                 # todo : Disconnect socket and set is_watch_events false
-                # print(f"XXXX Exception {ex}")
-                pass
+                self.logger.error(
+                    f"{self.device_name}: error during watch-thread startup sequence: {ex}"
+                )
 
     def end_watch_thread(self):
         # I think it should be is_watch_events instead of is_connected...
@@ -2978,7 +4051,7 @@ class Seestar:
             self.is_watch_events = False
             self.get_msg_thread.join(timeout=7)
             self.heartbeat_msg_thread.join(timeout=7)
-            self.s.close()
+            self.disconnect()
             self.is_connected = False
 
     def get_events(self):
@@ -3030,7 +4103,7 @@ class Seestar:
                             + b"\n\n"
                         )
 
-                print(f"Event: {event_name}: {event}")
+                self.logger.debug(f"Event: {event_name}: {event}")
 
                 yield frame
             except GeneratorExit:

@@ -204,7 +204,18 @@ class NighttimeCalibrationSession:
 
         self._lock = threading.Lock()
         self._sightings: list[NighttimeSighting] = []
+        # Bumped under ``_lock`` on every change to ``_sightings``. A refit
+        # stores its result only if the generation it fitted is still the
+        # current one, so a slow refit of an older list cannot overwrite
+        # the solution of a newer one.
+        self._sightings_gen = 0
         self._solution: RotationSolution | None = None
+        # The ``_sightings_gen`` that ``_solution`` was fitted from. Set
+        # together with ``_solution`` under ``_lock``; apply() refuses while
+        # it differs from ``_sightings_gen`` (a refit for the current list
+        # has not landed yet). Every gen bump is followed by a refit from
+        # the same caller, so the two re-converge on every legitimate path.
+        self._solution_gen = 0
         self._pending: PendingCapture | None = None
         self._last_failed: PendingCapture | None = None
         self._errors: list[str] = []
@@ -336,16 +347,21 @@ class NighttimeCalibrationSession:
                 "solving",
             ):
                 raise RuntimeError("a plate-solve is already in flight; wait")
-            self._pending = PendingCapture(
+            pending = PendingCapture(
                 image_path="" if image_path is None else str(image_path),
                 encoder_az_deg=float(encoder_az_deg),
                 encoder_el_deg=float(encoder_el_deg),
                 t_started_unix=time.time(),
                 status="queued",
             )
+            self._pending = pending
             self._phase = "solving"
+        # Hand the worker its own capture so it never picks up a later one
+        # (skip + re-capture before this thread starts would otherwise make
+        # two workers solve the same pending).
         self._solve_thread = threading.Thread(
             target=self._solve_worker,
+            args=(pending,),
             name=f"NighttimePlateSolve({self.telescope_id})",
             daemon=True,
         )
@@ -365,8 +381,10 @@ class NighttimeCalibrationSession:
                     self._last_failed = self._pending
                 self._pending = None
             elif self._pending is not None:
-                # In-flight solve: mark cancelled. The worker will see
-                # _stop_evt is set (or detect _pending=None on exit).
+                # In-flight solve: mark cancelled. When the worker's solve
+                # returns it sees its capture is no longer the current
+                # ``_pending`` (or no longer ``solving``) and drops the
+                # result; see ``_pending_is_current_locked``.
                 self._pending.status = "skipped"
                 self._last_failed = self._pending
                 self._pending = None
@@ -379,6 +397,7 @@ class NighttimeCalibrationSession:
             if not (0 <= idx < len(self._sightings)):
                 raise IndexError(f"sighting idx {idx} out of range")
             del self._sightings[idx]
+            self._sightings_gen += 1
         self._refit_locked()
 
     def apply(self) -> None:
@@ -391,6 +410,14 @@ class NighttimeCalibrationSession:
                 )
             if self._solution is None:
                 raise ValueError("no solution yet; capture more sightings")
+            if self._solution_gen != self._sightings_gen:
+                # A sighting was added or removed and its refit has not
+                # stored a solution yet: the current fit lags the list and
+                # would be stamped with the wrong n_sightings.
+                raise ValueError(
+                    "fit is still updating for the latest sightings; "
+                    "retry apply in a moment"
+                )
             sol = self._solution
             sightings_snapshot = list(self._sightings)
         payload = self._build_payload(sol, sightings_snapshot)
@@ -400,10 +427,29 @@ class NighttimeCalibrationSession:
 
     # ---------- internals ----------
 
-    def _solve_worker(self) -> None:
+    def _pending_is_current_locked(self, pending: PendingCapture) -> bool:
+        """True while ``pending`` is still the live, in-flight capture.
+
+        Must be called with ``self._lock`` held. False once the operator
+        (or the auto-runner's timeout) skipped it, a newer capture replaced
+        it, or the session was stopped: a result that arrives after any of
+        those must be dropped, not appended, and must not touch the newer
+        capture's pending slot or the phase.
+        """
+        return (
+            self._pending is pending
+            and pending.status == "solving"
+            and not self._stop_evt.is_set()
+        )
+
+    def _solve_worker(self, pending: PendingCapture | None = None) -> None:
         with self._lock:
-            pending = self._pending
             if pending is None:
+                # Legacy call shape (no argument): solve the current slot.
+                pending = self._pending
+            if pending is None or self._pending is not pending:
+                return
+            if pending.status != "queued" or self._stop_evt.is_set():
                 return
             pending.status = "solving"
 
@@ -469,14 +515,31 @@ class NighttimeCalibrationSession:
             stars_used=solve_result.stars_used,
         )
         with self._lock:
+            if not self._pending_is_current_locked(pending):
+                # Skipped, superseded or stopped while solving: drop the
+                # late result.
+                return
             self._sightings.append(sighting)
+            self._sightings_gen += 1
             pending.status = "ok"
-            self._pending = None
             self._phase = "fit_pending"
+        # Keep the pending slot occupied (status "ok") until the refit has
+        # stored the solution for the new sighting list. Clearing it first
+        # left a window where status() showed no pending capture and
+        # n_accepted already bumped, but ``fit`` was still the previous
+        # (smaller) fit -- a poller such as the auto-runner's _await_solve,
+        # or an operator pressing Apply, could act on that stale fit.
         self._refit_locked()
+        with self._lock:
+            if self._pending is pending:
+                self._pending = None
 
     def _record_failure(self, pending: PendingCapture, reason: str) -> None:
         with self._lock:
+            if not self._pending_is_current_locked(pending):
+                # Late failure of a skipped/superseded/stopped capture:
+                # leave the current pending slot, last_failed and phase alone.
+                return
             pending.status = "fail"
             pending.error = reason
             self._last_failed = pending
@@ -488,10 +551,14 @@ class NighttimeCalibrationSession:
         # Snapshot under lock, fit outside.
         with self._lock:
             sightings = list(self._sightings)
+            gen = self._sightings_gen
         if len(sightings) < 1:
             with self._lock:
-                self._solution = None
-                self._phase = "idle"
+                if self._sightings_gen == gen:
+                    self._solution = None
+                    self._solution_gen = gen
+                    if self._active:
+                        self._phase = "idle"
             return
         try:
             sol = solve_rotation_from_pairs(
@@ -511,15 +578,25 @@ class NighttimeCalibrationSession:
                 # Drop the previous solution so a subsequent apply() cannot
                 # persist a stale rotation stamped with the (now larger)
                 # n_sightings. apply() refuses when _solution is None.
-                self._solution = None
+                # Skipped when the list changed meanwhile: the newer refit
+                # owns the solution.
+                if self._sightings_gen == gen:
+                    self._solution = None
+                    self._solution_gen = gen
             return
         with self._lock:
+            if self._sightings_gen != gen:
+                # The sightings changed while this fit ran; a newer refit
+                # (started after that change) stores the matching solution.
+                return
             self._solution = sol
-            self._phase = (
-                "ready_to_apply"
-                if len(self._sightings) >= self.min_sightings
-                else "fit_pending"
-            )
+            self._solution_gen = gen
+            if self._active:
+                self._phase = (
+                    "ready_to_apply"
+                    if len(self._sightings) >= self.min_sightings
+                    else "fit_pending"
+                )
 
     def _build_payload(
         self,

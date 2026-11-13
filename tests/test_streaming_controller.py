@@ -592,3 +592,65 @@ def test_per_tick_sun_check_uses_calibrated_sky_frame(monkeypatch):
     assert abs(got_el - exp_el) < 1e-6
     # And it must NOT be the raw mount az (0°) — the yaw offset shifts it.
     assert abs(got_az - 0.0) > 1.0
+
+
+def test_per_tick_sun_check_covers_commanded_pointing(monkeypatch):
+    """The per-tick sun net must also check the COMMANDED pointing
+    (eff_ref = ref + anchor offset + user biases), not just the raw
+    reference. Here the reference (az 0) is safe, but the mount starts at
+    az 120 so the anchor offset drives the mount toward az 120, which the
+    stub marks unsafe. The track must exit with 'sun_avoidance'."""
+    import device.streaming_controller as sc
+
+    calls: list[tuple[float, float]] = []
+
+    def _stub(az, el):
+        calls.append((float(az), float(el)))
+        d_az = ((float(az) - 120.0 + 180.0) % 360.0) - 180.0
+        if abs(d_az) < 10.0:
+            return (False, "sun_avoidance: stub cone at az 120")
+        return (True, "")
+
+    monkeypatch.setattr(sc, "_is_sun_safe", _stub)
+
+    provider = _FakeReferenceProvider(
+        t0=time.time() - 1.0,
+        tail_fn=lambda: time.time() + 10.0,
+        is_live=False,
+    )
+    cli = FakeMountClient()
+    cli.set_position(az_deg=120.0, el_deg=45.0)
+
+    result = track(cli, provider, dry_run=True, tick_dt=0.5, max_duration_s=3.0)
+
+    assert result.exit_reason == "sun_avoidance", (result.exit_reason, result.errors)
+    assert any("commanded pointing" in e for e in result.errors)
+    # The raw reference (az 0) was checked first and judged safe.
+    assert calls and abs(calls[0][0] - 0.0) < 1e-6
+
+
+def test_per_tick_sun_check_safe_commanded_pointing_does_not_trip(monkeypatch):
+    """Companion: with the mount already on the reference, both checks see
+    az 0 (outside the stub cone) and the track is not aborted for sun."""
+    import device.streaming_controller as sc
+
+    def _stub(az, el):
+        d_az = ((float(az) - 120.0 + 180.0) % 360.0) - 180.0
+        if abs(d_az) < 10.0:
+            return (False, "sun_avoidance: stub cone at az 120")
+        return (True, "")
+
+    monkeypatch.setattr(sc, "_is_sun_safe", _stub)
+
+    provider = _FakeReferenceProvider(
+        t0=time.time() - 1.0,
+        tail_fn=lambda: time.time() + 10.0,
+        is_live=False,
+    )
+    cli = FakeMountClient()
+    cli.set_position(az_deg=0.0, el_deg=45.0)
+
+    result = track(cli, provider, dry_run=True, tick_dt=0.5, max_duration_s=1.2)
+
+    assert result.exit_reason != "sun_avoidance", (result.exit_reason, result.errors)
+    assert result.ticks >= 1

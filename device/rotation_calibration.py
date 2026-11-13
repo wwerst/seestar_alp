@@ -15,6 +15,7 @@ Exposed API:
     - :func:`terrestrial_refraction_deg`
     - :func:`predict_mount_azel`
     - :func:`solve_rotation`, :func:`write_calibration`
+    - :func:`mount_frame_euler_deg` (seeds a fit from a kept prior)
     - :func:`parse_calibrated_at`, :func:`inspect_prior`,
       :func:`decide_clear_or_keep`
 - Session:
@@ -444,6 +445,42 @@ def _topo_to_mount_azel(
     az = (math.degrees(math.atan2(e, n)) + 360.0) % 360.0
     el = math.degrees(math.asin(u / slant))
     return az, el
+
+
+def mount_frame_euler_deg(
+    frame: MountFrame | None,
+) -> tuple[float, float, float] | None:
+    """Recover ``(yaw, pitch, roll)`` degrees from a :class:`MountFrame`.
+
+    Inverts :meth:`MountFrame.from_euler_deg` (``R = R_roll @ R_pitch @
+    R_yaw``), the convention every calibration JSON is loaded with, so a
+    kept prior can seed :func:`solve_rotation`. Returns ``None`` for
+    ``None``, a non-finite matrix, or one that the recovered angles do
+    not reproduce (e.g. |pitch| at 90°); callers then keep the default
+    zero seeds.
+    """
+    if frame is None:
+        return None
+    try:
+        r = np.asarray(frame.topo_to_mount, dtype=np.float64)
+        if r.shape != (3, 3) or not np.all(np.isfinite(r)):
+            return None
+        # Row 1 of R is [cos(p)·sin(y), cos(p)·cos(y), -sin(p)]; column 2
+        # is [sin(r)·cos(p), -sin(p), cos(r)·cos(p)].
+        pitch = math.degrees(math.asin(max(-1.0, min(1.0, -float(r[1, 2])))))
+        yaw = math.degrees(math.atan2(float(r[1, 0]), float(r[1, 1])))
+        roll = math.degrees(math.atan2(float(r[0, 2]), float(r[2, 2])))
+        rebuilt = MountFrame.from_euler_deg(
+            yaw_deg=yaw,
+            pitch_deg=pitch,
+            roll_deg=roll,
+            site=frame.site,
+        ).topo_to_mount
+        if not np.allclose(rebuilt, r, atol=1e-9):
+            return None
+    except Exception:  # noqa: BLE001 — seeding is best-effort
+        return None
+    return yaw, pitch, roll
 
 
 # ---------- solver ---------------------------------------------------
@@ -1018,6 +1055,11 @@ class CalibrationSession:
         self.site = site
         self.out_path = Path(out_path)
         self._prior_frame = prior_frame
+        # Euler angles of a kept prior, used to seed every refit. With
+        # fewer than 3 sightings the fit is yaw-only and holds pitch/roll
+        # at the seeds, so seeding at 0 would replace the prior's known
+        # tilt with 0 on a two-sighting commit. None → zero seeds.
+        self._prior_euler = mount_frame_euler_deg(prior_frame)
         self._alpaca_host = alpaca_host
         self._alpaca_port = alpaca_port
         self.dry_run = bool(dry_run)
@@ -1025,6 +1067,10 @@ class CalibrationSession:
         self._capture_image_fn = capture_image_fn
 
         self._queue: queue.Queue[_Command] = queue.Queue()
+        # One-slot pushback for a non-nudge command that nudge coalescing
+        # pulled off the queue. Taken before the queue so it keeps its
+        # place ahead of commands queued after it. Worker thread only.
+        self._pushback: _Command | None = None
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -1295,13 +1341,17 @@ class CalibrationSession:
         the encoder. Returns when a CMD_CANCEL is processed (already
         handled inside the dispatcher, which sets phase to cancelled)."""
         while not self._stop_evt.is_set():
-            try:
-                cmd = self._queue.get(timeout=self.IDLE_POLL_DT_S)
-            except queue.Empty:
-                # Idle tick: refresh encoder status so the UI polling
-                # loop stays live even when nothing else is happening.
-                self._poll_encoder_nonfatal(cli)
-                continue
+            cmd = self._pushback
+            if cmd is not None:
+                self._pushback = None
+            else:
+                try:
+                    cmd = self._queue.get(timeout=self.IDLE_POLL_DT_S)
+                except queue.Empty:
+                    # Idle tick: refresh encoder status so the UI polling
+                    # loop stays live even when nothing else is happening.
+                    self._poll_encoder_nonfatal(cli)
+                    continue
             if cmd.kind == "cancel":
                 self._set_phase("cancelled")
                 return
@@ -1338,11 +1388,11 @@ class CalibrationSession:
             except queue.Empty:
                 break
             if nxt.kind != "nudge":
-                # Put non-nudge command back on the queue front-ish; we
-                # can't peek, so just enqueue. Order preservation
-                # between the coalesced move and the subsequent command
-                # is preserved by the move completing first.
-                self._queue.put(nxt)
+                # Hold the non-nudge command in the pushback slot so the
+                # process loop runs it next. Re-queuing it would put it
+                # behind nudges queued after it (a sight would then record
+                # a position moved by a later nudge).
+                self._pushback = nxt
                 break
             with self._lock:
                 self._target_az += float(nxt.payload["d_az"])
@@ -1432,10 +1482,18 @@ class CalibrationSession:
             enc_el = float(self._encoder_el)
         # Resolve truth + handle plate-solve outside the lock — celestial
         # ephem and the plate-solver both can take seconds.
+        t_sight: float | None = None
         if ts.kind == TargetKind.PLATESOLVE:
             self._set_phase("plate_solving")
+            # Exposure time, taken just before the capture starts. Tracking
+            # is off, so the sky drifts past the stationary mount while the
+            # capture and solve run; the solved RA/Dec must be converted
+            # to alt/az at the exposure time, not at solve completion.
+            t_sight = time.time()
             try:
-                outcome = self._capture_and_solve(ts, enc_az, enc_el)
+                outcome = self._capture_and_solve(
+                    ts, enc_az, enc_el, t_capture_unix=t_sight
+                )
             except _PlateSolveSightingFailure as exc:
                 with self._lock:
                     self._last_platesolve_error = str(exc)
@@ -1470,7 +1528,7 @@ class CalibrationSession:
             true_az_deg=true_az_wrapped,
             true_el_deg=float(true_el),
             slant_m=(float(slant) if slant is not None else None),
-            t_unix=time.time(),
+            t_unix=(t_sight if t_sight is not None else time.time()),
             sigma_az_deg=sigma_az,
             sigma_el_deg=sigma_el,
         )
@@ -1482,9 +1540,17 @@ class CalibrationSession:
             sightings = list(self._sightings)
             next_idx = self._target_idx + 1
             self._last_platesolve_error = None
-        # Fit outside the lock.
+        # Fit outside the lock. Seed from a kept prior so a yaw-only fit
+        # (< 3 sightings) keeps the prior's pitch/roll instead of 0.
+        seed_yaw, seed_pitch, seed_roll = self._prior_euler or (0.0, 0.0, 0.0)
         try:
-            sol = solve_rotation(sightings, self.site)
+            sol = solve_rotation(
+                sightings,
+                self.site,
+                yaw_seed_deg=seed_yaw,
+                pitch_seed_deg=seed_pitch,
+                roll_seed_deg=seed_roll,
+            )
             with self._lock:
                 self._solution = sol
         except ValueError as exc:
@@ -1500,12 +1566,19 @@ class CalibrationSession:
             self._set_phase("nudging")
 
     def _capture_and_solve(
-        self, ts: CalibrationTargetSpec, enc_az: float, enc_el: float
+        self,
+        ts: CalibrationTargetSpec,
+        enc_az: float,
+        enc_el: float,
+        *,
+        t_capture_unix: float | None = None,
     ) -> PlateSolveOutcome:
         """Drive the plate-solve sub-flow for a PLATESOLVE sighting.
 
         Reuses :func:`device.nighttime_calibration.radec_to_topocentric_azel`
-        so the celestial transform stays in one place. Raises
+        so the celestial transform stays in one place. The solved RA/Dec
+        is converted at ``t_capture_unix`` (the exposure time); when not
+        given, the time just before the capture starts is used. Raises
         :class:`_PlateSolveSightingFailure` for any of: missing solver,
         capture failure, solver error, FOV out of range, or transform
         failure. Caller catches it, surfaces the error, and lets the
@@ -1519,6 +1592,7 @@ class CalibrationSession:
             raise _PlateSolveSightingFailure(
                 "no capture_image_fn configured; cannot sight a platesolve target"
             )
+        t_obs = float(t_capture_unix) if t_capture_unix is not None else time.time()
         try:
             image_path = self._capture_image_fn()
         except Exception as exc:
@@ -1535,7 +1609,7 @@ class CalibrationSession:
             true_az, true_el = radec_to_topocentric_azel(
                 solve_result.ra_deg,
                 solve_result.dec_deg,
-                time.time(),
+                t_obs,
                 self.site,
             )
         except Exception as exc:
@@ -1676,6 +1750,22 @@ class CalibrationSession:
             float(true_az) % 360.0,
             float(true_el),
         )
+        if sun_safe and ts.kind == TargetKind.PLATESOLVE:
+            # The seed is sent to the mount as an encoder target, so with a
+            # calibrated prior (encoder zero not at north) it lands at a
+            # different sky position from the raw numbers checked above.
+            # Which reading the operator meant is not recorded, so the slew
+            # is refused if either one is inside the cone. With an identity
+            # prior the two are the same point.
+            from device.streaming_controller import _sun_check_sky_azel
+
+            seed_sky_az, seed_sky_el = _sun_check_sky_azel(
+                prior_frame, float(pred_az), float(pred_el)
+            )
+            sun_safe, sun_reason = _is_sun_safe(
+                float(seed_sky_az) % 360.0,
+                float(seed_sky_el),
+            )
         if not sun_safe:
             with self._lock:
                 self._errors.append(f"{sun_reason} (target {ts.label})")
@@ -1693,6 +1783,14 @@ class CalibrationSession:
                 self._encoder_el = pred_el
             return
 
+        # The endpoint can be safe while the straight-line (az, el) move to
+        # it sweeps through the sun cone. Check the whole path from the
+        # current encoder pointing before commanding any motion.
+        if not self._preslew_path_sun_safe(
+            cli, ts, prior_frame, pred_az_wrapped, pred_el
+        ):
+            return
+
         # If a calibrate-motion session is running, hand the slew to it
         # so the same continuous-control primitive drives both pre-slew
         # and the operator's subsequent nudges. Wait briefly for the
@@ -1701,9 +1799,39 @@ class CalibrationSession:
         # carry on regardless. The user can refine via nudges from
         # whatever the mount actually reached.
         motion = self._motion_delegate()
+        provider_target = (
+            self._delegate_provider_target(motion, pred_az_wrapped, pred_el)
+            if motion is not None
+            else None
+        )
+        if motion is not None and provider_target is None:
+            # The motion session has no tick yet, so its anchor offset is
+            # unknown and an absolute target cannot be expressed in its
+            # frame. Do NOT fall back to move_to_ff here: the delegate is
+            # alive and its track() loop commands the mount every tick, so
+            # a direct move_to_ff would fight it (two controllers on one
+            # mount). Fail the pre-slew and let the operator retry.
+            logger.warning(
+                "calibrate-motion gave no position within %.1f s; "
+                "refusing pre-slew to %s",
+                self.DELEGATE_FIRST_TICK_WAIT_S,
+                ts.label,
+            )
+            if self._stop_evt.is_set():
+                return
+            with self._lock:
+                self._errors.append(
+                    f"pre-slew to {ts.label} failed: the calibrate-motion session "
+                    f"did not respond within {self.DELEGATE_FIRST_TICK_WAIT_S:.0f} s; "
+                    "stop and restart calibration to retry"
+                )
+                self._phase = "error"
+            self._stop_evt.set()
+            return
         if motion is not None:
+            prov_az, prov_el, land_az_cum = provider_target
             try:
-                motion.set_target(pred_az_wrapped, pred_el)
+                motion.set_target(prov_az, prov_el)
             except Exception as exc:
                 with self._lock:
                     self._errors.append(f"motion set_target failed: {exc}")
@@ -1711,7 +1839,12 @@ class CalibrationSession:
             deadline = time.time() + 30.0
             while time.time() < deadline and not self._stop_evt.is_set():
                 try:
-                    if motion.is_settled(threshold_deg=0.05, ticks=4):
+                    # is_settled alone can still be true from the ticks
+                    # before the new target, so also require the mount to
+                    # be near where this target lands it.
+                    if motion.is_settled(
+                        threshold_deg=0.05, ticks=4
+                    ) and self._delegate_near(motion, land_az_cum, pred_el):
                         break
                 except Exception:
                     break
@@ -1751,6 +1884,135 @@ class CalibrationSession:
                 self._errors.append(f"slew to {ts.label} failed: {exc}")
 
     # ---------- helpers ----------
+
+    def _preslew_path_sun_safe(
+        self, cli, ts, prior_frame, pred_az_wrapped: float, pred_el: float
+    ) -> bool:
+        """Sun-check the straight-line pre-slew path from the current
+        encoder pointing to ``(pred_az_wrapped, pred_el)``.
+
+        Reuses ``LiveTrackSession._preslew_path_sun_safe`` (short-way az,
+        which is what both the delegate and the limit-less ``move_to_ff``
+        here take). Mount-frame path points are converted to sky through
+        ``prior_frame``. A seeded plate-solve target is also checked with no
+        frame (the seed read as sky numbers), matching its endpoint check.
+        On refusal records the reason, sets phase ``error`` and the stop
+        event, and returns False.
+
+        If the encoder cannot be read the pre-slew is refused, as the live
+        tracker's ``_auto_slew`` does (``_fail_preslew``): the path cannot
+        be verified without a start point.
+        """
+        cur_el, cur_az = self._read_encoder_nonfatal(cli)
+        if cur_el is None or cur_az is None:
+            ok = False
+            reason = (
+                "sun_avoidance: pre-slew path could not be verified "
+                "(encoder read failed); refusing"
+            )
+        else:
+            # Imported here: live_tracker imports this module lazily, and
+            # pulls in heavy deps the calibration unit tests do not need.
+            from device.live_tracker import LiveTrackSession
+
+            cur_az_wrapped = ((float(cur_az) + 180.0) % 360.0) - 180.0
+            # A seeded plate-solve target is checked both ways, like its
+            # endpoint: as raw sky numbers (no frame) and as the encoder
+            # path it really is (through the prior). Either one unsafe
+            # refuses.
+            frames = (
+                [None, prior_frame]
+                if ts.kind == TargetKind.PLATESOLVE
+                else [prior_frame]
+            )
+            ok, reason = True, ""
+            for mount_frame in frames:
+                ok, reason = LiveTrackSession._preslew_path_sun_safe(
+                    mount_frame,
+                    cur_az_wrapped,
+                    float(cur_el),
+                    float(pred_az_wrapped),
+                    float(pred_el),
+                )
+                if not ok:
+                    break
+        if ok:
+            return True
+        with self._lock:
+            self._errors.append(f"{reason} (pre-slew to {ts.label})")
+            self._phase = "error"
+        self._stop_evt.set()
+        return False
+
+    # How long the pre-slew waits for the calibrate-motion session's first
+    # tick (which carries the anchor offset) before giving up.
+    DELEGATE_FIRST_TICK_WAIT_S = 3.0
+
+    def _delegate_provider_target(
+        self, motion, pred_az_wrapped: float, pred_el: float
+    ) -> tuple[float, float, float] | None:
+        """Express an absolute mount-encoder target in the motion
+        delegate's provider frame.
+
+        Returns ``(provider_az, provider_el, landing_cum_az)``, where
+        ``landing_cum_az`` is the cumulative encoder az the mount should
+        reach.
+
+        The calibrate-motion session's streaming controller anchors at
+        start: it commands ``eff_ref = provider_target + offset``, with
+        ``offset = encoder_at_start - provider_target_at_start`` (plus any
+        biases). Its last tick reports ``err = eff_ref - cur``, so
+        ``offset = cur + err - provider_target``. Setting the provider to
+        ``encoder_target - offset`` lands the mount on ``encoder_target``.
+        Azimuth is taken the short way from the current cumulative
+        encoder az.
+
+        Returns ``None`` when the needed status fields are not available
+        (no tick yet, within ``DELEGATE_FIRST_TICK_WAIT_S``).
+        """
+        deadline = time.time() + self.DELEGATE_FIRST_TICK_WAIT_S
+        while True:
+            try:
+                st = motion.status()
+                fields = (
+                    st.cur_cum_az_deg,
+                    st.cur_el_deg,
+                    st.err_az_deg,
+                    st.err_el_deg,
+                    st.target_az_deg,
+                    st.target_el_deg,
+                )
+                if all(v is not None for v in fields):
+                    vals = [float(v) for v in fields]
+                    if all(math.isfinite(v) for v in vals):
+                        cur_az, cur_el, err_az, err_el, tgt_az, tgt_el = vals
+                        off_az = (cur_az + err_az) - tgt_az
+                        off_el = (cur_el + err_el) - tgt_el
+                        pred_cum = cur_az + _wrap_pm180(float(pred_az_wrapped) - cur_az)
+                        return (
+                            pred_cum - off_az,
+                            float(pred_el) - off_el,
+                            pred_cum,
+                        )
+            except Exception:  # noqa: BLE001 — treat as "no status yet"
+                pass
+            if time.time() >= deadline or self._stop_evt.is_set():
+                return None
+            time.sleep(0.1)
+
+    @staticmethod
+    def _delegate_near(
+        motion, az_cum_deg: float, el_deg: float, tol_deg: float = 0.5
+    ) -> bool:
+        """True when the delegate's last tick has the mount within
+        ``tol_deg`` of ``(az_cum_deg, el_deg)`` on both axes."""
+        st = motion.status()
+        if st.cur_cum_az_deg is None or st.cur_el_deg is None:
+            return False
+        return (
+            abs(float(st.cur_cum_az_deg) - float(az_cum_deg)) < tol_deg
+            and abs(float(st.cur_el_deg) - float(el_deg)) < tol_deg
+        )
 
     def _set_phase(self, phase: str) -> None:
         with self._lock:

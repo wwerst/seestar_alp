@@ -23,6 +23,7 @@ docker/getopts_long
 front/twilight_times.json
 front/planning.json
 front/node_modules/
+seestar_alp_upstream.egg-info/
 
 Seestar Alpaca API.json:Zone.Identifier
 CometEls.txt
@@ -49,3 +50,12 @@ data/fetch_aircraft.log
 device/mount_calibration.json
 # Rotation-calibration REPL / web UI backs up the prior calibration to .bak on clear.
 device/mount_calibration.json.bak
+
+emulator/astrometry/index/
+emulator/sim/data/*.npy
+emulator/sim/shared/*
+!emulator/sim/shared/.gitkeep
+.venv-mcp/
+device/horizon.hrz
+device/horizon.horizon.json
+device/*.tmp

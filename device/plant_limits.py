@@ -147,22 +147,27 @@ class CumulativeAzTracker:
             "saved_at_iso": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
 
-    def save(self, path: str = _STATE_JSON) -> None:
+    def save(self, path: str | None = None) -> None:
         """Write cum-az state to disk so the next session can pick it up.
 
         Atomic write: the next session's `load_or_fresh` reads this on
         startup; a truncated file from SIGKILL/power-loss would silently
         reset cumulative-az and mis-report cable-wrap state.
+
+        ``path=None`` means the module's ``_STATE_JSON``, resolved at call
+        time (not captured as a default argument) so tests can redirect it.
         """
         from device._atomic_json import write_atomic_json
 
+        if path is None:
+            path = _STATE_JSON
         write_atomic_json(path, self.to_dict(), indent=2)
 
     @classmethod
     def load_or_fresh(
         cls,
         current_wrapped_az_deg: float,
-        path: str = _STATE_JSON,
+        path: str | None = None,
         tol_deg: float = 2.0,
     ) -> "CumulativeAzTracker":
         """Load tracker state from disk, or start fresh on mismatch.
@@ -173,8 +178,10 @@ class CumulativeAzTracker:
         uninitialized tracker is returned (it will anchor to the next
         `update()` reading). On success the tracker's `_prev_wrapped` is
         re-anchored to the current reading, absorbing sub-tolerance drift
-        into `cum_az_deg`.
+        into `cum_az_deg`. ``path=None`` means ``_STATE_JSON`` at call time.
         """
+        if path is None:
+            path = _STATE_JSON
         tracker = cls()
         if not os.path.isfile(path):
             return tracker

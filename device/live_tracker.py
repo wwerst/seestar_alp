@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import threading
 import time
 from collections import deque
@@ -47,6 +48,7 @@ from device.streaming_controller import (
     OffsetSnapshot,
     TickInfo,
     _mount_azel_to_sky,
+    _sun_check_sky_azel,
     pre_check,
     track,
 )
@@ -92,6 +94,31 @@ EL_BIAS_BOUND_DEG = 5.0
 ALONG_BOUND_DEG = 5.0
 CROSS_BOUND_DEG = 5.0
 TIME_OFFSET_BOUND_S = 30.0
+
+
+# ---------- ADS-B feed sanitizing -------------------------------------
+
+# adsb.fi "hex" is a 24-bit ICAO address (6 hex digits), prefixed with "~"
+# for non-ICAO (TIS-B) targets. "flight" is a callsign of up to 8
+# alphanumerics, space padded.
+_ICAO24_RE = re.compile(r"^~?[0-9A-Fa-f]{6}$")
+_CALLSIGN_RE = re.compile(r"^[A-Za-z0-9 ]{0,8}$")
+
+
+def _sanitize_icao24(value) -> str | None:
+    """Return the feed's hex id if it is a plain ICAO address, else None."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if _ICAO24_RE.match(value) else None
+
+
+def _sanitize_callsign(value) -> str:
+    """Return the stripped callsign if it is plain alphanumerics, else ''."""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return value if _CALLSIGN_RE.match(value) else ""
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -673,6 +700,13 @@ class TargetCatalog:
             if parsed is None:
                 continue
             icao24, callsign, s = parsed
+            # Third-party feed: drop records whose hex id is not a plain
+            # ICAO address and blank callsigns that are not plain
+            # alphanumerics. Both end up in the UI (display_name, id).
+            icao24 = _sanitize_icao24(icao24)
+            if icao24 is None:
+                continue
+            callsign = _sanitize_callsign(callsign)
             if s.alt_m > MAX_ALT_M:
                 continue
             # Backdate the sample by the feed's reported position age so the
@@ -1057,9 +1091,13 @@ class LiveTrackSession:
            the target az is a mount-encoder target.
 
         Scenery view mode is entered first so the imager can display the
-        live camera while the loop runs. Failures are logged to
-        `self._errors` but the streaming loop still runs from wherever
-        the mount ended up.
+        live camera while the loop runs (a failure there is only logged).
+        A failed measure, unstow, provider sample or move_to_ff, or a
+        slew that does not converge, is terminal
+        (``exit_reason='pre_slew_failed'``, see ``_fail_preslew``): the
+        streaming loop would otherwise anchor to wherever the mount ended
+        up. Both the target and the straight-line path to it are checked
+        against the sun before the slew is issued.
 
         Stop preemption: `self._stop_evt` is checked at each substep
         boundary. A running `move_to_ff` call cannot itself be
@@ -1093,8 +1131,7 @@ class LiveTrackSession:
         try:
             cur_el, cur_az_wrapped, _ = measure_altaz_timed(cli, loc)
         except Exception as exc:
-            with self._lock:
-                self._errors.append(f"pre-slew measure_altaz failed: {exc}")
+            self._fail_preslew(f"pre-slew measure_altaz failed: {exc}")
             return
 
         # Anchor the cumulative-az tracker to the encoder reading before any
@@ -1142,8 +1179,7 @@ class LiveTrackSession:
                 )
                 cur_el, cur_az_wrapped = new_el, new_az
             except Exception as exc:
-                with self._lock:
-                    self._errors.append(f"unstow failed: {exc}")
+                self._fail_preslew(f"unstow failed: {exc}")
                 return
             if self._position_logger is not None:
                 try:
@@ -1164,8 +1200,7 @@ class LiveTrackSession:
         try:
             first = self._provider.sample(time.time() + 5.0)
         except Exception as exc:
-            with self._lock:
-                self._errors.append(f"pre-slew sample failed: {exc}")
+            self._fail_preslew(f"pre-slew sample failed: {exc}")
             return
 
         target_az_wrapped = ((first.az_cum_deg + 180.0) % 360.0) - 180.0
@@ -1201,25 +1236,27 @@ class LiveTrackSession:
 
         sun_safe, sun_reason = _is_sun_safe(sun_check_az, sun_check_el)
         if not sun_safe:
-            with self._lock:
-                self._errors.append(sun_reason)
-                self._exit_reason = "sun_avoidance"
-                self._phase = "refused"
-            # Terminal: signal stop so nothing downstream re-enters the
-            # tracking loop and clobbers this refusal. `_run` also detects
-            # the already-set exit_reason and returns without overwriting
-            # phase/exit_reason.
-            self._stop_evt.set()
-            if self._position_logger is not None:
-                try:
-                    self._position_logger.mark_event(
-                        "pre_slew_refused_sun",
-                        target_az_deg=target_az_wrapped,
-                        target_el_deg=target_el,
-                        reason=sun_reason,
-                    )
-                except Exception:
-                    pass
+            self._refuse_preslew_sun(
+                sun_reason, target_az_wrapped, target_el, "pre_slew_refused_sun"
+            )
+            return
+
+        # The endpoint can be safe while the straight-line (az, el) move to
+        # it sweeps through the sun cone. Sample the path move_to_ff will
+        # plan (same az direction) and refuse if any point is unsafe.
+        path_safe, path_reason = self._preslew_path_sun_safe(
+            sun_mount_frame,
+            cur_az_wrapped,
+            cur_el,
+            target_az_wrapped,
+            target_el,
+            az_limits=az_limits,
+            az_tracker=az_tracker,
+        )
+        if not path_safe:
+            self._refuse_preslew_sun(
+                path_reason, target_az_wrapped, target_el, "pre_slew_refused_sun_path"
+            )
             return
 
         if self._position_logger is not None:
@@ -1252,8 +1289,7 @@ class LiveTrackSession:
                 arrive_tolerance_deg=0.8,
             )
         except Exception as exc:
-            with self._lock:
-                self._errors.append(f"pre-slew move_to_ff failed: {exc}")
+            self._fail_preslew(f"pre-slew move_to_ff failed: {exc}")
             return
         if self._position_logger is not None:
             try:
@@ -1265,12 +1301,127 @@ class LiveTrackSession:
                 )
             except Exception:
                 pass
-        if not stats.get("converged"):
-            with self._lock:
-                self._errors.append(
-                    f"pre-slew did not converge (final az={new_az:+.2f}° "
-                    f"el={new_el:+.2f}°)"
+        # move_to_ff's zero-length-plan early return never sets "converged",
+        # so also accept a final position measured within the arrive
+        # tolerance of the target.
+        try:
+            arrived = (
+                abs(((new_az - target_az_wrapped + 180.0) % 360.0) - 180.0) <= 0.8
+                and abs(new_el - target_el) <= 0.8
+            )
+        except Exception:
+            arrived = False
+        if not (stats.get("converged") or arrived):
+            self._fail_preslew(
+                f"pre-slew did not converge (final az={new_az:+.2f}° el={new_el:+.2f}°)"
+            )
+
+    def _fail_preslew(self, message: str) -> None:
+        """Terminal pre-slew failure (measure / unstow / sample / move_to_ff
+        error, or the slew did not converge).
+
+        The streaming loop anchors its reference to wherever the mount is
+        when it starts, so tracking from a failed pre-slew can command a
+        pointing offset by an unbounded anchor. Record the failure, set
+        ``exit_reason='pre_slew_failed'`` and the stop event so ``_run``
+        does not fall through into ``track()``.
+        """
+        with self._lock:
+            self._errors.append(message)
+            if self._exit_reason is None:
+                self._exit_reason = "pre_slew_failed"
+            self._phase = "error"
+        self._stop_evt.set()
+        if self._position_logger is not None:
+            try:
+                self._position_logger.mark_event("pre_slew_failed", reason=message)
+            except Exception:
+                pass
+
+    def _refuse_preslew_sun(
+        self,
+        reason: str,
+        target_az_deg: float,
+        target_el_deg: float,
+        event: str,
+    ) -> None:
+        """Terminal pre-slew sun refusal (``exit_reason='sun_avoidance'``)."""
+        with self._lock:
+            self._errors.append(reason)
+            self._exit_reason = "sun_avoidance"
+            self._phase = "refused"
+        # Terminal: signal stop so nothing downstream re-enters the
+        # tracking loop and clobbers this refusal. `_run` also detects
+        # the already-set exit_reason and returns without overwriting
+        # phase/exit_reason.
+        self._stop_evt.set()
+        if self._position_logger is not None:
+            try:
+                self._position_logger.mark_event(
+                    event,
+                    target_az_deg=target_az_deg,
+                    target_el_deg=target_el_deg,
+                    reason=reason,
                 )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _preslew_path_sun_safe(
+        mount_frame,
+        cur_az_wrapped: float,
+        cur_el: float,
+        target_az_wrapped: float,
+        target_el: float,
+        *,
+        az_limits: AzimuthLimits | None = None,
+        az_tracker: CumulativeAzTracker | None = None,
+    ) -> tuple[bool, str]:
+        """Sun check for the whole straight-line pre-slew path.
+
+        Uses the az direction ``move_to_ff`` will plan: the cable-wrap-aware
+        ``pick_cum_target`` when limits and a tracker are given, else the
+        short way. If that direction cannot be determined, both ways are
+        checked. Each mount-frame point is converted to sky with the same
+        transform and fallback as the endpoint check. Any error while
+        checking returns unsafe (fail closed).
+        """
+        from device import sun_safety as _ss
+        from device.velocity_controller import wrap_pm180
+
+        try:
+            short_delta = wrap_pm180(float(target_az_wrapped) - float(cur_az_wrapped))
+            d_az_options = [short_delta]
+            if az_limits is not None and az_tracker is not None:
+                try:
+                    from device.plant_limits import pick_cum_target
+
+                    cum0 = float(az_tracker.cum_az_deg)
+                    d_az_options = [
+                        pick_cum_target(
+                            cum0, cur_az_wrapped, target_az_wrapped, az_limits
+                        )
+                        - cum0
+                    ]
+                except Exception:
+                    long_delta = (
+                        short_delta - 360.0 if short_delta >= 0 else short_delta + 360.0
+                    )
+                    d_az_options = [short_delta, long_delta]
+            d_el = float(target_el) - float(cur_el)
+            for d_az in d_az_options:
+                mount_pts = _ss.sample_azel_segment(cur_az_wrapped, cur_el, d_az, d_el)
+                sky_pts = [
+                    _sun_check_sky_azel(mount_frame, az, el) for az, el in mount_pts
+                ]
+                ok, reason = _ss.path_is_sun_safe(sky_pts)
+                if not ok:
+                    return False, reason
+        except Exception as exc:
+            return False, (
+                f"sun_avoidance: pre-slew path could not be verified ({exc}); refusing"
+            )
+        return True, ""
 
     def _resolve_az_limits(self) -> AzimuthLimits | None:
         """Session cable-wrap limits: the caller-supplied ones, else the
@@ -1421,9 +1572,23 @@ class LiveTrackSession:
 
         try:
             tracker: CumulativeAzTracker | None = None
+            # Restore the persisted cable-wrap (cumulative az) state. The
+            # loader needs the current wrapped encoder az to decide whether
+            # the saved state still applies (no power-cycle since), so read
+            # it first. On failure keep the fresh-tracker fallback, but say
+            # so: track() will save the fresh state over the file on exit.
             try:
-                tracker = CumulativeAzTracker.load_or_fresh()
-            except Exception:
+                _el_now, az_now_wrapped, _ = measure_altaz_timed(cli, loc)
+                tracker = CumulativeAzTracker.load_or_fresh(
+                    current_wrapped_az_deg=az_now_wrapped
+                )
+            except Exception as exc:
+                logger.warning(
+                    "could not load persisted cable-wrap state (%s); starting "
+                    "a fresh cumulative-az tracker, which will be saved over "
+                    "the state file when the session ends",
+                    exc,
+                )
                 tracker = CumulativeAzTracker()
 
             if self._auto_slew_enabled and not self.dry_run:

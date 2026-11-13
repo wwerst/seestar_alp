@@ -27,7 +27,7 @@ from typing import Optional
 
 from device import live_tracker as _lt
 from device import sun_safety as _ss
-from device.config import Config
+from device.config import Config, ConfigError
 
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,13 @@ class LiveTrackerMain:
     # ---------- lifecycle ----------
 
     def start(self) -> None:
-        Config.load_toml()
+        try:
+            Config.load_toml()
+        except ConfigError as e:
+            # config.toml is unparseable. Keep the last-good (or import-time)
+            # config and still start: the sun-safety monitor must not be
+            # skipped because of a config typo.
+            logger.error("Using last-good config; config.toml is invalid.\n%s", e)
 
         # Touch the lazy singletons so their state is ready when the
         # Front hits them. Neither call starts a thread.
@@ -58,8 +64,12 @@ class LiveTrackerMain:
             jog_command=_make_jog_command(),
             abort_active=_abort_active_sessions,
             jog_telescope_id=_primary_telescope_id(),
-            lat_deg=Config.init_lat,
-            lon_deg=Config.init_long,
+            # None = resolve the site from Config on every tick. The site
+            # can change at runtime (Seestar.start_up_sequence sets
+            # Config.init_lat/init_long from params or IP geolocation); a
+            # value captured here would leave the monitor blind at 0/0.
+            lat_deg=None,
+            lon_deg=None,
             min_separation_deg=Config.sun_avoidance_min_sep_deg,
             alt_threshold_deg=Config.sun_avoidance_alt_threshold_deg,
             jog_speed=Config.sun_avoidance_jog_speed,
@@ -72,7 +82,14 @@ class LiveTrackerMain:
     def reload(self) -> None:
         """Picked up by root_app's config watcher. Pushes the new
         thresholds into the running monitor without restarting."""
-        Config.load_toml()
+        try:
+            Config.load_toml()
+        except ConfigError as e:
+            # A live edit left config.toml unparseable. Keep running on the
+            # last-good config (same as root_app's watcher); the next valid
+            # save reloads.
+            logger.error("Ignoring config reload; config.toml is invalid.\n%s", e)
+            return
         if self._monitor is None:
             # Config might have re-enabled us; spin up now.
             if getattr(Config, "sun_avoidance_enabled", True):

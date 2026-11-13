@@ -1,11 +1,32 @@
 import json
+import os
 import re
+import shutil
 import threading
 from types import SimpleNamespace
 
 import pytest
+import falcon
 import front.app as front_app
 from device.config import Config
+from falcon import testing
+
+
+@pytest.fixture(autouse=True)
+def _clear_auth_cache():
+    front_app._auth_needs_cache.clear()
+    yield
+    front_app._auth_needs_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_emulator_flag(monkeypatch):
+    # Isolate from the developer's local config.toml: if a [[seestars]] entry
+    # has is_emulator = true (e.g. for local emulator testing), tests below
+    # that don't care about it must not silently start skipping their
+    # check_needs_auth path. Tests exercising is_emulator_telescope or the
+    # is_emulator short-circuit explicitly override get_telescope again.
+    monkeypatch.setattr(front_app, "get_telescope", lambda _tid: {"device_num": _tid})
 
 
 class DummyReq:
@@ -94,6 +115,7 @@ def _minimal_context(partial_path, online=True):
         "platform": "raspberry_pi",
         "defgain": 80,
         "current_exp": None,
+        "needs_auth_warning": False,
     }
 
 
@@ -217,6 +239,31 @@ def test_get_nearest_csc_uses_result_cache(monkeypatch):
     assert calls["count"] == 1
 
 
+def test_config_json_resource_contract(monkeypatch):
+    monkeypatch.setattr(
+        Config,
+        "seestars",
+        [
+            {"device_num": 1, "name": "Seestar Alpha", "ip_address": "192.168.1.50"},
+            {"device_num": 2, "name": "Seestar Beta", "ip_address": "192.168.1.51"},
+        ],
+    )
+    monkeypatch.setattr(Config, "port", 5555)
+    monkeypatch.setattr(Config, "imgport", 7556)
+
+    resp = falcon.Response()
+    front_app.ConfigJsonResource.on_get(DummyReq(), resp)
+
+    assert resp.status == falcon.HTTP_200
+    assert resp.content_type == "application/json"
+    data = json.loads(resp.text)
+    assert data["server"] == {"alpaca_port": 5555, "imaging_port": 7556}
+    assert data["devices"] == [
+        {"device_num": 1, "name": "Seestar Alpha", "ip_address": "192.168.1.50"},
+        {"device_num": 2, "name": "Seestar Beta", "ip_address": "192.168.1.51"},
+    ]
+
+
 def test_get_planning_cards_uses_file_mtime_cache(monkeypatch, tmp_path):
     planning_file = tmp_path / "planning.json"
     planning_file.write_text(
@@ -280,6 +327,82 @@ def test_update_planning_card_state_invalidates_cache(monkeypatch, tmp_path):
     assert front_app._planning_cards_cache is None
     updated_cards = front_app.get_planning_cards()
     assert updated_cards[0]["planning_page_enable"] is False
+
+
+def test_get_planning_cards_merges_missing_cards_from_example(monkeypatch, tmp_path):
+    planning_file = tmp_path / "planning.json"
+    planning_file.write_text(
+        json.dumps(
+            [
+                {
+                    "card_name": "twilight_times",
+                    "card_friendly_name": "Twilight Times",
+                    "template": "partials/twilight_times.html",
+                    "planning_page_enable": False,
+                    "planning_page_collapsed": True,
+                }
+            ]
+        )
+    )
+    example_file = tmp_path / "planning.json.example"
+    example_file.write_text(
+        json.dumps(
+            [
+                {
+                    "card_name": "twilight_times",
+                    "card_friendly_name": "Twilight Times",
+                    "template": "partials/twilight_times.html",
+                    "planning_page_enable": True,
+                    "planning_page_collapsed": False,
+                },
+                {
+                    "card_name": "framed_mosaic",
+                    "card_friendly_name": "Framed Mosaic",
+                    "template": "partials/framed_mosaic_planning.html",
+                    "planning_page_enable": True,
+                    "planning_page_collapsed": False,
+                },
+            ]
+        )
+    )
+
+    monkeypatch.setattr(front_app.os.path, "dirname", lambda _: str(tmp_path))
+    front_app._planning_cards_cache = None
+    front_app._planning_cards_cache_mtime = None
+
+    cards = front_app.get_planning_cards()
+
+    names = {card["card_name"] for card in cards}
+    assert names == {"twilight_times", "framed_mosaic"}
+
+    # the user's existing settings for a card they already have must be preserved
+    twilight = next(c for c in cards if c["card_name"] == "twilight_times")
+    assert twilight["planning_page_enable"] is False
+    assert twilight["planning_page_collapsed"] is True
+
+    # the merge is persisted so a second load doesn't need the cache
+    front_app._planning_cards_cache = None
+    front_app._planning_cards_cache_mtime = None
+    persisted = json.loads(planning_file.read_text())
+    assert {c["card_name"] for c in persisted} == {"twilight_times", "framed_mosaic"}
+
+
+def test_planning_page_includes_framed_mosaic_card(monkeypatch, tmp_path):
+    example_source = os.path.join(
+        os.path.dirname(front_app.__file__), "planning.json.example"
+    )
+    shutil.copyfile(example_source, tmp_path / "planning.json")
+
+    monkeypatch.setattr(front_app.os.path, "dirname", lambda _: str(tmp_path))
+    front_app._planning_cards_cache = None
+    front_app._planning_cards_cache_mtime = None
+
+    cards = front_app.get_planning_cards()
+    names = {card["card_name"] for card in cards}
+    assert "framed_mosaic" in names
+
+    framed_mosaic_card = next(c for c in cards if c["card_name"] == "framed_mosaic")
+    assert framed_mosaic_card["template"] == "partials/framed_mosaic_planning.html"
 
 
 def test_get_csc_sites_data_uses_in_memory_cache(monkeypatch, tmp_path):
@@ -733,6 +856,194 @@ def test_settings_post_missing_light_duration_min_does_not_raise(monkeypatch):
     assert captured["stack_payload"]["light_duration_min"] == -1
 
 
+@pytest.mark.parametrize(
+    "timed_out_call", ["settings", "dark_mode", "drizzle", "star_trails"]
+)
+def test_settings_post_does_not_crash_when_a_write_times_out(
+    monkeypatch, timed_out_call
+):
+    # Issue #728: a device-side write timeout (do_action_device returns None,
+    # matching a real requests.exceptions.Timeout in front/app.py's
+    # do_action_device) must not crash on_post with
+    # `TypeError: 'NoneType' object is not subscriptable` when the result is
+    # later subscripted as e.g. settings_output["ErrorNumber"].
+    model = "Seestar S30 Pro" if timed_out_call == "star_trails" else "Seestar S50"
+
+    class DummyReq:
+        def __init__(self):
+            self.media = {
+                "stack_lenhance": "false",
+                "stack_dither_pix": "10",
+                "stack_dither_interval": "2",
+                "stack_dither_enable": "true",
+                "exp_ms_stack_l": "10000",
+                "exp_ms_continuous": "500",
+                "focal_pos": "1500",
+                "auto_power_off": "false",
+                "auto_3ppa_calib": "true",
+                "frame_calib": "true",
+                "save_discrete_frame": "true",
+                "save_discrete_ok_frame": "false",
+                "heater_enable": "false",
+                "dark_mode": "false",
+                "stack_cont_capt": "false",
+                "stack_drizzle2x": "false",
+                "stack_star_trails": "false",
+            }
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        method = parameters.get("method")
+        params = parameters.get("params", {})
+        if timed_out_call == "settings" and "stack_lenhance" in params:
+            return None
+        if timed_out_call == "dark_mode" and "dark_mode" in params:
+            return None
+        if timed_out_call == "drizzle" and "drizzle2x" in params.get("stack", {}):
+            return None
+        if timed_out_call == "star_trails" and "star_trails" in params.get("stack", {}):
+            return None
+        assert method  # sanity: every other call still gets a normal response
+        return {"ErrorNumber": 0, "Value": {"code": 0}}
+
+    captured = {}
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2500)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: model)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(
+        front_app.SettingsResource,
+        "render_settings",
+        staticmethod(lambda _req, _resp, _tid, output: captured.update(output=output)),
+    )
+
+    front_app.SettingsResource().on_post(DummyReq(), object(), 1)
+
+    assert captured["output"] == "Error Updating Settings."
+
+
+def test_settings_post_auto_lenhance_sent_on_fw_2775(monkeypatch):
+    class DummyReq:
+        def __init__(self):
+            self.media = {
+                "stack_lenhance": "false",
+                "auto_lenhance": "true",
+                "stack_dither_pix": "10",
+                "stack_dither_interval": "2",
+                "stack_dither_enable": "true",
+                "exp_ms_stack_l": "10000",
+                "exp_ms_continuous": "500",
+                "focal_pos": "1500",
+                "auto_power_off": "false",
+                "auto_3ppa_calib": "true",
+                "frame_calib": "true",
+                "plan_target_af": "false",
+                "viewplan_gohome": "false",
+                "expert_mode": "false",
+                "heater_enable": "false",
+                "dark_mode": "false",
+                "stack_cont_capt": "false",
+                "stack_drizzle2x": "false",
+            }
+
+    captured = {"main_set_setting_params": None}
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        if action == "method_async":
+            return {"ErrorNumber": 0, "Value": {"code": 0}}
+        method = parameters.get("method")
+        params = parameters.get("params", {})
+        if (
+            action == "method_sync"
+            and method == "set_setting"
+            and "auto_lenhance" in params
+        ):
+            captured["main_set_setting_params"] = params
+        return {"ErrorNumber": 0, "Value": {"code": 0}}
+
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2775)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(
+        front_app.SettingsResource,
+        "render_settings",
+        staticmethod(lambda _req, _resp, _tid, _output: None),
+    )
+
+    front_app.SettingsResource().on_post(DummyReq(), object(), 1)
+
+    assert captured["main_set_setting_params"] is not None
+    assert captured["main_set_setting_params"]["auto_lenhance"] is True
+
+
+def test_settings_post_auto_lenhance_not_sent_on_older_fw(monkeypatch):
+    class DummyReq:
+        def __init__(self):
+            self.media = {
+                "stack_lenhance": "false",
+                "stack_dither_pix": "10",
+                "stack_dither_interval": "2",
+                "stack_dither_enable": "true",
+                "exp_ms_stack_l": "10000",
+                "exp_ms_continuous": "500",
+                "focal_pos": "1500",
+                "auto_power_off": "false",
+                "auto_3ppa_calib": "true",
+                "frame_calib": "true",
+                "plan_target_af": "false",
+                "viewplan_gohome": "false",
+                "expert_mode": "false",
+                "heater_enable": "false",
+                "dark_mode": "false",
+                "stack_cont_capt": "false",
+                "stack_drizzle2x": "false",
+            }
+
+    captured = {"saw_auto_lenhance": False}
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        if action == "method_async":
+            return {"ErrorNumber": 0, "Value": {"code": 0}}
+        params = parameters.get("params", {})
+        if "auto_lenhance" in params:
+            captured["saw_auto_lenhance"] = True
+        return {"ErrorNumber": 0, "Value": {"code": 0}}
+
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2670)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(
+        front_app.SettingsResource,
+        "render_settings",
+        staticmethod(lambda _req, _resp, _tid, _output: None),
+    )
+
+    front_app.SettingsResource().on_post(DummyReq(), object(), 1)
+
+    assert captured["saw_auto_lenhance"] is False
+
+
+def test_auto_lenhance_defaults_to_false_when_absent_from_firmware(monkeypatch):
+    # Firmware may not include auto_lenhance in get_setting response even on 7.75+.
+    # Defaulting to False ensures the setting renders as a boolean toggle, not "None".
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda action, tid, params, **kw: {
+            "Value": {
+                "result": {
+                    "exp_ms": {"stack_l": 10000, "continuous": 500},
+                    "stack_dither": {"pix": 10, "interval": 2, "enable": True},
+                    "stack_lenhance": False,
+                    # auto_lenhance intentionally absent
+                }
+            }
+        },
+    )
+    settings = front_app.get_device_settings(1)
+    assert settings["auto_lenhance"] is False
+
+
 def test_home_content_endpoint_returns_non_empty_html(monkeypatch):
     monkeypatch.setattr(
         front_app,
@@ -826,6 +1137,40 @@ def test_eventstatus_endpoint_handles_empty_event_result(monkeypatch):
 
     assert "Current Status of Devices" in resp.text
     assert "No results available." in resp.text
+
+
+def test_eventstatus_framed_mosaic_uses_same_eventlist_as_mosaic(monkeypatch):
+    monkeypatch.setattr(
+        front_app,
+        "get_context",
+        lambda _tid, _req: _minimal_context("eventstatus", online=True),
+    )
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda *_args, **_kwargs: {"Value": {"result": {"x": {"state": "idle"}}}},
+    )
+
+    def render(action):
+        front_app.EventStatus._last_render_by_key.clear()
+        req = DummyHTMXReq(
+            relative_uri="/1/eventstatus",
+            params={"action": action},
+            headers={
+                "User-Agent": "pytest-agent",
+                "HX-Current-URL": f"http://localhost/1/{action}",
+            },
+        )
+        resp = DummyResp()
+        front_app.EventStatus.on_get(req, resp, telescope_id=1)
+        return resp.text
+
+    mosaic_html = render("mosaic")
+    framed_mosaic_html = render("framed_mosaic")
+
+    for expected in ("DarkLibrary", "Stack"):
+        assert expected in mosaic_html
+        assert expected in framed_mosaic_html
 
 
 @pytest.mark.parametrize(
@@ -1711,11 +2056,308 @@ def test_ensure_scenery_video_guard_matrix(monkeypatch):
     assert front_app._ensure_scenery_video(1) is False
     assert seen == []
 
-    # "Offline" string / None from method_sync → treated as not working
-    # (the kick attempt is itself a no-op when the device is unreachable).
-    monkeypatch.setattr(front_app, "method_sync", lambda *a, **k: "Offline")
+    # result == 0 (well-formed success with no View) → idle → kick.
+    monkeypatch.setattr(
+        front_app,
+        "method_sync",
+        lambda *a, **k: {"command": "get_view_state", "status": "success", "result": 0},
+    )
     seen.clear()
     assert front_app._ensure_scenery_video(1) is True
+
+    # A failed read must NOT kick: the view state is unknown, and an online
+    # mount that is star-imaging must not be switched to scenery because one
+    # read failed. Covers "Offline", None, the device-layer timeout string
+    # and a firmware error reply.
+    failed_reads = [
+        "Offline",
+        None,
+        "Error: Exceeded allotted wait time for result",
+        {"command": "get_view_state", "status": "error", "result": "fail"},
+    ]
+    for bad in failed_reads:
+        monkeypatch.setattr(front_app, "method_sync", lambda *a, _b=bad, **k: _b)
+        seen.clear()
+        assert front_app._ensure_scenery_video(1) is False, bad
+        assert seen == [], bad
+
+    # Federation (0) is never kicked and never read.
+    reads = []
+    monkeypatch.setattr(front_app, "method_sync", lambda *a, **k: reads.append(a) or {})
+    seen.clear()
+    assert front_app._ensure_scenery_video(0) is False
+    assert seen == []
+    assert reads == []
+
+
+def test_live_video_kick_error_reply_does_not_kick(monkeypatch):
+    """An online device whose get_view_state returns a firmware error reply
+    must not get a scenery kick from the 2 s video_kick poll."""
+    calls = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        if parameters.get("method") == "get_view_state":
+            return {"Value": {"error": "busy", "code": 1}}
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.LiveVideoKickResource().on_get(req, resp, telescope_id=1)
+
+    assert "204" in str(resp.status)
+    assert not any(c[0] == "method_async" for c in calls), calls
+
+
+def test_live_video_kick_federation_is_noop_204(monkeypatch):
+    """telescope_id 0 (federation) must not fan a scenery kick out to every
+    scope; the endpoint stays a 204 no-op."""
+    calls = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": {"result": {}}}
+
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.LiveVideoKickResource().on_get(req, resp, telescope_id=0)
+
+    assert "204" in str(resp.status)
+    assert calls == []
+
+
+# ---------- fork routes refuse the federation (telescope_id 0) ----------
+
+
+def test_reject_federation_target_helper():
+    resp = _DummyJSONResp()
+    assert front_app._reject_federation_target(resp, 1) is False
+    assert resp.status is None
+    for bad in (0, -1, "x", None):
+        resp = _DummyJSONResp()
+        assert front_app._reject_federation_target(resp, bad) is True
+        assert "400" in str(resp.status)
+        assert json.loads(resp.text) == {"error": "select a single telescope"}
+
+
+def test_live_tracker_track_rejects_federation(monkeypatch):
+    started = []
+    _patch_live_tracker_manager(monkeypatch, started.append)
+    calls = []
+    monkeypatch.setattr(
+        front_app, "do_action_device", lambda *a, **k: calls.append(a) or {}
+    )
+    req = _DummyJSONReq(body={"kind": "file", "id": "sat-123"})
+    resp = _DummyJSONResp()
+    front_app.LiveTrackerTrackResource.on_post(req, resp, telescope_id=0)
+    assert "400" in str(resp.status)
+    assert json.loads(resp.text)["error"] == "select a single telescope"
+    assert started == []
+    assert calls == []
+
+
+def test_calibration_start_rejects_federation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        front_app, "do_action_device", lambda *a, **k: calls.append(a) or {}
+    )
+    req = _DummyJSONReq(body={"targets": []})
+    resp = _DummyJSONResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=0)
+    assert "400" in str(resp.status)
+    assert json.loads(resp.text)["error"] == "select a single telescope"
+    assert calls == []
+
+
+def test_fork_nav_links_hidden_for_federation():
+    """The four fork pages are single-telescope only: their nav links are
+    rendered for /1 and hidden for the federation (/0)."""
+    template = front_app.fetch_template("nav.html")
+    base = {
+        "telescopes": [
+            {"device_num": 1, "name": "Seestar Alpha", "ip_address": "10.0.0.2"}
+        ],
+        "client_master": True,
+        "experimental": False,
+        "confirm": False,
+        "uitheme": "dark",
+        "online": True,
+        "segment": "",
+        "partial_path": "",
+        "imager_root": "",
+    }
+    fork_paths = (
+        "velocity_controller",
+        "live_tracker",
+        "calibrate_rotation",
+        "sky_visibility",
+    )
+    html1 = template.render(
+        root="/1",
+        telescope={"device_num": 1, "name": "Seestar Alpha"},
+        telescope_id=1,
+        **base,
+    )
+    for path in fork_paths:
+        assert f"/1/{path}" in html1
+    html0 = template.render(
+        root="/0",
+        telescope={"device_num": 0, "name": "Federation"},
+        telescope_id=0,
+        **base,
+    )
+    for path in fork_paths:
+        assert f"/0/{path}" not in html0
+
+
+# ---------- live-view joystick (/position) sun-safety gate ----------
+
+
+class _FakeJoystickDev:
+    def __init__(self, connected=True, ok=True):
+        self.is_connected = connected
+        self.ra = 1.0
+        self.dec = 2.0
+        self._ok = ok
+        self.moves = []
+
+    def move_scope(self, in_angle, in_speed, in_dur=3):
+        self.moves.append((in_angle, in_speed, in_dur))
+        return self._ok
+
+
+def _patch_joystick(monkeypatch, dev, locked=False, jogging=False):
+    import device.sun_safety as ss
+
+    calls = []
+    jog_queries = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": {"result": 0}}
+
+    def fake_jog(telescope_id=None):
+        jog_queries.append(telescope_id)
+        return jogging
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(front_app, "method_sync", lambda *a, **k: None)
+    monkeypatch.setattr(front_app.telescope, "seestar_dev", {1: dev})
+    monkeypatch.setattr(ss, "sun_safety_is_locked_out", lambda: locked)
+    monkeypatch.setattr(ss, "sun_safety_jog_in_progress", fake_jog)
+    return calls, jog_queries
+
+
+def _speed_moves(calls):
+    return [
+        c
+        for c in calls
+        if c[0] == "method_sync" and c[2].get("method") == "scope_speed_move"
+    ]
+
+
+def test_position_refuses_motion_during_sun_lockout(monkeypatch):
+    dev = _FakeJoystickDev()
+    calls, _ = _patch_joystick(monkeypatch, dev, locked=True)
+    req = _DummyJSONReq(body={"distance": 50, "angle": 90, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert "200" in str(resp.status)
+    assert dev.moves == []
+    assert _speed_moves(calls) == []
+    assert "lockout" in resp.text
+
+
+def test_position_stop_suppressed_during_sun_jog(monkeypatch):
+    dev = _FakeJoystickDev()
+    calls, jog_queries = _patch_joystick(monkeypatch, dev, jogging=True)
+    req = _DummyJSONReq(body={"distance": 0, "angle": 0, "force": 0})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert _speed_moves(calls) == []
+    assert jog_queries == [1]
+
+
+def test_position_stop_sent_when_no_jog(monkeypatch):
+    dev = _FakeJoystickDev()
+    calls, _ = _patch_joystick(monkeypatch, dev)
+    req = _DummyJSONReq(body={"distance": 0, "angle": 0, "force": 0})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    stops = _speed_moves(calls)
+    assert len(stops) == 1
+    assert stops[0][2]["params"]["speed"] == 0
+
+
+def test_position_motion_routes_through_device_move_scope(monkeypatch):
+    dev = _FakeJoystickDev()
+    calls, _ = _patch_joystick(monkeypatch, dev)
+    req = _DummyJSONReq(body={"distance": 50, "angle": 90.7, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert dev.moves == [(90, min(50 * 14.4 * 1, 1440.0), 3)]
+    assert _speed_moves(calls) == []
+
+
+def test_position_reports_device_guard_refusal(monkeypatch):
+    dev = _FakeJoystickDev(ok=False)
+    calls, _ = _patch_joystick(monkeypatch, dev)
+    req = _DummyJSONReq(body={"distance": 50, "angle": 90, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert len(dev.moves) == 1
+    assert _speed_moves(calls) == []
+    assert "refused" in resp.text
+
+
+def test_position_falls_back_to_method_sync_without_in_process_device(monkeypatch):
+    """A device that is not connected in-process keeps the original raw
+    method_sync path (compatibility fallback)."""
+    dev = _FakeJoystickDev(connected=False)
+    calls, _ = _patch_joystick(monkeypatch, dev)
+    req = _DummyJSONReq(body={"distance": 50, "angle": 90, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert dev.moves == []
+    moves = _speed_moves(calls)
+    assert len(moves) == 1
+    assert moves[0][2]["params"]["angle"] == 90
+
+
+def test_position_device_commands_run_under_the_telescope_lock(monkeypatch):
+    """The page sends the release (stop) without waiting for an in-flight
+    move, so the move (with its sun pre-flight RPC) and the stop both run
+    under one per-telescope lock: the stop then reaches the mount after the
+    move instead of before it."""
+    held = []
+
+    class _Dev(_FakeJoystickDev):
+        def move_scope(self, in_angle, in_speed, in_dur=3):
+            held.append(front_app._joystick_lock_for(1).locked())
+            return super().move_scope(in_angle, in_speed, in_dur)
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        held.append(front_app._joystick_lock_for(1).locked())
+        return {"Value": {"result": 0}}
+
+    dev = _Dev()
+    _patch_joystick(monkeypatch, dev)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    move = _DummyJSONReq(body={"distance": 50, "angle": 90, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(move, resp, telescope_id=1)
+    stop = _DummyJSONReq(body={"distance": 0, "angle": 0, "force": 0})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(stop, resp, telescope_id=1)
+    assert len(dev.moves) == 1
+    assert held == [True, True]
+    assert not front_app._joystick_lock_for(1).locked()
 
 
 def test_calibrate_rotation_page_renders_when_streaming_kick_fails(monkeypatch):
@@ -2855,6 +3497,46 @@ def test_live_tracker_has_stream_quality_controls():
     assert "jpeg.addEventListener('change', apply)" in html
 
 
+def test_fork_templates_honor_root_path_prefix():
+    """Fork pages build their asset and API URLs under {{ root_path }}, so
+    they keep working behind a sub-path reverse proxy; with no prefix the
+    URLs are unchanged."""
+    ctx = _minimal_context("live_tracker", online=True)
+    prefixed = front_app.fetch_template("live_tracker.html").render(
+        telescope_id=1, root_path="/ssc", **ctx
+    )
+    assert 'src="/ssc/public/chart.umd.min.js"' in prefixed
+    assert "`/ssc/api/${telescopeId}/live_tracker`" in prefixed
+    assert "`/ssc/api/${telescopeId}/stream_quality`" in prefixed
+    assert "fetch('/ssc/api/' + tid + '/netstats'" in prefixed
+    plain = front_app.fetch_template("live_tracker.html").render(telescope_id=1, **ctx)
+    assert 'src="/public/chart.umd.min.js"' in plain
+    assert "`/api/${telescopeId}/live_tracker`" in plain
+    banner = front_app.fetch_template("partials/sun_safety_banner.html").render(
+        root_path="/ssc"
+    )
+    assert 'hx-get="/ssc/api/sun_safety/status"' in banner
+    # The dismiss call is prefixed at run time from the page's root-path data
+    # attribute (like main.js's sscRootPath), not by Jinja: the banner is on
+    # every page and upstream's byte-level root-path test only lets the
+    # prefix change URL attributes.
+    assert "document.documentElement.dataset.rootPath" in banner
+    assert 'fetch(rootPath + "/api/sun_safety/dismiss"' in banner
+    assert 'fetch("/api/sun_safety/dismiss"' not in banner
+
+
+def test_live_tracker_target_rows_do_not_parse_feed_text_as_html():
+    """Target names come from the third-party ADS-B feed: the list rows are
+    built with textContent, never innerHTML."""
+    html = front_app.fetch_template("live_tracker.html").render(
+        telescope_id=1,
+        **_minimal_context("live_tracker", online=True),
+    )
+    assert "row.innerHTML" not in html
+    assert "nameSpan.textContent = String(t.display_name || id);" in html
+    assert "infoSpan.textContent = right;" in html
+
+
 def test_stream_quality_post_malformed_json_returns_400():
     """A present-but-unparseable body must surface as 400, not masquerade
     as a successful no-op (PR #25 review)."""
@@ -2898,3 +3580,1964 @@ def test_stream_quality_post_empty_body_is_noop_echo(monkeypatch):
     payload = json.loads(resp.text)
     assert payload["max_stream_fps"] == 8.0
     assert payload["jpeg_quality"] == 60
+
+
+# --- check_needs_auth ---
+
+
+def test_is_emulator_telescope_true_when_flagged(monkeypatch):
+    monkeypatch.setattr(
+        front_app, "get_telescope", lambda _tid: {"device_num": 1, "is_emulator": True}
+    )
+    assert front_app.is_emulator_telescope(1) is True
+
+
+def test_is_emulator_telescope_false_when_absent(monkeypatch):
+    monkeypatch.setattr(front_app, "get_telescope", lambda _tid: {"device_num": 1})
+    assert front_app.is_emulator_telescope(1) is False
+
+
+def test_is_emulator_telescope_false_when_no_such_telescope(monkeypatch):
+    monkeypatch.setattr(front_app, "get_telescope", lambda _tid: None)
+    assert front_app.is_emulator_telescope(1) is False
+
+
+def test_check_needs_auth_false_for_emulator_telescope_without_network_call(
+    monkeypatch,
+):
+    # The emulator's license signature check can never pass (no real device's
+    # signing key is shipped in the repo), so is_emulator must short-circuit
+    # before any pi_is_verified round trip -- not just return False after one.
+    monkeypatch.setattr(front_app, "is_emulator_telescope", lambda _tid: True)
+
+    def fail_if_called(_tid):
+        raise AssertionError("check_api_state must not be called for emulator devices")
+
+    monkeypatch.setattr(front_app, "check_api_state", fail_if_called)
+    assert front_app.check_needs_auth(1) is False
+
+
+def test_check_needs_auth_false_when_offline(monkeypatch):
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: False)
+    assert front_app.check_needs_auth(1) is False
+
+
+def test_check_needs_auth_false_for_old_firmware(monkeypatch):
+    # Old firmware has no pi_is_verified → method_sync returns error dict → no warning
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app,
+        "method_sync",
+        lambda method, telescope_id=1, **kw: {
+            "command": "pi_is_verified",
+            "status": "error",
+            "result": {"code": -32601, "message": "Method not found"},
+        },
+    )
+    assert front_app.check_needs_auth(1) is False
+
+
+def test_check_needs_auth_true_when_unverified(monkeypatch):
+    # method_sync wraps result:False as {"status":"success","result":False}
+    # because False==0 in Python triggers the == 0 branch in method_sync.
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app,
+        "method_sync",
+        lambda method, telescope_id=1, **kw: {
+            "command": "pi_is_verified",
+            "status": "success",
+            "result": False,
+        },
+    )
+    assert front_app.check_needs_auth(1) is True
+
+
+def test_check_needs_auth_false_when_verified(monkeypatch):
+    # method_sync returns True directly when firmware returns result:True
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app,
+        "method_sync",
+        lambda method, telescope_id=1, **kw: True,
+    )
+    assert front_app.check_needs_auth(1) is False
+
+
+def test_check_needs_auth_false_on_exception(monkeypatch):
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+
+    def raise_error(method, telescope_id=1, **kw):
+        raise RuntimeError("connection failed")
+
+    monkeypatch.setattr(front_app, "method_sync", raise_error)
+    assert front_app.check_needs_auth(1) is False
+
+
+def test_check_needs_auth_true_when_method_sync_returns_none(monkeypatch):
+    # Firmware 7.32+ without auth silently ignores all commands.
+    # The front-layer HTTP request times out → do_action_device returns None →
+    # method_sync returns None.  With no prior confirmed-auth cache, this looks
+    # like the auth gap (ALPACA says connected but firmware won't talk to us).
+    front_app._auth_needs_cache.pop(99, None)
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app, "method_sync", lambda method, telescope_id=1, **kw: None
+    )
+    assert front_app.check_needs_auth(99) is True
+
+
+def test_check_needs_auth_true_when_device_layer_times_out_faster_than_http(
+    monkeypatch,
+):
+    # Once seestar_device.py's auth-gap fail-fast cap kicks in, the device
+    # layer resolves its OWN timeout (~1.5s) faster than this request's HTTP
+    # client timeout (Config.timeout, 5s) -- so the HTTP call succeeds and
+    # method_sync unwraps the device's "Error: Exceeded allotted wait time for
+    # result" string instead of the request itself timing out to None. That
+    # string must be treated the same as the None case above, not silently
+    # fall through to "no warning needed".
+    front_app._auth_needs_cache.pop(98, None)
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app,
+        "method_sync",
+        lambda method, telescope_id=1, **kw: (
+            "Error: Exceeded allotted wait time for result"
+        ),
+    )
+    assert front_app.check_needs_auth(98) is True
+
+
+def test_check_needs_auth_timeout_preserved_false_when_previously_authenticated(
+    monkeypatch,
+):
+    # Device was confirmed authenticated (cached False), then pi_is_verified times
+    # out — device is busy during imaging.  The warning must NOT reappear.
+    front_app._auth_needs_cache[88] = (False, 0.0)  # expired entry, was authenticated
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app, "method_sync", lambda method, telescope_id=1, **kw: None
+    )
+    try:
+        assert front_app.check_needs_auth(88) is False
+    finally:
+        front_app._auth_needs_cache.pop(88, None)
+
+
+def test_check_needs_auth_timeout_stays_true_when_previously_needed_auth(monkeypatch):
+    # Device previously needed auth (cached True), then times out again.
+    # Warning must stay visible — don't suppress it.
+    front_app._auth_needs_cache[77] = (True, 0.0)  # expired entry, was needing auth
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app, "method_sync", lambda method, telescope_id=1, **kw: None
+    )
+    try:
+        assert front_app.check_needs_auth(77) is True
+    finally:
+        front_app._auth_needs_cache.pop(77, None)
+
+
+def test_check_needs_auth_false_when_method_sync_returns_offline(monkeypatch):
+    # "Offline" string means the device layer explicitly says the device is offline.
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app, "method_sync", lambda method, telescope_id=1, **kw: "Offline"
+    )
+    assert front_app.check_needs_auth(1) is False
+
+
+def test_check_needs_auth_false_when_firmware_returns_bool_true(monkeypatch):
+    # Firmware 7.32+ returns result: True (boolean) → method_sync returns True directly
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app, "method_sync", lambda method, telescope_id=1, **kw: True
+    )
+    assert front_app.check_needs_auth(1) is False
+
+
+def test_check_needs_auth_true_when_firmware_returns_bool_false(monkeypatch):
+    # Bare False boolean (also valid — treated as not-verified)
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(
+        front_app, "method_sync", lambda method, telescope_id=1, **kw: False
+    )
+    assert front_app.check_needs_auth(1) is True
+
+
+def _auth_status_app():
+    app = falcon.App()
+    app.add_route("/{telescope_id:int}/auth-status", front_app.AuthStatusResource())
+    return app
+
+
+def test_auth_status_returns_204_no_swap_when_no_warning(monkeypatch):
+    # When no auth warning is needed, endpoint should return 204 + HX-Reswap: none
+    # so HTMX skips the DOM update entirely (no flash).
+    monkeypatch.setattr(front_app, "check_needs_auth", lambda _tid: False)
+    client = testing.TestClient(_auth_status_app())
+    resp = client.simulate_get("/1/auth-status")
+    assert resp.status_code == 204
+    assert resp.headers.get("hx-reswap") == "none"
+
+
+def test_auth_status_returns_warning_html_when_needed(monkeypatch):
+    monkeypatch.setattr(front_app, "check_needs_auth", lambda _tid: True)
+    client = testing.TestClient(_auth_status_app())
+    resp = client.simulate_get("/1/auth-status")
+    assert resp.status_code == 200
+    assert "Authentication required" in resp.text
+    assert resp.headers.get("hx-reswap") is None
+
+
+def test_auth_warning_rendered_in_base_template(monkeypatch):
+    context = _minimal_context("stats")
+    context["needs_auth_warning"] = True
+    context["flashed_messages"] = []
+    context["messages"] = []
+    context["version"] = "test"
+    context["now"] = "now"
+    template = front_app.fetch_template("base.html")
+    html = template.render(**context)
+    assert "Authentication required" in html
+    assert "seestar-proxy" in html
+    assert "interop_pem" in html
+
+
+def test_auth_warning_absent_when_not_needed(monkeypatch):
+    context = _minimal_context("stats")
+    context["needs_auth_warning"] = False
+    context["flashed_messages"] = []
+    context["messages"] = []
+    context["version"] = "test"
+    context["now"] = "now"
+    template = front_app.fetch_template("base.html")
+    html = template.render(**context)
+    assert "Authentication required" not in html
+
+
+def test_form_text_stays_legible_with_default_theme():
+    """Regression guard: Bootstrap's .form-text/.text-muted use
+    --bs-secondary-color, which used to only get a theme-aware value inside
+    `{% if webui_text_color %}`. With the default (unconfigured) theme that
+    left it at Bootstrap's stock dark-gray, unreadable against this app's
+    dark background -- surfaced by the new, longer mosaic help text added
+    for issues #37/#680. --bs-secondary-color must resolve to a visible
+    color even when no custom webui_text_color is set."""
+    context = _minimal_context("stats")
+    context["flashed_messages"] = []
+    context["messages"] = []
+    context["version"] = "test"
+    context["now"] = "now"
+    template = front_app.fetch_template("base.html")
+    html = template.render(**context)
+    assert "--bs-secondary-color: var(--ui-muted);" in html
+    assert "--ui-muted: rgba(231, 237, 247, 0.75);" in html
+
+
+# ---------------------------------------------------------------------------
+# Wide angle camera settings – GET (get_device_settings)
+# ---------------------------------------------------------------------------
+
+
+def _s30_get_setting_response():
+    return {
+        "stack_dither": {"pix": 10, "interval": 2, "enable": True},
+        "exp_ms": {"stack_l": 10000, "continuous": 500},
+        "auto_3ppa_calib": True,
+        "frame_calib": True,
+        "focal_pos": 1500,
+        "heater_enable": False,
+        "auto_power_off": False,
+        "stack_lenhance": False,
+        "dark_mode": False,
+        "stack_cont_capt": False,
+        "stack": {"drizzle2x": False},
+        "wide_cam": True,
+        "wide_4k": False,
+        "wide_focal_pos": 1500,
+    }
+
+
+def test_get_device_settings_wide_cam_shown_for_s30_with_experimental(monkeypatch):
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2775)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    monkeypatch.setattr(Config, "experimental", True)
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            return _s30_get_setting_response()
+        if method == "get_stack_setting":
+            return {"wide_denoise": True}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert settings["wide_cam"] is True
+    assert settings["wide_4k"] is False
+    assert settings["wide_focal_pos"] == 1500
+    assert settings["wide_denoise"] is True
+
+
+def test_get_device_settings_wide_cam_shown_for_s30_pro_with_experimental(monkeypatch):
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2775)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30 Pro")
+    monkeypatch.setattr(Config, "experimental", True)
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            return _s30_get_setting_response()
+        if method == "get_stack_setting":
+            return {}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert "wide_cam" in settings
+    assert "wide_4k" in settings
+
+
+def test_get_device_settings_wide_cam_absent_for_s50(monkeypatch):
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2775)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+    monkeypatch.setattr(Config, "experimental", True)
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            return _s30_get_setting_response()
+        if method == "get_stack_setting":
+            return {}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert "wide_cam" not in settings
+    assert "wide_4k" not in settings
+    assert "wide_denoise" not in settings
+    assert "wide_focal_pos" not in settings
+
+
+def test_get_device_settings_wide_cam_absent_when_experimental_off(monkeypatch):
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2775)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    monkeypatch.setattr(Config, "experimental", False)
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            return _s30_get_setting_response()
+        if method == "get_stack_setting":
+            return {}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert "wide_cam" not in settings
+    assert "wide_4k" not in settings
+
+
+def test_get_device_settings_wide_cam_omits_none_fields(monkeypatch):
+    """Fields the firmware doesn't return should be absent, not present as None."""
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2775)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    monkeypatch.setattr(Config, "experimental", True)
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            # wide_focal_pos and wide_4k absent from firmware response
+            resp = _s30_get_setting_response()
+            del resp["wide_focal_pos"]
+            resp["wide_4k"] = None
+            return resp
+        if method == "get_stack_setting":
+            return {}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert settings["wide_cam"] is True
+    assert "wide_focal_pos" not in settings
+    assert "wide_4k" not in settings
+
+
+def test_get_device_settings_wide_denoise_sourced_from_stack_settings(monkeypatch):
+    """wide_denoise is returned by get_stack_setting, not get_setting."""
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2775)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    monkeypatch.setattr(Config, "experimental", True)
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            resp = _s30_get_setting_response()
+            # wide_denoise NOT in get_setting response
+            return resp
+        if method == "get_stack_setting":
+            return {"wide_denoise": True, "save_discrete_frame": False}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert settings["wide_denoise"] is True
+
+
+# ---------------------------------------------------------------------------
+# Wide angle camera settings – POST (SettingsResource.on_post)
+# ---------------------------------------------------------------------------
+
+
+def _base_settings_form():
+    """Minimal valid settings POST payload (no wide cam fields)."""
+    return {
+        "stack_lenhance": "false",
+        "stack_dither_pix": "10",
+        "stack_dither_interval": "2",
+        "stack_dither_enable": "true",
+        "exp_ms_stack_l": "10000",
+        "exp_ms_continuous": "500",
+        "focal_pos": "1500",
+        "auto_power_off": "false",
+        "auto_3ppa_calib": "true",
+        "frame_calib": "true",
+        "plan_target_af": "false",
+        "viewplan_gohome": "false",
+        "expert_mode": "false",
+        "heater_enable": "false",
+        "dark_mode": "false",
+        "stack_cont_capt": "false",
+        "stack_drizzle2x": "false",
+    }
+
+
+def _run_settings_post(monkeypatch, model, form_extra=None, fw=2775):
+    """Helper: POST to SettingsResource and return (output, captured_calls)."""
+
+    class FormReq:
+        def __init__(self):
+            self.media = {**_base_settings_form(), **(form_extra or {})}
+
+    captured = {"output": None, "calls": []}
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        captured["calls"].append((action, parameters))
+        return {"ErrorNumber": 0, "Value": {"code": 0}}
+
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: fw)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: model)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(
+        front_app.SettingsResource,
+        "render_settings",
+        staticmethod(
+            lambda _req, _resp, _tid, output: captured.__setitem__("output", output)
+        ),
+    )
+
+    front_app.SettingsResource().on_post(FormReq(), object(), 1)
+    return captured["output"], captured["calls"]
+
+
+def test_settings_post_wide_cam_fields_sent_for_s30(monkeypatch):
+    output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S30",
+        form_extra={
+            "wide_cam": "true",
+            "wide_4k": "false",
+            "wide_denoise": "true",
+            "wide_focal_pos": "1600",
+        },
+    )
+
+    assert output == "Successfully Updated Settings."
+    # Gather the flat set_setting params that were sent
+    merged = {}
+    stack_members = {}
+    for action, params in calls:
+        if (
+            action in ("method_sync", "method_async")
+            and params.get("method") == "set_setting"
+        ):
+            p = params.get("params", {})
+            if isinstance(p, dict):
+                merged.update(p)
+                stack_members.update(p.get("stack", {}))
+
+    assert merged.get("wide_cam") is True
+    assert merged.get("wide_4k") is False
+    # A stack member; top-level wide_denoise gets 109 (seestar-spec, READ).
+    assert "wide_denoise" not in merged
+    assert stack_members.get("wide_denoise") is True
+    assert merged.get("wide_focal_pos") == 1600
+
+
+def test_settings_post_wide_cam_not_sent_for_s50(monkeypatch):
+    output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S50",
+        form_extra={
+            "wide_cam": "true",
+            "wide_4k": "true",
+            "wide_denoise": "true",
+            "wide_focal_pos": "1600",
+        },
+    )
+
+    assert output == "Successfully Updated Settings."
+    merged = {}
+    for action, params in calls:
+        if (
+            action in ("method_sync", "method_async")
+            and params.get("method") == "set_setting"
+        ):
+            p = params.get("params", {})
+            if isinstance(p, dict):
+                merged.update(p)
+
+    assert "wide_cam" not in merged
+    assert "wide_4k" not in merged
+    assert "wide_denoise" not in merged
+    assert "wide_focal_pos" not in merged
+
+
+def test_settings_post_wide_cam_absent_fields_not_sent(monkeypatch):
+    """S30 form without wide cam fields should not error and should not send them."""
+    output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S30",
+        form_extra={},  # no wide cam keys
+    )
+
+    assert output == "Successfully Updated Settings."
+    merged = {}
+    for action, params in calls:
+        if (
+            action in ("method_sync", "method_async")
+            and params.get("method") == "set_setting"
+        ):
+            p = params.get("params", {})
+            if isinstance(p, dict):
+                merged.update(p)
+
+    assert "wide_cam" not in merged
+    assert "wide_focal_pos" not in merged
+
+
+def test_settings_post_wide_focal_pos_bad_value_coerced_to_zero(monkeypatch):
+    """Non-numeric wide_focal_pos is safely coerced to 0."""
+    output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S30",
+        form_extra={"wide_focal_pos": "not_a_number"},
+    )
+
+    assert output == "Successfully Updated Settings."
+    merged = {}
+    for action, params in calls:
+        if (
+            action in ("method_sync", "method_async")
+            and params.get("method") == "set_setting"
+        ):
+            p = params.get("params", {})
+            if isinstance(p, dict):
+                merged.update(p)
+
+    assert merged.get("wide_focal_pos") == 0
+
+
+# ---------------------------------------------------------------------------
+# Autofocus-enabled toggle (auto_af) -- present since firmware 2732 (v3.1.2);
+# firmware 2846 (v3.3.0) additionally gates the new sensor-temp-drift
+# auto-refocus check on it (confirmed against the real decompiled firmware
+# and the live QEMU emulator, not just the key's presence).
+# ---------------------------------------------------------------------------
+
+
+def test_get_device_settings_shows_auto_af(monkeypatch):
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2732)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            return {
+                "stack_dither": {"pix": 10, "interval": 2, "enable": True},
+                "exp_ms": {"stack_l": 10000, "continuous": 500},
+                "auto_3ppa_calib": True,
+                "frame_calib": True,
+                "focal_pos": 1500,
+                "heater_enable": False,
+                "auto_power_off": False,
+                "stack_lenhance": False,
+                "dark_mode": False,
+                "stack_cont_capt": False,
+                "stack": {"drizzle2x": False},
+                "auto_af": True,
+            }
+        if method == "get_stack_setting":
+            return {}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert settings["auto_af"] is True
+
+
+def test_get_device_settings_omits_auto_af_when_absent(monkeypatch):
+    """Firmware may not return auto_af; don't show it as None."""
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2732)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            return {
+                "stack_dither": {"pix": 10, "interval": 2, "enable": True},
+                "exp_ms": {"stack_l": 10000, "continuous": 500},
+                "auto_3ppa_calib": True,
+                "frame_calib": True,
+                "focal_pos": 1500,
+                "heater_enable": False,
+                "auto_power_off": False,
+                "stack_lenhance": False,
+                "dark_mode": False,
+                "stack_cont_capt": False,
+                "stack": {"drizzle2x": False},
+                # auto_af intentionally absent
+            }
+        if method == "get_stack_setting":
+            return {}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert "auto_af" not in settings
+
+
+def test_settings_post_auto_af_sent(monkeypatch):
+    output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S50",
+        fw=2846,
+        form_extra={"auto_af": "true"},
+    )
+
+    assert output == "Successfully Updated Settings."
+    merged = {}
+    for action, params in calls:
+        if (
+            action in ("method_sync", "method_async")
+            and params.get("method") == "set_setting"
+        ):
+            p = params.get("params", {})
+            if isinstance(p, dict):
+                merged.update(p)
+
+    assert merged.get("auto_af") is True
+
+
+def test_settings_post_auto_af_absent_not_sent(monkeypatch):
+    """Form without auto_af should not error and should not send it."""
+    output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S50",
+        fw=2846,
+        form_extra={},
+    )
+
+    assert output == "Successfully Updated Settings."
+    merged = {}
+    for action, params in calls:
+        if (
+            action in ("method_sync", "method_async")
+            and params.get("method") == "set_setting"
+        ):
+            p = params.get("params", {})
+            if isinstance(p, dict):
+                merged.update(p)
+
+    assert "auto_af" not in merged
+
+
+# ---------------------------------------------------------------------------
+# On-device ASCOM Alpaca server toggle (alpaca_enable) -- new in firmware
+# v3.3.1 (build 9.16). This is ZWO's own Alpaca REST server running on the
+# device itself, separate from seestar_alp's Alpaca API layer. Feature-detect
+# by payload presence, like auto_af above, since we don't have a confirmed
+# firmware_ver_int threshold for this firmware family's release.
+# ---------------------------------------------------------------------------
+
+
+def test_get_device_settings_shows_alpaca_enable(monkeypatch):
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2846)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            return {
+                "stack_dither": {"pix": 10, "interval": 2, "enable": True},
+                "exp_ms": {"stack_l": 10000, "continuous": 500},
+                "auto_3ppa_calib": True,
+                "frame_calib": True,
+                "focal_pos": 1500,
+                "heater_enable": False,
+                "auto_power_off": False,
+                "stack_lenhance": False,
+                "dark_mode": False,
+                "stack_cont_capt": False,
+                "stack": {"drizzle2x": False},
+                "alpaca_enable": True,
+            }
+        if method == "get_stack_setting":
+            return {}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert settings["alpaca_enable"] is True
+
+
+def test_get_device_settings_omits_alpaca_enable_when_absent(monkeypatch):
+    """Firmware may not return alpaca_enable; don't show it as None."""
+    monkeypatch.setattr(front_app, "get_client_master", lambda _tid: True)
+    monkeypatch.setattr(front_app, "get_firmware_ver_int", lambda _tid: 2846)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+
+    def fake_method_sync(method, telescope_id=1, **kwargs):
+        if method == "get_setting":
+            return {
+                "stack_dither": {"pix": 10, "interval": 2, "enable": True},
+                "exp_ms": {"stack_l": 10000, "continuous": 500},
+                "auto_3ppa_calib": True,
+                "frame_calib": True,
+                "focal_pos": 1500,
+                "heater_enable": False,
+                "auto_power_off": False,
+                "stack_lenhance": False,
+                "dark_mode": False,
+                "stack_cont_capt": False,
+                "stack": {"drizzle2x": False},
+                # alpaca_enable intentionally absent
+            }
+        if method == "get_stack_setting":
+            return {}
+        raise AssertionError(f"Unexpected: {method}")
+
+    monkeypatch.setattr(front_app, "method_sync", fake_method_sync)
+
+    settings = front_app.get_device_settings(1)
+
+    assert "alpaca_enable" not in settings
+
+
+def test_settings_post_alpaca_enable_sent(monkeypatch):
+    output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S50",
+        fw=2846,
+        form_extra={"alpaca_enable": "true"},
+    )
+
+    assert output == "Successfully Updated Settings."
+    merged = {}
+    for action, params in calls:
+        if (
+            action in ("method_sync", "method_async")
+            and params.get("method") == "set_setting"
+        ):
+            p = params.get("params", {})
+            if isinstance(p, dict):
+                merged.update(p)
+
+    assert merged.get("alpaca_enable") is True
+
+
+def test_settings_post_alpaca_enable_absent_not_sent(monkeypatch):
+    """Form without alpaca_enable should not error and should not send it."""
+    output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S50",
+        fw=2846,
+        form_extra={},
+    )
+
+    assert output == "Successfully Updated Settings."
+    merged = {}
+    for action, params in calls:
+        if (
+            action in ("method_sync", "method_async")
+            and params.get("method") == "set_setting"
+        ):
+            p = params.get("params", {})
+            if isinstance(p, dict):
+                merged.update(p)
+
+    assert "alpaca_enable" not in merged
+
+
+# ---------------------------------------------------------------------------
+# Stack type – form extraction (do_create_image / do_create_mosaic)
+# ---------------------------------------------------------------------------
+
+
+def _make_image_form(extra=None):
+    base = {
+        "targetName": "Test Target",
+        "ra": "10.5",
+        "dec": "-5.0",
+        "panelTime": "3600",
+        "gain": "80",
+        "num_tries": "1",
+        "retry_wait_s": "300",
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
+def _make_mosaic_form(extra=None):
+    base = {
+        "targetName": "Test Target",
+        "ra": "10.5",
+        "raPanels": "1",
+        "dec": "-5.0",
+        "decPanels": "1",
+        "panelOverlap": "10",
+        "panelSelect": "",
+        "panelTime": "3600",
+        "gain": "80",
+        "num_tries": "1",
+        "retry_wait_s": "300",
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
+def _make_framed_mosaic_form(extra=None):
+    base = {
+        "targetName": "Test Target",
+        "ra": "10.5",
+        "dec": "-5.0",
+        "mosaicScale": "1.5",
+        "mosaicAngle": "45",
+        "panelTime": "3600",
+        "gain": "80",
+        "num_tries": "1",
+        "retry_wait_s": "300",
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
+class _FormReq:
+    def __init__(self, data):
+        self.media = data
+
+
+@pytest.mark.parametrize(
+    "stack_type_input,expected",
+    [
+        (None, "DeepSky"),
+        ("DeepSky", "DeepSky"),
+        ("SolarSystem", "SolarSystem"),
+        ("MilkyWay", "MilkyWay"),
+        ("invalid_type", "DeepSky"),
+        ("", "DeepSky"),
+        ("solarsystem", "DeepSky"),  # case-sensitive; wrong case falls back
+    ],
+)
+def test_do_create_image_stack_type_extraction(monkeypatch, stack_type_input, expected):
+    captured = {}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        captured["params"] = params
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_image_form(
+        {"stackType": stack_type_input} if stack_type_input is not None else {}
+    )
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    values, errors = front_app.do_create_image(req, resp, False, 1)
+
+    assert not errors
+    assert values["stack_type"] == expected
+
+
+@pytest.mark.parametrize(
+    "stack_type_input,expected",
+    [
+        (None, "DeepSky"),
+        ("SolarSystem", "SolarSystem"),
+        ("MilkyWay", "MilkyWay"),
+        ("bogus", "DeepSky"),
+    ],
+)
+def test_do_create_mosaic_stack_type_extraction(
+    monkeypatch, stack_type_input, expected
+):
+    captured = {}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        captured["params"] = params
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_mosaic_form(
+        {"stackType": stack_type_input} if stack_type_input is not None else {}
+    )
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    values, errors = front_app.do_create_mosaic(req, resp, False, 1)
+
+    assert not errors
+    assert values["stack_type"] == expected
+
+
+def test_do_create_image_stack_type_included_in_start_mosaic_params(monkeypatch):
+    """stack_type must reach the start_mosaic payload sent to the device layer."""
+    captured = {}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        if action == "start_mosaic":
+            captured["start_mosaic_params"] = params
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_image_form({"stackType": "SolarSystem"})
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    front_app.do_create_image(req, resp, False, 1)
+
+    assert captured.get("start_mosaic_params", {}).get("stack_type") == "SolarSystem"
+
+
+def test_do_create_framed_mosaic_builds_expected_params(monkeypatch):
+    captured = {}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        captured["action"] = action
+        captured["params"] = params
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_framed_mosaic_form()
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    values, errors = front_app.do_create_framed_mosaic(req, resp, False, 1)
+
+    assert not errors
+    assert captured["action"] == "start_framed_mosaic"
+    assert values["mosaic_scale"] == 1.5
+    assert values["mosaic_angle"] == 45.0
+    assert values["target_name"] == "Test Target"
+    assert values["panel_time_sec"] == 3600
+    assert values["gain"] == 80
+
+
+def test_do_create_framed_mosaic_rejects_scale_out_of_range(monkeypatch):
+    called = {"device": False}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        called["device"] = True
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_framed_mosaic_form({"mosaicScale": "4.5"})
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    values, errors = front_app.do_create_framed_mosaic(req, resp, False, 1)
+
+    assert "mosaic_scale" in errors
+    assert called["device"] is False
+
+
+def test_do_create_framed_mosaic_rejects_angle_out_of_range(monkeypatch):
+    called = {"device": False}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        called["device"] = True
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_framed_mosaic_form({"mosaicAngle": "120"})
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    values, errors = front_app.do_create_framed_mosaic(req, resp, False, 1)
+
+    assert "mosaic_angle" in errors
+    assert called["device"] is False
+
+
+def test_do_create_framed_mosaic_invalid_ra_does_not_call_device(monkeypatch):
+    called = {"device": False}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        called["device"] = True
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_framed_mosaic_form({"ra": "not_valid"})
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    values, errors = front_app.do_create_framed_mosaic(req, resp, False, 1)
+
+    assert "ra" in errors
+    assert called["device"] is False
+
+
+def test_do_create_framed_mosaic_schedule_append(monkeypatch):
+    captured = {}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        captured["action"] = action
+        captured["params"] = params
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_framed_mosaic_form({"action": "append"})
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    front_app.do_create_framed_mosaic(req, resp, True, 1)
+
+    assert captured["action"] == "add_schedule_item"
+    assert captured["params"]["action"] == "start_framed_mosaic"
+    assert captured["params"]["params"]["mosaic_scale"] == 1.5
+
+
+def test_framed_mosaic_resource_renders_form(monkeypatch):
+    monkeypatch.setattr(
+        front_app,
+        "get_context",
+        lambda telescope_id, req: {
+            "online": True,
+            "client_master": True,
+            "root": "",
+            "defgain": 80,
+            "telescope": {"device_num": telescope_id},
+        },
+    )
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda action, dev_num, params, is_schedule=False: {
+            "Value": {"state": "stopped"}
+        },
+    )
+
+    app = falcon.App()
+    app.add_route("/{telescope_id:int}/framed_mosaic", front_app.FramedMosaicResource())
+    client = testing.TestClient(app)
+
+    resp = client.simulate_get("/1/framed_mosaic")
+
+    assert resp.status_code == 200
+    assert "Framed Mosaic" in resp.text
+    assert 'id="mosaicScale"' in resp.text
+    assert 'id="mosaicAngle"' in resp.text
+
+
+def test_mosaic_resource_renders_order_and_notation_guidance(monkeypatch):
+    """Regression guard for the mosaic clarity cleanup (issues #37/#680):
+    the create form must explain panel order, panel-select notation, and
+    show a computed total-time readout, without touching Framed Mosaic."""
+    monkeypatch.setattr(
+        front_app,
+        "get_context",
+        lambda telescope_id, req: {
+            "online": True,
+            "client_master": True,
+            "root": "",
+            "defgain": 80,
+            "telescope": {"device_num": telescope_id},
+        },
+    )
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda action, dev_num, params, is_schedule=False: {
+            "Value": {"state": "stopped"}
+        },
+    )
+
+    app = falcon.App()
+    app.add_route("/{telescope_id:int}/mosaic", front_app.MosaicResource())
+    client = testing.TestClient(app)
+
+    resp = client.simulate_get("/1/mosaic")
+
+    assert resp.status_code == 200
+    assert "Panel Acquisition Time (per panel)" in resp.text
+    assert 'id="mosaicTotalTime"' in resp.text
+    assert "does not alternate direction row to row" in resp.text
+    assert "RA panel number followed by its Dec panel number" in resp.text
+
+
+def test_mosaic_panel_count_uses_grid_when_no_selection():
+    assert front_app.mosaic_panel_count({"ra_num": 3, "dec_num": 2}) == 6
+
+
+def test_mosaic_panel_count_uses_selected_panels_when_present():
+    assert (
+        front_app.mosaic_panel_count(
+            {"ra_num": 3, "dec_num": 2, "selected_panels": "11;21"}
+        )
+        == 2
+    )
+
+
+def test_do_create_image_invalid_ra_does_not_propagate_stack_type_to_device(
+    monkeypatch,
+):
+    """Coordinate validation errors should abort before the device call."""
+    called = {"device": False}
+
+    def fake_do_action_device(action, dev_num, params, is_schedule=False):
+        called["device"] = True
+        return {"ErrorNumber": 0, "Value": {}}
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    form = _make_image_form({"ra": "not_valid", "stackType": "SolarSystem"})
+    req = _FormReq(form)
+    resp = DummyResp()
+
+    values, errors = front_app.do_create_image(req, resp, False, 1)
+
+    assert "ra" in errors
+    assert not called["device"]
+
+
+# ---------------------------------------------------------------------------
+# Settings page template – wide cam fields rendered / hidden
+# ---------------------------------------------------------------------------
+
+
+def test_settings_template_renders_wide_cam_fields_for_s30(monkeypatch):
+    """Wide cam rows appear in the settings page when model is S30 and experimental."""
+    context = _minimal_context("settings")
+    context["experimental"] = True
+    context["settings"] = {
+        "wide_cam": True,
+        "wide_4k": False,
+        "wide_denoise": True,
+        "wide_focal_pos": 1500,
+        "focal_pos": 1500,
+        "heater_enable": False,
+        "auto_power_off": False,
+        "stack_lenhance": False,
+        "dark_mode": False,
+    }
+    context["settings_friendly_names"] = {k: k for k in context["settings"]}
+    context["settings_helper_text"] = {k: "" for k in context["settings"]}
+    context["output"] = None
+    context["action"] = "/1/settings"
+    context["firmware_ver_int"] = 2775
+    context["version"] = "test"
+
+    template = front_app.fetch_template("settings.html")
+    html = template.render(**context)
+
+    assert "wide_cam" in html
+    assert "wide_4k" in html
+    assert "wide_denoise" in html
+    assert "wide_focal_pos" in html
+
+
+def test_settings_template_groups_wide_fields_under_imaging(monkeypatch):
+    """wide_* settings should land in the Imaging group, not General."""
+    context = _minimal_context("settings")
+    context["experimental"] = True
+    context["settings"] = {
+        "wide_cam": True,
+        "wide_4k": False,
+    }
+    context["settings_friendly_names"] = {
+        "wide_cam": "Wide Angle Camera",
+        "wide_4k": "Wide 4K",
+    }
+    context["settings_helper_text"] = {"wide_cam": "", "wide_4k": ""}
+    context["output"] = None
+    context["action"] = "/1/settings"
+    context["firmware_ver_int"] = 2775
+    context["version"] = "test"
+
+    template = front_app.fetch_template("settings.html")
+    html = template.render(**context)
+
+    imaging_pos = html.find("Imaging")
+    general_pos = html.find("General")
+    wide_cam_pos = html.find("wide_cam")
+
+    # wide_cam should appear after the Imaging header and before (or without) General
+    assert imaging_pos != -1
+    assert wide_cam_pos > imaging_pos
+    if general_pos != -1:
+        assert wide_cam_pos < general_pos or general_pos < imaging_pos
+
+
+# ---------------------------------------------------------------------------
+# LiveWideCamResource – wide cam toggle in live view
+# ---------------------------------------------------------------------------
+
+
+def _live_wide_cam_app():
+    app = falcon.App()
+    app.add_route("/{telescope_id:int}/live/wide-cam", front_app.LiveWideCamResource())
+    return app
+
+
+def test_live_wide_cam_get_returns_204_for_non_s30(monkeypatch):
+    monkeypatch.setattr(front_app.Config, "experimental", True)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+    client = testing.TestClient(_live_wide_cam_app())
+    resp = client.simulate_get("/1/live/wide-cam")
+    assert resp.status_code == 204
+    assert resp.headers.get("hx-reswap") == "none"
+
+
+def test_live_wide_cam_get_returns_204_when_experimental_off(monkeypatch):
+    monkeypatch.setattr(front_app.Config, "experimental", False)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    client = testing.TestClient(_live_wide_cam_app())
+    resp = client.simulate_get("/1/live/wide-cam")
+    assert resp.status_code == 204
+
+
+def test_live_wide_cam_get_returns_toggle_for_s30(monkeypatch):
+    monkeypatch.setattr(front_app.Config, "experimental", True)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda *a, **kw: {"Value": {"result": {"wide_cam": False}}},
+    )
+    client = testing.TestClient(_live_wide_cam_app())
+    resp = client.simulate_get("/1/live/wide-cam")
+    assert resp.status_code == 200
+    assert "wide-cam-toggle" in resp.text
+    assert "Wide Camera" in resp.text
+
+
+def test_live_wide_cam_get_shows_checked_when_enabled(monkeypatch):
+    monkeypatch.setattr(front_app.Config, "experimental", True)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30 Pro")
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda *a, **kw: {"Value": {"result": {"wide_cam": True}}},
+    )
+    client = testing.TestClient(_live_wide_cam_app())
+    resp = client.simulate_get("/1/live/wide-cam")
+    assert resp.status_code == 200
+    # The checkbox attribute "checked" appears as a standalone HTML attribute
+    # when enabled; hx-vals always contains "checked.toString()" regardless.
+    assert resp.text.count("checked") >= 2
+
+
+def test_live_wide_cam_post_sets_true(monkeypatch):
+    monkeypatch.setattr(front_app.Config, "experimental", True)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    calls = []
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda action, tid, params, **kw: calls.append(params) or {},
+    )
+    client = testing.TestClient(_live_wide_cam_app())
+    resp = client.simulate_post("/1/live/wide-cam", json={"wide_cam": "true"})
+    assert resp.status_code == 200
+    assert any(
+        p.get("params", {}).get("wide_cam") is True
+        for p in calls
+        if isinstance(p, dict) and "params" in p
+    )
+    assert resp.text.count("checked") >= 2  # attribute + hx-vals JS
+
+
+def test_live_wide_cam_post_sets_false(monkeypatch):
+    monkeypatch.setattr(front_app.Config, "experimental", True)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    calls = []
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda action, tid, params, **kw: calls.append(params) or {},
+    )
+    client = testing.TestClient(_live_wide_cam_app())
+    resp = client.simulate_post("/1/live/wide-cam", json={"wide_cam": "false"})
+    assert resp.status_code == 200
+    assert any(
+        p.get("params", {}).get("wide_cam") is False
+        for p in calls
+        if isinstance(p, dict) and "params" in p
+    )
+    assert resp.text.count("checked") == 1  # only the hx-vals JS, not the attribute
+
+
+def test_live_wide_cam_post_returns_204_when_experimental_off(monkeypatch):
+    monkeypatch.setattr(front_app.Config, "experimental", False)
+    calls = []
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda *a, **kw: calls.append(a),
+    )
+    client = testing.TestClient(_live_wide_cam_app())
+    resp = client.simulate_post("/1/live/wide-cam", json={"wide_cam": "true"})
+    assert resp.status_code == 204
+    assert resp.headers.get("hx-reswap") == "none"
+    assert calls == []
+
+
+def test_live_wide_cam_post_returns_204_for_non_s30(monkeypatch):
+    monkeypatch.setattr(front_app.Config, "experimental", True)
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+    calls = []
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda *a, **kw: calls.append(a),
+    )
+    client = testing.TestClient(_live_wide_cam_app())
+    resp = client.simulate_post("/1/live/wide-cam", json={"wide_cam": "true"})
+    assert resp.status_code == 204
+    assert resp.headers.get("hx-reswap") == "none"
+    assert calls == []
+
+
+def test_force_stop_goto_endpoint_returns_json(monkeypatch):
+    seen = {}
+
+    def _do_action(action, tid, params):
+        seen["action"] = action
+        seen["tid"] = tid
+        return {"ErrorNumber": 0, "Value": {"ok": True, "stop_slew_result": {}}}
+
+    monkeypatch.setattr(front_app, "do_action_device", _do_action)
+    req = DummyHTMXReq(relative_uri="/api/1/force_stop_goto")
+    resp = DummyResp()
+
+    front_app.ForceStopGotoResource.on_post(req, resp, telescope_id=1)
+
+    assert seen == {"action": "force_stop_goto", "tid": 1}
+    assert resp.status == falcon.HTTP_200
+    assert resp.content_type == "application/json"
+    body = json.loads(resp.text)
+    assert body["Value"]["ok"] is True
+
+
+def test_force_stop_goto_endpoint_json_when_device_offline(monkeypatch):
+    monkeypatch.setattr(front_app, "do_action_device", lambda *_a, **_k: None)
+    req = DummyHTMXReq(relative_uri="/api/1/force_stop_goto")
+    resp = DummyResp()
+
+    front_app.ForceStopGotoResource.on_post(req, resp, telescope_id=1)
+
+    body = json.loads(resp.text)
+    assert body == {"ok": False, "reason": "no response"}
+
+
+def test_force_stop_goto_endpoint_htmx_fragment(monkeypatch):
+    monkeypatch.setattr(
+        front_app,
+        "do_action_device",
+        lambda *_a, **_k: {"ErrorNumber": 0, "Value": {"ok": True}},
+    )
+    req = DummyHTMXReq(
+        relative_uri="/api/1/force_stop_goto", headers={"HX-Request": "true"}
+    )
+    resp = DummyResp()
+
+    front_app.ForceStopGotoResource.on_post(req, resp, telescope_id=1)
+
+    assert resp.content_type == "text/html"
+    assert "Cleared. Mount free." in resp.text
+
+
+def test_force_stop_goto_endpoint_htmx_fragment_offline(monkeypatch):
+    monkeypatch.setattr(front_app, "do_action_device", lambda *_a, **_k: None)
+    req = DummyHTMXReq(
+        relative_uri="/api/1/force_stop_goto", headers={"HX-Request": "true"}
+    )
+    resp = DummyResp()
+
+    front_app.ForceStopGotoResource.on_post(req, resp, telescope_id=1)
+
+    assert resp.content_type == "text/html"
+    assert "No response from device." in resp.text
+
+
+def test_goto_target_template_has_htmx_force_stop_button():
+    template = front_app.fetch_template("goto_target.html")
+    html = template.render(
+        telescope={"device_num": 1},
+        values={},
+        errors={},
+        action="/1/goto",
+    )
+    assert 'id="forceStopGotoBtn"' in html
+    assert 'hx-post="/api/1/force_stop_goto"' in html
+    assert 'hx-target="#forceStopGotoStatus"' in html
+    assert 'id="forceStopGotoStatus"' in html
+    # The button must not fall back to hand-rolled fetch() wiring.
+    assert "fetch(" not in html
+
+
+def test_schedule_list_renders_framed_mosaic_item():
+    template = front_app.env.get_template("partials/schedule_list.html")
+    html = template.render(
+        schedule={
+            "list": [
+                {
+                    "schedule_item_id": "fm1",
+                    "action": "start_framed_mosaic",
+                    "params": {
+                        "target_name": "M31",
+                        "ra": 0.7,
+                        "dec": 41.27,
+                        "mosaic_scale": 1.5,
+                        "mosaic_angle": 45.0,
+                        "panel_time_sec": 3600,
+                        "gain": 80,
+                        "num_tries": 1,
+                        "retry_wait_s": 300,
+                    },
+                }
+            ],
+            "is_stacking": False,
+        },
+        current_item={},
+    )
+
+    assert "M31" in html
+    assert "Scale: 1.5x" in html
+    assert "Angle: 45.0&deg;" in html
+
+
+def test_schedule_list_shows_total_mosaic_time_and_labeled_current_panel():
+    """Regression guard for the mosaic clarity cleanup (issues #37/#680):
+    the schedule list must show a computed grand total next to the
+    per-panel time, and label the running panel by RA/Dec instead of an
+    ambiguous concatenated digit pair."""
+    template = front_app.env.get_template("partials/schedule_list.html")
+    html = template.render(
+        schedule={
+            "list": [
+                {
+                    "schedule_item_id": "x1",
+                    "action": "start_mosaic",
+                    "params": {
+                        "target_name": "M31",
+                        "ra": 0.7,
+                        "dec": 41.27,
+                        "ra_num": 2,
+                        "dec_num": 2,
+                        "panel_overlap_percent": 10,
+                        "panel_time_sec": 3600,
+                        "gain": 80,
+                        "selected_panels": "",
+                        "num_tries": 1,
+                        "retry_wait_s": 300,
+                    },
+                }
+            ],
+            "is_stacking": True,
+        },
+        current_item={
+            "schedule_item_id": "x1",
+            "item_total_time_s": 14400,
+            "item_remaining_time_s": 10800,
+            "cur_ra_panel_num": 2,
+            "cur_dec_panel_num": 1,
+        },
+    )
+
+    assert "01:00:00 ea." in html
+    assert "Total: 04:00:00" in html
+    assert "Current Panel: 21" in html
+    assert "RA 2 / Dec 1" in html
+
+
+def _row_column_count(html):
+    """Count top-level Bootstrap grid columns (col/col-2/col-auto) in a
+    rendered schedule_list.html row, to catch column-count drift between
+    action-type branches that share the same table header."""
+    return len(re.findall(r'class="col(?:-\d+|-auto)?[ "]', html))
+
+
+@pytest.mark.parametrize("is_current", [True, False])
+def test_schedule_list_framed_mosaic_column_count_matches_mosaic(is_current):
+    """Regression guard: a framed_mosaic row must have the same column count
+    as a start_mosaic row, since both render under schedule_base.html's one
+    shared 10-column header. A mismatch silently shifts every column after
+    the divergence point (this exact bug shipped once already)."""
+    template = front_app.env.get_template("partials/schedule_list.html")
+    current_item = {"schedule_item_id": "x1"} if is_current else {}
+
+    mosaic_html = template.render(
+        schedule={
+            "list": [
+                {
+                    "schedule_item_id": "x1",
+                    "action": "start_mosaic",
+                    "params": {
+                        "target_name": "M31",
+                        "ra": 0.7,
+                        "dec": 41.27,
+                        "ra_num": 1,
+                        "dec_num": 1,
+                        "panel_overlap_percent": 10,
+                        "panel_time_sec": 3600,
+                        "gain": 80,
+                        "selected_panels": "",
+                        "num_tries": 1,
+                        "retry_wait_s": 300,
+                    },
+                }
+            ],
+            "is_stacking": False,
+        },
+        current_item=current_item,
+    )
+    framed_html = template.render(
+        schedule={
+            "list": [
+                {
+                    "schedule_item_id": "x1",
+                    "action": "start_framed_mosaic",
+                    "params": {
+                        "target_name": "M31",
+                        "ra": 0.7,
+                        "dec": 41.27,
+                        "mosaic_scale": 1.5,
+                        "mosaic_angle": 45.0,
+                        "panel_time_sec": 3600,
+                        "gain": 80,
+                        "num_tries": 1,
+                        "retry_wait_s": 300,
+                    },
+                }
+            ],
+            "is_stacking": False,
+        },
+        current_item=current_item,
+    )
+
+    assert _row_column_count(framed_html) == _row_column_count(mosaic_html)
+
+
+@pytest.mark.parametrize(
+    "model,wide,key",
+    [
+        ("Seestar S50", False, "S50"),
+        ("Seestar S50 Pro", True, "S50 Pro"),
+        ("S50Pro", True, "S50 Pro"),
+        ("S50P", True, "S50 Pro"),
+        ("Seestar S50P", True, "S50 Pro"),
+        ("Seestar S30P", True, "S30 Pro"),
+        ("Seestar S50N", False, "S50"),
+        ("Seestar S30", True, "S30"),
+        ("Seestar S30 Pro", True, "S30 Pro"),
+        ("Seestar S30 Plus", True, "S30"),
+        (None, False, None),
+        (0, False, None),
+    ],
+)
+def test_model_helpers_wide_camera_and_planner_key(model, wide, key):
+    assert front_app.has_wide_camera(model) is wide
+    assert front_app.planner_model_key(model) == key
+
+
+def test_astro_mosaic_template_offers_s50_pro_and_preselects_model():
+    from jinja2 import Environment, FileSystemLoader
+
+    env = Environment(loader=FileSystemLoader("front/templates"))
+    html = env.get_template("partials/astro_mosaic.html").render(
+        planner_model="S50 Pro",
+        utc_offset=0,
+        config_lat=0,
+        config_long=0,
+        telescope={"device_num": 1},
+        root="",
+    )
+    assert '<option value="S50 Pro" selected>' in html
+    assert "Wide" not in html.split('id="seestar"')[1].split("</select>")[0]
+
+
+def _render_astro_mosaic(**context):
+    from jinja2 import Environment, FileSystemLoader
+
+    env = Environment(loader=FileSystemLoader("front/templates"))
+    base = {"planner_model": "S50", "telescope": {"device_num": 1}, "root": ""}
+    base.update(context)
+    return env.get_template("partials/astro_mosaic.html").render(**base)
+
+
+def test_astro_mosaic_template_uses_configured_location():
+    html = _render_astro_mosaic(utc_offset=1.0, config_lat=44.06, config_long=0.65)
+    assert "location_lat: 44.06," in html
+    assert "location_lng: 0.65," in html
+    assert "32.92" not in html
+    assert "-96.72" not in html
+    # The chart's time zone is the site's, from the server, not a fixed UTC-5
+    # nor the browser's.
+    assert "timezoneOffset: 1.0," in html
+    assert "getTimezoneOffset" not in html
+    assert 'id="astro-mosaic-location-unset"' not in html
+
+
+def test_astro_mosaic_template_handles_half_hour_site_offset():
+    html = _render_astro_mosaic(utc_offset=5.5, config_lat=19.08, config_long=72.88)
+    assert "timezoneOffset: 5.5," in html
+
+
+def test_astro_mosaic_template_without_location_stays_valid_js():
+    # Rendered without the planner's variables, the parameters must still be
+    # JavaScript literals, not "location_lat: ," which breaks the card script.
+    html = _render_astro_mosaic()
+    assert "location_lat: 0," in html
+    assert "location_lng: 0," in html
+    assert "timezoneOffset: 0," in html
+
+
+def test_astro_mosaic_template_warns_when_location_unset():
+    html = _render_astro_mosaic(utc_offset=0, config_lat=0.0, config_long=0.0)
+    assert 'id="astro-mosaic-location-unset"' in html
+
+
+def test_astro_mosaic_template_versions_the_engine_script():
+    # A cached engine of an older release must not be run with this template.
+    html = _render_astro_mosaic(version="v3.3.1+17")
+    assert 'src="/public/AstroMosaicEngine.js?v=v3.3.1%2B17"' in html
+
+
+def test_site_utc_offset_follows_configured_timezone(monkeypatch):
+    from datetime import datetime
+
+    import pytz
+
+    monkeypatch.setattr(Config, "init_timezone", "Europe/Paris", raising=False)
+    winter = datetime(2026, 1, 15, 12, tzinfo=pytz.utc)
+    summer = datetime(2026, 7, 15, 12, tzinfo=pytz.utc)
+    assert front_app.site_utc_offset_hours(winter) == 1.0
+    assert front_app.site_utc_offset_hours(summer) == 2.0
+
+    monkeypatch.setattr(Config, "init_timezone", "Asia/Kolkata", raising=False)
+    assert front_app.site_utc_offset_hours(winter) == 5.5
+
+
+def test_site_utc_offset_falls_back_to_server_zone(monkeypatch):
+    from datetime import datetime
+
+    import pytz
+
+    monkeypatch.setattr(
+        front_app.tzlocal, "get_localzone", lambda: pytz.timezone("America/Chicago")
+    )
+    winter = datetime(2026, 1, 15, 12, tzinfo=pytz.utc)
+    monkeypatch.setattr(Config, "init_timezone", "", raising=False)
+    assert front_app.site_utc_offset_hours(winter) == -6.0
+    # An unknown name is ignored rather than breaking the planning page.
+    monkeypatch.setattr(Config, "init_timezone", "Mars/Olympus_Mons", raising=False)
+    assert front_app.site_utc_offset_hours(winter) == -6.0
+
+
+def _render_partial(name, **context):
+    from jinja2 import Environment, FileSystemLoader
+
+    env = Environment(loader=FileSystemLoader("front/templates"))
+    base = {
+        "planner_model": "S50",
+        "utc_offset": 0,
+        "config_lat": 44.06,
+        "config_long": 0.65,
+        "telescope": {"device_num": 1},
+        "root": "",
+    }
+    return env.get_template(name).render(**{**base, **context})
+
+
+def test_astro_mosaic_template_flat_horizon_without_profile():
+    html = _render_partial("partials/astro_mosaic.html", horizon_limits=None)
+    assert "horizonHard: [30]," in html
+
+
+def test_astro_mosaic_template_uses_horizon_profile():
+    limits = [12.5] * 71 + [40]
+    html = _render_partial("partials/astro_mosaic.html", horizon_limits=limits)
+    line = re.search(r"horizonHard: (\[[^\]]*\]),", html)
+    assert json.loads(line.group(1)) == limits
+
+
+def test_horizon_card_draws_the_profile():
+    curve = [(azimuth, 10) for azimuth in range(361)]
+    html = _render_partial(
+        "partials/horizon.html",
+        horizon_curve=curve,
+        horizon_point_count=4,
+        horizon_file="/etc/seestar/site.hrz",
+        horizon_error=None,
+    )
+    assert 'id="horizon-profile"' in html
+    assert "0,80 1,80" in html  # altitude 10 drawn 80 units down a 0-90 scale
+    assert "/etc/seestar/site.hrz" in html
+    assert "4 points" in html
+
+
+def test_horizon_card_reports_an_unusable_file():
+    html = _render_partial(
+        "partials/horizon.html",
+        horizon_curve=None,
+        horizon_error="site.hrz, line 2: expected 'azimuth altitude'",
+    )
+    assert "Horizon file not used" in html
+    assert "line 2" in html
+    assert 'id="horizon-profile"' not in html
+
+
+def test_horizon_card_explains_how_to_set_a_profile():
+    html = _render_partial("partials/horizon.html", horizon_curve=None)
+    assert "No horizon profile" in html
+    assert "Horizon file" in html
+
+
+def test_cached_context_is_not_rewritten_by_a_request_prefix(monkeypatch):
+    # Isolate from a local config.toml [webui_settings] root_path.
+    monkeypatch.setattr(Config, "root_path", "")
+    # get_context() returns one cached dict per telescope for ~1s, shared by
+    # every request. Each request must get its own prefix applied to a copy,
+    # so a prefix from one proxy never leaks into another request's HTML.
+    cached = {"root": "/1", "action": "/1/live", "imager_root": "/1/imaging"}
+    snapshot = dict(cached)
+    behind_a = DummyHTMXReq(headers={"X-Forwarded-Prefix": "/a"})
+    behind_b = DummyHTMXReq(headers={"X-Forwarded-Prefix": "/b"})
+    plain = DummyHTMXReq()
+
+    out_a = front_app._template_context(behind_a, cached)
+    out_b = front_app._template_context(behind_b, cached)
+    out_plain = front_app._template_context(plain, cached)
+
+    assert cached == snapshot
+    assert out_a["root"] == "/a/1" and out_a["action"] == "/a/1/live"
+    assert out_b["root"] == "/b/1" and out_b["action"] == "/b/1/live"
+    assert out_plain["root"] == "/1" and out_plain["action"] == "/1/live"
+    assert out_a["root_path"] == "/a" and out_plain["root_path"] == ""
+
+
+def test_nav_links_to_the_horizon_page():
+    html = _render_nav("planning")
+    assert 'href="/1/horizon">Horizon (MMhorizon)</a>' in html
+
+
+def test_horizon_card_links_to_the_panorama_page():
+    for curve in (None, [(azimuth, 10) for azimuth in range(361)]):
+        html = _render_partial("partials/horizon.html", horizon_curve=curve, root="/1")
+        assert 'href="/1/horizon">Make the horizon from a 360&deg; panorama</a>' in html
+
+
+@pytest.mark.parametrize(
+    "horizon_file, horizon_error, shown",
+    [
+        ("", None, "flat horizon at 30"),
+        ("/etc/seestar/site.hrz", None, "/etc/seestar/site.hrz &middot; 4 points"),
+        ("/etc/seestar/gone.hrz", "No such file or directory", "Horizon file not used"),
+    ],
+)
+def test_horizon_page_current_card_is_always_replaceable(
+    horizon_file, horizon_error, shown
+):
+    # The page replaces #hz-current after a save, whatever it showed before,
+    # a warning about an unusable file included.
+    html = front_app.fetch_template("horizon.html").render(
+        **_minimal_context("horizon"),
+        config_lat=44.06,
+        config_long=0.65,
+        horizon_file=horizon_file,
+        horizon_error=horizon_error,
+        horizon_point_count=4,
+    )
+    current = re.search(
+        r'<div class="card-body" id="hz-current">(.*?)</div>', html, re.S
+    )
+    assert current is not None
+    assert shown in current.group(0)
+    assert 'id="hz-page" data-lat="44.06" data-lon="0.65"' in html
+
+
+def test_horizon_page_script_follows_the_root_path():
+    html = front_app.fetch_template("horizon.html").render(
+        **_minimal_context("horizon"),
+        root_path="/ingress",
+        config_lat=44.06,
+        config_long=0.65,
+        horizon_file="",
+        horizon_error=None,
+        horizon_point_count=0,
+    )
+    assert 'src="/ingress/public/horizon_panorama.js"' in html
+    assert 'data-root-path="/ingress"' in html
+
+
+def _record_device_actions(monkeypatch, reply=None):
+    """Capture (action, telescope_id, parameters) for every device call."""
+    calls = []
+
+    def fake(action, telescope_id, parameters, is_schedule=False):
+        calls.append((action, telescope_id, parameters))
+        return reply
+
+    monkeypatch.setattr(front_app, "do_action_device", fake)
+    return calls
+
+
+def test_get_remote_state_command_queries_the_selected_telescope(monkeypatch):
+    calls = _record_device_actions(monkeypatch)
+    req = type("Req", (), {"media": {"command": "get_remote_state"}})()
+
+    front_app.do_command(req, None, 2)
+
+    assert calls == [("method_sync", 2, {"method": "get_device_state"})]
+
+
+@pytest.mark.parametrize(
+    "helper, keys",
+    [
+        # An unfiltered get_device_state opens and closes the focuser, runs
+        # shell queries and can wait ~30 s on the mount (seestar-spec, READ);
+        # each helper asks only for the sections it reads.
+        (front_app.get_firmware_ver_int, ["device"]),
+        (front_app.get_device_model, ["device"]),
+        (front_app.get_guestmode_state, ["device", "setting", "client"]),
+        (
+            front_app.get_device_state,
+            [
+                "device",
+                "setting",
+                "focuser",
+                "storage",
+                "balance_sensor",
+                "compass_sensor",
+                "mount",
+                "pi_status",
+                "client",
+            ],
+        ),
+    ],
+)
+def test_device_state_helpers_request_only_the_sections_they_read(
+    monkeypatch, helper, keys
+):
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    calls = _record_device_actions(monkeypatch)
+
+    helper(3)
+
+    state_requests = [
+        params
+        for action, tid, params in calls
+        if params.get("method") == "get_device_state"
+    ]
+    assert state_requests == [{"method": "get_device_state", "params": {"keys": keys}}]
+    assert all(tid == 3 for _a, tid, _p in calls)
+
+
+def test_balance_sensor_endpoint_requests_only_balance_sensor(monkeypatch):
+    reply = {
+        "ErrorNumber": 0,
+        "Value": {"result": {"balance_sensor": {"data": {"x": 0.5, "y": -0.25}}}},
+    }
+    calls = _record_device_actions(monkeypatch, reply=reply)
+    req = type("Req", (), {"get_header": lambda self, _n: "http://h/2/live"})()
+    resp = type("Resp", (), {})()
+
+    front_app.GetBalanceSensorResource.on_get(req, resp)
+
+    assert calls == [
+        (
+            "method_sync",
+            2,
+            {"method": "get_device_state", "params": {"keys": ["balance_sensor"]}},
+        )
+    ]
+    assert json.loads(resp.text) == {"x": 0.5, "y": -0.25}
+
+
+def _sent_stack_dither(calls):
+    for action, params in calls:
+        if params.get("method") == "set_setting":
+            dither = (params.get("params") or {}).get("stack_dither")
+            if dither is not None:
+                return dither
+    return None
+
+
+@pytest.mark.parametrize(
+    "pix, interval, expected",
+    [
+        ("5", "3", {"pix": 5, "interval": 3}),
+        # Blank or out-of-range values are left out: the firmware ignores a
+        # missing member but answers 204 to an out-of-range one, which also
+        # stops the rest of that set_setting (seestar-spec, READ).
+        ("NaN", "", {}),
+        ("201", "0", {}),
+        ("-1", "101", {}),
+    ],
+)
+def test_settings_post_sends_only_valid_dither_values(
+    monkeypatch, pix, interval, expected
+):
+    _output, calls = _run_settings_post(
+        monkeypatch,
+        model="Seestar S50",
+        form_extra={
+            "stack_dither_pix": pix,
+            "stack_dither_interval": interval,
+            "stack_dither_enable": "true",
+        },
+    )
+
+    assert _sent_stack_dither(calls) == {"enable": True, **expected}

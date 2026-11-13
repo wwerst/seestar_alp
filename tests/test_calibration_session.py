@@ -849,3 +849,468 @@ def test_status_response_includes_kind_metadata(monkeypatch, tmp_path):
         assert st.current_landmark["oas"] == "06-000301"
     finally:
         session.stop()
+
+
+# --------- regression: motion delegate, seeding, ordering, timing --------
+
+
+def _wrap_diff(a: float, b: float) -> float:
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def _wait_until(predicate, timeout_s: float = 3.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class _FakeMotionDelegate:
+    """Calibrate-motion stand-in modelling the streaming controller's
+    start anchor: the mount sits at ``provider_target + offset`` (the
+    offset carries the encoder origin), and converges instantly. When
+    ``cli`` is given, ``set_target`` also moves that fake mount's encoder,
+    so the session's idle encoder poll reads the same position."""
+
+    def __init__(self, off_az: float, off_el: float, cli=None):
+        self.off_az = float(off_az)
+        self.off_el = float(off_el)
+        self.cli = cli
+        self.target = [0.0, 0.0]
+        self.set_calls: list[tuple[float, float]] = []
+
+    def mount(self) -> tuple[float, float]:
+        return self.target[0] + self.off_az, self.target[1] + self.off_el
+
+    def status(self):
+        from types import SimpleNamespace
+
+        cur_az, cur_el = self.mount()
+        return SimpleNamespace(
+            target_az_deg=self.target[0],
+            target_el_deg=self.target[1],
+            cur_cum_az_deg=cur_az,
+            cur_el_deg=cur_el,
+            err_az_deg=0.0,
+            err_el_deg=0.0,
+        )
+
+    def set_target(self, az_deg, el_deg):
+        self.set_calls.append((float(az_deg), float(el_deg)))
+        self.target = [float(az_deg), float(el_deg)]
+        if self.cli is not None:
+            self.cli.encoder_az, self.cli.encoder_el = self.mount()
+
+    def nudge_target(self, d_az_deg, d_el_deg):
+        self.target[0] += float(d_az_deg)
+        self.target[1] += float(d_el_deg)
+
+    def is_settled(self, threshold_deg=None, ticks=None):
+        return True
+
+
+def test_pre_slew_through_motion_delegate_lands_mount_on_prediction(
+    monkeypatch, tmp_path
+):
+    """The delegate's provider frame is offset from the encoder by its
+    start anchor. The pre-slew must convert the absolute mount-frame
+    prediction into that frame so the MOUNT lands on the prediction (not
+    on prediction + anchor offset)."""
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+    fake = _FakeMotionDelegate(off_az=37.0, off_el=4.0, cli=cli)
+    session = CalibrationSession(
+        telescope_id=41,
+        targets=_targets(site),
+        site=site,
+        out_path=tmp_path / "cal.json",
+    )
+    monkeypatch.setattr(session, "_motion_delegate", lambda: fake)
+    session.start()
+    try:
+        _wait_for_phase(session, "nudging")
+        st = session.status()
+        assert fake.set_calls, "pre-slew did not go through the delegate"
+        mount_az, mount_el = fake.mount()
+        assert abs(_wrap_diff(mount_az, st.target_az_deg)) < 1e-6
+        assert mount_el == pytest.approx(st.target_el_deg, abs=1e-6)
+        # The session's encoder readout follows the delegate's mount.
+        assert abs(_wrap_diff(st.encoder_az_deg, st.target_az_deg)) < 1e-6
+    finally:
+        session.stop()
+
+
+def _count_move_to_ff(monkeypatch) -> list[tuple[float, float]]:
+    """Wrap the installed fake move_to_ff so a test can assert whether
+    (and where) a direct pre-slew was commanded."""
+    import device.velocity_controller as vc
+
+    inner = vc.move_to_ff
+    calls: list[tuple[float, float]] = []
+
+    def counting(client, **kw):
+        calls.append((kw["target_az_deg"], kw["target_el_deg"]))
+        return inner(client, **kw)
+
+    monkeypatch.setattr(vc, "move_to_ff", counting)
+    return calls
+
+
+def test_delegate_without_tick_fails_preslew_without_move_to_ff(monkeypatch, tmp_path):
+    """No tick yet → the anchor offset is unknown, so the delegate is not
+    given an absolute target. The delegate is alive (its track() loop owns
+    the mount), so a direct move_to_ff would fight it: the pre-slew must
+    fail with a clear error instead, commanding nothing."""
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+    move_calls = _count_move_to_ff(monkeypatch)
+    fake = _FakeMotionDelegate(off_az=37.0, off_el=4.0)
+    from types import SimpleNamespace
+
+    fake.status = lambda: SimpleNamespace(
+        target_az_deg=0.0,
+        target_el_deg=0.0,
+        cur_cum_az_deg=None,
+        cur_el_deg=None,
+        err_az_deg=None,
+        err_el_deg=None,
+    )
+    session = CalibrationSession(
+        telescope_id=42,
+        targets=_targets(site),
+        site=site,
+        out_path=tmp_path / "cal.json",
+    )
+    monkeypatch.setattr(session, "DELEGATE_FIRST_TICK_WAIT_S", 0.0)
+    monkeypatch.setattr(session, "_motion_delegate", lambda: fake)
+    session.start()
+    try:
+        _wait_for_phase(session, "error")
+        st = session.status()
+        assert fake.set_calls == []
+        assert move_calls == []
+        assert any("did not respond" in e for e in st.errors), st.errors
+        # The fake mount never moved.
+        assert (cli.encoder_az, cli.encoder_el) == (0.0, 0.0)
+    finally:
+        session.stop()
+
+
+def _first_target_prediction(site, monkeypatch, tmp_path) -> tuple[float, float]:
+    """Predicted mount (az, el) for target 0, via a dry-run slew."""
+    dry = CalibrationSession(
+        telescope_id=45,
+        targets=_targets(site),
+        site=site,
+        out_path=tmp_path / "dry.json",
+        dry_run=True,
+    )
+    dry._slew_to_target(None, 0)
+    st = dry.status()
+    return float(st.target_az_deg), float(st.target_el_deg)
+
+
+def _az_dist(a: float, b: float) -> float:
+    return abs(((a - b + 180.0) % 360.0) - 180.0)
+
+
+def _path_session(site, monkeypatch, tmp_path, cone_az):
+    """Non-dry-run session with no motion delegate whose sun cone (stubbed
+    in sun_safety.is_sun_safe) is a 5° az band around ``cone_az``
+    (``None`` = no cone)."""
+    from device import sun_safety as ss
+
+    def fake_is_sun_safe(az, el, **kw):
+        if cone_az is not None and _az_dist(float(az), cone_az) < 5.0:
+            return False, "sun_avoidance: stubbed cone"
+        return True, ""
+
+    monkeypatch.setattr(ss, "is_sun_safe", fake_is_sun_safe)
+    session = CalibrationSession(
+        telescope_id=46,
+        targets=_targets(site),
+        site=site,
+        out_path=tmp_path / "cal.json",
+    )
+    monkeypatch.setattr(session, "_motion_delegate", lambda: None)
+    return session
+
+
+def test_preslew_refused_when_path_crosses_sun_cone(monkeypatch, tmp_path):
+    """Start and end are outside the cone but the straight-line path
+    between them crosses it: refuse with no motion command issued."""
+    site = _site()
+    tgt_az, tgt_el = _first_target_prediction(site, monkeypatch, tmp_path)
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli)
+    move_calls = _count_move_to_ff(monkeypatch)
+    cli.encoder_az = ((tgt_az + 60.0 + 180.0) % 360.0) - 180.0
+    cli.encoder_el = tgt_el
+    start = (cli.encoder_az, cli.encoder_el)
+    session = _path_session(site, monkeypatch, tmp_path, cone_az=tgt_az + 30.0)
+
+    session._slew_to_target(cli, 0)
+
+    st = session.status()
+    assert st.phase == "error"
+    assert session._stop_evt.is_set()
+    assert any("sun_avoidance" in e and "path point" in e for e in st.errors), st.errors
+    assert move_calls == []
+    assert (cli.encoder_az, cli.encoder_el) == start
+
+
+def test_preslew_proceeds_when_path_is_clear(monkeypatch, tmp_path):
+    site = _site()
+    tgt_az, tgt_el = _first_target_prediction(site, monkeypatch, tmp_path)
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli)
+    move_calls = _count_move_to_ff(monkeypatch)
+    cli.encoder_az = ((tgt_az + 60.0 + 180.0) % 360.0) - 180.0
+    cli.encoder_el = tgt_el
+    # Cone on the far side of the sky: the short-way path never nears it.
+    session = _path_session(site, monkeypatch, tmp_path, cone_az=tgt_az + 200.0)
+
+    session._slew_to_target(cli, 0)
+
+    st = session.status()
+    assert st.phase == "slewing", st.errors
+    assert not session._stop_evt.is_set()
+    assert len(move_calls) == 1
+    assert _az_dist(cli.encoder_az, tgt_az) < 1e-6
+    assert cli.encoder_el == pytest.approx(tgt_el, abs=1e-6)
+
+
+def test_preslew_refused_when_encoder_unreadable(monkeypatch, tmp_path):
+    """Without a start point the path cannot be verified: refuse (same as
+    the live tracker's pre-slew) rather than skip the check."""
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli)
+    move_calls = _count_move_to_ff(monkeypatch)
+
+    def broken_measure(client, loc):
+        raise RuntimeError("no encoder")
+
+    monkeypatch.setattr(
+        "device.velocity_controller.measure_altaz_timed", broken_measure
+    )
+    session = _path_session(site, monkeypatch, tmp_path, cone_az=None)
+
+    session._slew_to_target(cli, 0)
+
+    st = session.status()
+    assert st.phase == "error"
+    assert any("could not be verified" in e for e in st.errors), st.errors
+    assert move_calls == []
+
+
+def test_two_sighting_commit_keeps_kept_prior_pitch_and_roll(monkeypatch, tmp_path):
+    """With a kept prior, the yaw-only fit of a two-sighting commit must
+    keep the prior's pitch/roll, not overwrite them with 0."""
+    from device.target_frame import MountFrame
+
+    site = _site()
+    cli = _FakeCli()
+    _install_fakes(monkeypatch, cli, neutralise_sun=True)
+    prior = MountFrame.from_euler_deg(
+        yaw_deg=5.0, pitch_deg=1.0, roll_deg=-0.5, site=site
+    )
+    out = tmp_path / "cal.json"
+    session = CalibrationSession(
+        telescope_id=43,
+        targets=_targets(site),
+        site=site,
+        out_path=out,
+        prior_frame=prior,
+    )
+    session.start()
+    try:
+        _wait_for_phase(session, "nudging")
+        session.sight()
+        assert _wait_until(lambda: session.status().target_idx == 1)
+        _wait_for_phase(session, "nudging")
+        session.sight()
+        _wait_for_phase(session, "review")
+        session.commit()
+        _wait_for_phase(session, "committed")
+    finally:
+        session.stop()
+
+    payload = json.loads(out.read_text())
+    assert payload["n_landmarks"] == 2
+    assert payload["pitch_offset_deg"] == pytest.approx(1.0, abs=1e-9)
+    assert payload["roll_offset_deg"] == pytest.approx(-0.5, abs=1e-9)
+    assert payload["yaw_offset_deg"] == pytest.approx(5.0, abs=0.1)
+
+
+def test_nudge_coalescing_keeps_sight_ahead_of_later_nudge(monkeypatch, tmp_path):
+    """Queued [nudge, sight, nudge]: the sight must record the position
+    after the first nudge only. Re-queuing the sight behind the second
+    nudge (the old behaviour) recorded a position moved by both."""
+    import threading
+
+    site = _site()
+    _install_fakes(monkeypatch, _FakeCli(), neutralise_sun=True)
+    session = CalibrationSession(
+        telescope_id=44,
+        targets=_targets(site),
+        site=site,
+        out_path=tmp_path / "cal.json",
+        dry_run=True,
+    )
+    session._slew_to_target(None, 0)
+    base_az = session.status().target_az_deg
+    assert base_az is not None
+
+    session.nudge(1.0, 0.0)
+    session.sight()
+    session.nudge(1.0, 0.0)
+
+    worker = threading.Thread(target=session._process_loop, args=(None,), daemon=True)
+    worker.start()
+    try:
+        assert _wait_until(lambda: len(session._sightings) >= 1)
+    finally:
+        session._stop_evt.set()
+        worker.join(2.0)
+
+    assert session._sightings[0].encoder_az_deg == pytest.approx(
+        base_az + 1.0, abs=1e-9
+    )
+
+
+def test_platesolve_sighting_uses_capture_time_not_solve_completion(
+    monkeypatch, tmp_path
+):
+    """The solved RA/Dec must be converted to alt/az at the exposure time
+    (tracking is off, so the sky drifts while the solve runs), and the
+    sighting carries that same timestamp."""
+    import device.nighttime_calibration as nc
+    from device.calibration_targets import CalibrationTargetSpec
+    from device.plate_solver import SolveResult
+
+    site = _site()
+    _install_fakes(monkeypatch, _FakeCli(), neutralise_sun=True)
+
+    capture_times: list[float] = []
+    transform_times: list[float] = []
+
+    def _capture():
+        capture_times.append(time.time())
+        return Path("cap.fits")
+
+    class _SlowSolver:
+        def solve(self, image_path):
+            time.sleep(0.2)
+            return SolveResult(
+                ra_deg=10.0,
+                dec_deg=20.0,
+                fov_x_deg=1.27,
+                fov_y_deg=0.71,
+                position_angle_deg=0.0,
+            )
+
+    def _fake_transform(ra, dec, t_unix, site_):
+        transform_times.append(float(t_unix))
+        return 100.0, 40.0
+
+    monkeypatch.setattr(nc, "radec_to_topocentric_azel", _fake_transform)
+    specs = [
+        CalibrationTargetSpec.platesolve("free aim"),
+        CalibrationTargetSpec.from_landmark(HYPERION_06_000301, slant_m=5523.0),
+    ]
+    session = CalibrationSession(
+        telescope_id=45,
+        target_specs=specs,
+        site=site,
+        out_path=tmp_path / "cal.json",
+        dry_run=True,
+        plate_solver=_SlowSolver(),
+        capture_image_fn=_capture,
+    )
+    session._encoder_az = 10.0
+    session._encoder_el = 40.0
+    t_before = time.time()
+    session._on_sight(None)
+
+    assert len(session._sightings) == 1, session.status().errors
+    assert transform_times and capture_times
+    t_used = transform_times[0]
+    assert t_before <= t_used <= capture_times[0]
+    assert session._sightings[0].t_unix == pytest.approx(t_used)
+
+
+def _seeded_platesolve_session(site, monkeypatch, tmp_path, prior_frame, cone_sky_az):
+    """Dry-run session whose only target is a plate-solve seed at mount
+    (az 0, el 30); the stubbed sun cone is a 5° az band at ``cone_sky_az``."""
+    from device import sun_safety as ss
+    from device.calibration_targets import CalibrationTargetSpec
+    from device.plate_solver import FakePlateSolver
+
+    def fake_is_sun_safe(az, el, **kw):
+        if _az_dist(float(az), cone_sky_az) < 5.0:
+            return False, "sun_avoidance: stubbed cone"
+        return True, ""
+
+    monkeypatch.setattr(ss, "is_sun_safe", fake_is_sun_safe)
+    return CalibrationSession(
+        telescope_id=47,
+        target_specs=[
+            CalibrationTargetSpec.platesolve(
+                "seeded", seed_az_deg=0.0, seed_el_deg=30.0
+            )
+        ],
+        site=site,
+        out_path=tmp_path / "cal.json",
+        plate_solver=FakePlateSolver(results={}),
+        capture_image_fn=lambda: Path("/tmp/unused.fits"),
+        prior_frame=prior_frame,
+        dry_run=True,
+    )
+
+
+def test_seeded_platesolve_refused_when_encoder_seed_lands_on_sun(
+    monkeypatch, tmp_path
+):
+    """The seed is commanded as an encoder target. With a calibrated prior
+    whose encoder zero is not north, encoder az 0 is a different sky az;
+    if the sun is there the slew must be refused even though the raw seed
+    numbers, read as sky, are far from it."""
+    from device.streaming_controller import _mount_azel_to_sky
+    from device.target_frame import MountFrame
+
+    site = _site()
+    prior = MountFrame.from_euler_deg(90.0, 0.0, 0.0, site)
+    sky_az, _ = _mount_azel_to_sky(prior, 0.0, 30.0)
+    assert _az_dist(sky_az, 0.0) > 45.0  # the two readings really differ
+    session = _seeded_platesolve_session(site, monkeypatch, tmp_path, prior, sky_az)
+
+    session._slew_to_target(None, 0)
+
+    st = session.status()
+    assert st.phase == "error"
+    assert session._stop_evt.is_set()
+    assert any("sun_avoidance" in e for e in st.errors), st.errors
+
+
+def test_seeded_platesolve_allowed_with_identity_prior(monkeypatch, tmp_path):
+    """Same cone, uncalibrated (identity) prior: both readings of the seed
+    are sky az 0, well clear of it, so the slew goes ahead."""
+    from device.streaming_controller import _mount_azel_to_sky
+    from device.target_frame import MountFrame
+
+    site = _site()
+    cone_az, _ = _mount_azel_to_sky(
+        MountFrame.from_euler_deg(90.0, 0.0, 0.0, site), 0.0, 30.0
+    )
+    session = _seeded_platesolve_session(site, monkeypatch, tmp_path, None, cone_az)
+
+    session._slew_to_target(None, 0)
+
+    st = session.status()
+    assert st.phase == "slewing", st.errors
+    assert not session._stop_evt.is_set()

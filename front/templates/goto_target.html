@@ -1,5 +1,5 @@
 <!-- Import javascript for reading fits tags -->
-<script src="/public/fit_import.js"></script>
+<script src="{{ root_path }}/public/fit_import.js"></script>
 <form method="post" action="{{ action }}">
     <div class="card border-primary mb-3"> <!-- Target details card-->
         <div class="card-body">
@@ -41,7 +41,7 @@
                     <label for="ra" class="form-label">Right Ascension</label>
                     <input type="text" class="form-control" id="ra" name="ra" aria-describedby="raHelp"
                            value="{{ values.ra }}" required>
-                    <div id="raHelp" class="form-text">Mosaic center in decimal degrees or minutes (e.g. -1.2 or 6h32m32.5s)</div>
+                    <div id="raHelp" class="form-text">Mosaic center in decimal hours or hours/minutes/seconds (e.g. 1.2 or 6h32m32.5s)</div>
                 </div>
                 <div class="col"> <!-- Declination text box -->
                     <label for="dec" class="form-label">Declination</label>
@@ -106,9 +106,22 @@
 				{% endif %} <!-- End error modal?-->
             </div>
         </div>
-        
-    </div> 
-    <button type="submit" class="btn btn-primary">Submit</button>
+
+    </div>
+    <div class="d-flex align-items-center gap-2">
+        <button type="submit" class="btn btn-primary">Submit</button>
+        <button type="button" class="btn btn-warning"
+                id="forceStopGotoBtn"
+                hx-post="{{ root_path }}/api/{{ telescope.device_num }}/force_stop_goto"
+                hx-params="none"
+                hx-target="#forceStopGotoStatus"
+                hx-swap="innerHTML"
+                hx-disabled-elt="this"
+                title="Unconditionally stop the current goto / AutoGoto loop and force-clear the 'goto in progress' flag. Use if a goto is wedged on plate-solve and new gotos are being rejected with 'mount is in goto routine'.">
+            Stop Goto
+        </button>
+        <span id="forceStopGotoStatus" class="text-muted small ms-2"></span>
+    </div>
 </form>
 
 <!-- Modal structure -->

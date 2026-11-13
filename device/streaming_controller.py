@@ -555,21 +555,32 @@ def track(
             #     just catches trajectories whose provider output rolls
             #     into the cone mid-run so we abort before the mount
             #     commits to the slew.
-            if sun_mount_frame is not None:
-                try:
-                    sun_az, sun_el = _mount_azel_to_sky(
-                        sun_mount_frame, ref.az_cum_deg % 360.0, float(ref.el_deg)
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "mount->sky transform for sun check failed (%s); "
-                        "falling back to mount az/el",
-                        exc,
-                    )
-                    sun_az, sun_el = ref.az_cum_deg % 360.0, float(ref.el_deg)
-            else:
-                sun_az, sun_el = ref.az_cum_deg % 360.0, float(ref.el_deg)
+            #     The raw reference is checked first, then the COMMANDED
+            #     pointing (eff_ref = ref + anchor offset + user biases):
+            #     that is where the mount is actually driven, and the
+            #     anchor offset is unbounded when the pre-slew was skipped.
+            #     Either one unsafe aborts the track.
+            sun_az, sun_el = _sun_check_sky_azel(
+                sun_mount_frame, ref.az_cum_deg % 360.0, float(ref.el_deg)
+            )
             sun_safe, sun_reason = _is_sun_safe(sun_az, sun_el)
+            if sun_safe:
+                if not (math.isfinite(eff_ref_az) and math.isfinite(eff_ref_el)):
+                    # Fail closed: a NaN pointing would compare "safe".
+                    sun_safe = False
+                    sun_reason = (
+                        "sun_avoidance: commanded pointing is non-finite "
+                        f"(az={eff_ref_az!r}, el={eff_ref_el!r})"
+                    )
+                else:
+                    cmd_az, cmd_el = _sun_check_sky_azel(
+                        sun_mount_frame,
+                        eff_ref_az % 360.0,
+                        max(-90.0, min(90.0, float(eff_ref_el))),
+                    )
+                    sun_safe, sun_reason = _is_sun_safe(cmd_az, cmd_el)
+                    if not sun_safe:
+                        sun_reason = f"{sun_reason} (commanded pointing)"
             if not sun_safe:
                 exit_reason = "sun_avoidance"
                 errors.append(sun_reason)
@@ -730,6 +741,28 @@ def _mount_azel_to_sky(
     sky_az = (math.degrees(math.atan2(float(topo[0]), float(topo[1]))) + 360.0) % 360.0
     sky_el = math.degrees(math.asin(max(-1.0, min(1.0, float(topo[2])))))
     return sky_az, sky_el
+
+
+def _sun_check_sky_azel(
+    mount_frame: Any, az_deg: float, el_deg: float
+) -> tuple[float, float]:
+    """Mount-frame (az, el) -> sky (az, el) for the per-tick sun net.
+
+    Uses :func:`_mount_azel_to_sky` when the provider has a mount frame.
+    With no frame, or if the transform raises, it falls back to treating
+    the mount az/el as sky (the conservative pre-calibration behavior).
+    """
+    if mount_frame is None:
+        return az_deg, el_deg
+    try:
+        return _mount_azel_to_sky(mount_frame, az_deg, el_deg)
+    except Exception as exc:
+        logger.debug(
+            "mount->sky transform for sun check failed (%s); "
+            "falling back to mount az/el",
+            exc,
+        )
+        return az_deg, el_deg
 
 
 def _build_result(

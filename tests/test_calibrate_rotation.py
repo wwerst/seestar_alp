@@ -885,3 +885,106 @@ def test_pointing_uncertainty_monte_carlo_matches_analytic():
     # bounds — they should exceed the per-axis MC σ, not match it.
     assert sigma_az_an >= expected_az * 0.9
     assert sigma_el_an >= expected_el * 0.9
+
+
+# ---------- kept-prior seeding ---------------------------------------
+
+
+def test_mount_frame_euler_deg_round_trips_from_euler():
+    from device.rotation_calibration import mount_frame_euler_deg
+
+    site = build_site(**DOCKWEILER)
+    frame = MountFrame.from_euler_deg(
+        yaw_deg=-25.0, pitch_deg=0.8, roll_deg=-0.3, site=site
+    )
+    yaw, pitch, roll = mount_frame_euler_deg(frame)
+    assert yaw == pytest.approx(-25.0, abs=1e-9)
+    assert pitch == pytest.approx(0.8, abs=1e-9)
+    assert roll == pytest.approx(-0.3, abs=1e-9)
+    assert mount_frame_euler_deg(None) is None
+
+
+def test_two_sighting_fit_seeded_from_kept_prior_keeps_its_tilt():
+    """With a kept prior, the yaw-only two-sighting fit must keep the
+    prior's pitch/roll instead of writing 0 (CLI seeding helper)."""
+    from scripts.trajectory.calibrate_rotation import _prior_seed_kwargs
+
+    site = build_site(**DOCKWEILER)
+    prior = MountFrame.from_euler_deg(
+        yaw_deg=-25.0, pitch_deg=0.8, roll_deg=-0.3, site=site
+    )
+    two = [
+        _synth_sighting(HYPERION_06_000301, site, -25.0, 0.8, -0.3),
+        _synth_sighting(LA_BROADCAST_06_000177, site, -25.0, 0.8, -0.3),
+    ]
+    sol = solve_rotation(two, site, **_prior_seed_kwargs(prior))
+    assert sol.pitch_deg == pytest.approx(0.8, abs=1e-9)
+    assert sol.roll_deg == pytest.approx(-0.3, abs=1e-9)
+    assert sol.yaw_deg == pytest.approx(-25.0, abs=0.02)
+    assert sol.residual_rms_deg < 0.01
+    # No prior → no seeds (legacy zero-seed behaviour).
+    assert _prior_seed_kwargs(None) == {}
+
+
+# ---------- CLI sun pre-flight ---------------------------------------
+
+
+def test_sun_safe_mount_identity_frame_passes_az_el_through(monkeypatch):
+    from device import sun_safety as ss
+    from scripts.trajectory.calibrate_rotation import _sun_safe_mount
+
+    seen = []
+
+    def _fake_is_sun_safe(az, el, **kw):
+        seen.append((az, el, kw))
+        return False, "sun_avoidance: forced by test"
+
+    monkeypatch.setattr(ss, "is_sun_safe", _fake_is_sun_safe)
+    site = build_site(**DOCKWEILER)
+    safe, reason = _sun_safe_mount(-30.0, 12.0, None, site)
+    assert safe is False
+    assert "sun_avoidance" in reason
+    az, el, kw = seen[0]
+    assert az == pytest.approx(330.0)
+    assert el == pytest.approx(12.0)
+    assert kw == {"lat_deg": site.lat_deg, "lon_deg": site.lon_deg}
+
+
+def test_sun_safe_mount_fails_closed_on_error(monkeypatch):
+    from device import sun_safety as ss
+    from scripts.trajectory.calibrate_rotation import _sun_safe_mount
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("ephem exploded")
+
+    monkeypatch.setattr(ss, "is_sun_safe", _boom)
+    safe, reason = _sun_safe_mount(10.0, 20.0, None, None)
+    assert safe is False
+    assert "ephem exploded" in reason
+
+
+def test_nudge_loop_refuses_unsafe_nudge_without_moving(monkeypatch):
+    import scripts.trajectory.calibrate_rotation as cr
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(
+        ss, "is_sun_safe", lambda *a, **kw: (False, "sun_avoidance: forced")
+    )
+    monkeypatch.setattr(cr, "_read_encoder", lambda cli: (20.0, 10.0))
+    moves = []
+    monkeypatch.setattr(cr, "move_to_ff", lambda *a, **kw: moves.append(kw))
+    answers = iter(["h +5", "ok"])
+    monkeypatch.setattr("builtins.input", lambda _p: next(answers))
+
+    rec = cr._nudge_loop(
+        object(),
+        10.0,
+        20.0,
+        dry_run=False,
+        no_move=False,
+        mount_frame=None,
+        site=build_site(**DOCKWEILER),
+    )
+    assert moves == [], "unsafe nudge must not command the mount"
+    # 'ok' records the (unmoved) encoder.
+    assert rec == (10.0, 20.0)

@@ -1,6 +1,7 @@
 import collections
 import json
 import logging
+import re
 import socket
 import sys
 import threading
@@ -13,7 +14,8 @@ from falcon import testing
 import pytest
 
 import front.app as front_app
-from device.config import Config
+from device import horizon
+from device.config import Config, _Config
 
 
 SIMULATOR_SRC = Path(__file__).resolve().parents[2] / "simulator" / "src"
@@ -159,7 +161,36 @@ def _build_front_test_app():
     # ---- Sun safety ----
     app.add_route("/api/sun_safety/status", front_app.SunSafetyStatusResource())
     app.add_route("/api/sun_safety/dismiss", front_app.SunSafetyDismissResource())
+    app.add_route("/{telescope_id:int}/auth-status", front_app.AuthStatusResource())
+    app.add_route(
+        "/api/{telescope_id:int}/force_stop_goto", front_app.ForceStopGotoResource()
+    )
+    app.add_route("/{telescope_id:int}/horizon", front_app.HorizonResource())
+    app.add_route("/horizon", front_app.HorizonResource())
+    app.add_route("/horizon/sun", front_app.HorizonSunResource())
     return app
+
+
+def test_prefixed_front_pages_render_under_forwarded_prefix(simulator_server):
+    # Prefix-once: a reverse proxy strips nothing and forwards X-Forwarded-Prefix;
+    # every rendered link must carry the prefix exactly once.
+    app = falcon.App(middleware=[front_app.RootPathMiddleware()])
+    for route, resource in (
+        ("/{telescope_id:int}/", front_app.HomeTelescopeResource()),
+        ("/{telescope_id:int}/stats-content", front_app.StatsContentResource()),
+    ):
+        app.add_route(route, resource)
+    client = testing.TestClient(app)
+    headers = {"X-Forwarded-Prefix": "/p"}
+
+    page = client.simulate_get("/1/", headers=headers)
+    assert page.status_code == 200
+    assert "/p/p/" not in page.text
+    assert 'href="/p/1/"' in page.text
+
+    fragment = client.simulate_get("/1/stats-content", headers=headers)
+    assert fragment.status_code in (200, 204)
+    assert "/p/p/" not in fragment.text
 
 
 @pytest.fixture(scope="module")
@@ -428,6 +459,55 @@ def _settings_payload():
     }
 
 
+ALPACA_SERVER_PORT = 32323
+
+
+def _can_connect(host, port, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.2)
+            try:
+                s.connect((host, port))
+                return True
+            except OSError:
+                time.sleep(0.05)
+    return False
+
+
+def _cannot_connect(host, port, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.2)
+            try:
+                s.connect((host, port))
+            except OSError:
+                return True
+            time.sleep(0.05)
+    return False
+
+
+def test_alpaca_server_toggle_opens_and_closes_port(front_sim_bridge):
+    """Toggling alpaca_enable should start/stop a real listener on 32323,
+    mirroring the on-device ASCOM Alpaca REST server introduced in firmware
+    v3.3.1 that seestar_alp's settings page now exposes."""
+    payload = _settings_payload()
+    try:
+        payload["alpaca_enable"] = "true"
+        post = front_sim_bridge["client"].simulate_post("/1/settings", json=payload)
+        assert post.status_code == 200
+        assert _can_connect("127.0.0.1", ALPACA_SERVER_PORT)
+
+        payload["alpaca_enable"] = "false"
+        post = front_sim_bridge["client"].simulate_post("/1/settings", json=payload)
+        assert post.status_code == 200
+        assert _cannot_connect("127.0.0.1", ALPACA_SERVER_PORT)
+    finally:
+        payload["alpaca_enable"] = "false"
+        front_sim_bridge["client"].simulate_post("/1/settings", json=payload)
+
+
 def test_01_simulator_tcp_get_device_state(simulator_server):
     resp = _send_tcp_command(
         simulator_server["host"],
@@ -439,6 +519,9 @@ def test_01_simulator_tcp_get_device_state(simulator_server):
     assert "device" in resp.get("result", {})
 
 
+# set_setting's stack.cont_capt is rejected here on purpose, so the front's
+# fallbacks send the legacy top-level cont_capt keys (kept per AGENTS.md).
+@pytest.mark.allow_nonconforming_requests("set_setting: stack_cont_capt")
 def test_02_set_stack_settings_alias_compatibility(front_sim_bridge):
     front_sim_bridge["set_stack_settings_only"]["enabled"] = True
     payload = _settings_payload()
@@ -709,6 +792,22 @@ def test_06f_live_video_kick_endpoint(front_sim_bridge):
     assert r2.status_code == 204
 
 
+def test_06f2_fork_routes_refuse_federation(front_sim_bridge):
+    """Fork session routes are single-telescope only: telescope_id 0 (the
+    federation, which fans out to every scope) gets a 400 JSON refusal, and
+    the video kick is a 204 no-op."""
+    client = front_sim_bridge["client"]
+    for path in (
+        "/api/0/live_tracker/track",
+        "/api/0/calibration/start",
+    ):
+        r = client.simulate_post(path, json={})
+        assert r.status_code == 400, path
+        assert json.loads(r.text)["error"] == "select a single telescope"
+    r = client.simulate_get("/0/live/video_kick")
+    assert r.status_code == 204
+
+
 def test_06g_netstats_endpoint_returns_sane_json(front_sim_bridge):
     """GET /api/{id}/netstats returns 200 with a sane stats envelope.
 
@@ -768,6 +867,157 @@ def test_06h_stream_quality_endpoint_roundtrip(front_sim_bridge, monkeypatch):
     assert r.status_code == 400
 
 
+def test_06b_planning_page_uses_configured_location(front_sim_bridge, monkeypatch):
+    monkeypatch.setattr(Config, "init_lat", 44.0612)
+    monkeypatch.setattr(Config, "init_long", 0.6504)
+    # A zone without daylight saving time, so the expected offset is fixed.
+    monkeypatch.setattr(Config, "init_timezone", "Asia/Kolkata", raising=False)
+    monkeypatch.setattr(
+        front_app,
+        "get_planning_cards",
+        lambda: [
+            {
+                "card_name": "astro_mosaic",
+                "card_friendly_name": "AstroMosaic",
+                "template": "partials/astro_mosaic.html",
+                "planning_page_enable": True,
+                "planning_page_collapsed": False,
+            }
+        ],
+    )
+    resp = front_sim_bridge["client"].simulate_get("/1/planning")
+    assert resp.status_code == 200
+    assert "location_lat: 44.06," in resp.text
+    assert "location_lng: 0.65," in resp.text
+    assert "-96.72" not in resp.text
+    assert "timezoneOffset: 5.5," in resp.text
+    assert 'id="astro-mosaic-location-unset"' not in resp.text
+
+
+def test_06c_planning_page_warns_when_location_unset(front_sim_bridge, monkeypatch):
+    monkeypatch.setattr(Config, "init_lat", 0)
+    monkeypatch.setattr(Config, "init_long", 0)
+    monkeypatch.setattr(
+        front_app,
+        "get_planning_cards",
+        lambda: [
+            {
+                "card_name": "astro_mosaic",
+                "card_friendly_name": "AstroMosaic",
+                "template": "partials/astro_mosaic.html",
+                "planning_page_enable": True,
+                "planning_page_collapsed": False,
+            }
+        ],
+    )
+    resp = front_sim_bridge["client"].simulate_get("/1/planning")
+    assert resp.status_code == 200
+    assert 'id="astro-mosaic-location-unset"' in resp.text
+    assert "location_lat: 0," in resp.text
+
+
+def test_06c_planning_page_uses_horizon_profile(
+    front_sim_bridge, monkeypatch, tmp_path
+):
+    hrz = tmp_path / "site.hrz"
+    hrz.write_text("# test site\n0 12\n60 24.5\n90 18\n180 15\n270 5.5\n")
+    monkeypatch.setattr(Config, "horizon_file", str(hrz))
+    monkeypatch.setattr(
+        front_app,
+        "get_planning_cards",
+        lambda: [
+            {
+                "card_name": name,
+                "card_friendly_name": name,
+                "template": f"partials/{name}.html",
+                "planning_page_enable": True,
+                "planning_page_collapsed": False,
+            }
+            for name in ("astro_mosaic", "horizon")
+        ],
+    )
+    resp = front_sim_bridge["client"].simulate_get("/1/planning")
+    assert resp.status_code == 200
+
+    limits = json.loads(re.search(r"horizonHard: (\[[^\]]*\]),", resp.text).group(1))
+    assert len(limits) == 72
+    assert limits[12] == 24.5  # 57.5 to 62.5 degrees holds the 60-degree point
+    # 267.5 to 272.5 degrees: highest at 267.5, on the slope down from 180.
+    assert limits[54] == pytest.approx(5.76, abs=0.01)
+    assert 'id="horizon-profile"' in resp.text
+    assert "5 points" in resp.text
+
+
+def test_06d_horizon_page_profile_reaches_the_planner(
+    front_sim_bridge, monkeypatch, tmp_path
+):
+    # A config of its own, so the saved profile lands in tmp_path.
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[seestar_initialization]\nlat = 44.06\nlong = 0.65\nhorizon_file = ""\n'
+    )
+    config = _Config.__new__(_Config)
+    config.path_to_dat = str(path)
+    config.load_toml()
+    monkeypatch.setattr(horizon, "Config", config)
+    monkeypatch.setattr(
+        front_app,
+        "get_planning_cards",
+        lambda: [
+            {
+                "card_name": name,
+                "card_friendly_name": name,
+                "template": f"partials/{name}.html",
+                "planning_page_enable": True,
+                "planning_page_collapsed": False,
+            }
+            for name in ("astro_mosaic", "horizon")
+        ],
+    )
+    client = front_sim_bridge["client"]
+
+    page = client.simulate_get("/1/horizon")
+    assert page.status_code == 200
+    assert 'type="file" id="hz-photo"' in page.text
+    assert 'href="/1/horizon">Horizon (MMhorizon)</a>' in page.text
+
+    sun = client.simulate_get(
+        "/horizon/sun",
+        params={"when": "2026-10-23T13:59:04Z", "lat": "44.06", "lon": "0.65"},
+    )
+    assert sun.status_code == 200
+    assert sun.json["azimuth"] == pytest.approx(218.0, abs=0.1)
+    # A photo time without UTC offset: read in the site's time zone.
+    monkeypatch.setattr(
+        front_app.Config, "init_timezone", "Europe/Paris", raising=False
+    )
+    local = client.simulate_get(
+        "/horizon/sun",
+        params={"when": "2026-10-23T15:59:04", "lat": "44.06", "lon": "0.65"},
+    )
+    assert local.status_code == 200
+    assert local.json["time_zone"] == "Europe/Paris"
+    assert local.json["azimuth"] == sun.json["azimuth"]
+
+    # What the page posts once the panorama is measured.
+    saved = client.simulate_post(
+        "/horizon", json={"hrz": "0 12\n60 24.5\n90 18\n180 15\n270 5.5\n"}
+    )
+    assert saved.status_code == 200
+    assert saved.json["points"] == 5
+    assert config.horizon_file == str(tmp_path / "horizon.hrz")
+
+    # The planner uses it at once, without a restart.
+    resp = client.simulate_get("/1/planning")
+    assert resp.status_code == 200
+    limits = json.loads(re.search(r"horizonHard: (\[[^\]]*\]),", resp.text).group(1))
+    assert limits[12] == 24.5
+    assert "5 points" in resp.text
+    assert 'href="/1/horizon">Make the horizon from a 360&deg; panorama</a>' in (
+        resp.text
+    )
+
+
 def test_07_schedule_lifecycle(front_sim_bridge):
     client = front_sim_bridge["client"]
     get_page = client.simulate_get("/1/schedule")
@@ -801,6 +1051,9 @@ def test_09_wrapped_value_shape_compat(front_sim_bridge):
     front_sim_bridge["wrapped_method_sync"]["enabled"] = False
 
 
+# set_setting's stack.cont_capt is rejected here on purpose, so the front's
+# fallbacks send the legacy top-level cont_capt keys (kept per AGENTS.md).
+@pytest.mark.allow_nonconforming_requests("set_setting: stack_cont_capt")
 def test_10_error_path_fallback_succeeds(front_sim_bridge):
     front_sim_bridge["forced_stack_set_error"]["enabled"] = True
     client = front_sim_bridge["client"]
@@ -890,6 +1143,9 @@ def test_16_fault_injection_eventstatus_none(front_sim_bridge):
     front_sim_bridge["inject_eventstatus_none"]["enabled"] = False
 
 
+# set_setting's stack.cont_capt is rejected here on purpose, so the front's
+# fallbacks send the legacy top-level cont_capt keys (kept per AGENTS.md).
+@pytest.mark.allow_nonconforming_requests("set_setting: stack_cont_capt")
 @pytest.mark.parametrize(
     "wrapped,set_stack_settings_only",
     [
@@ -1038,6 +1294,11 @@ def two_device_federation(monkeypatch, two_simulator_servers):
     port2 = two_simulator_servers["sim2"]["tcp_port"]
     logger = logging.getLogger("federation-fixture")
     set_shr_logger(logger)
+
+    # Isolate from the developer's local config.toml: if interop_pem is set
+    # there, reconnect() would attempt the auth handshake against the
+    # simulator, which does not implement it, and the devices never connect.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
 
     # Clean slate for the telescope module's global device registry
     tel_module.seestar_dev.clear()
@@ -1253,3 +1514,491 @@ def test_28_threaded_server_sse_does_not_block_other_requests():
         httpd.shutdown()
         httpd.server_close()
         server_thread.join(timeout=3)
+
+
+def test_40_framed_mosaic_federation_by_time_reaches_both_devices(
+    two_device_federation,
+):
+    """A federated by_time start_framed_mosaic splits panel_time_sec across both devices."""
+    alpaca_action = two_device_federation["alpaca_action"]
+    dev1 = two_device_federation["dev1"]
+    dev2 = two_device_federation["dev2"]
+
+    resp = alpaca_action(
+        0,
+        "start_framed_mosaic",
+        {
+            "target_name": "M31",
+            "ra": 0.7,
+            "dec": 41.27,
+            "is_j2000": True,
+            "is_use_lp_filter": False,
+            "federation_mode": "by_time",
+            "panel_time_sec": 20,
+            "mosaic_scale": 1.5,
+            "mosaic_angle": 45.0,
+            "gain": 80,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json["ErrorNumber"] == 0
+
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if dev1.schedule["list"] and dev2.schedule["list"]:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail(
+            "Timed out waiting for the framed mosaic item to reach both devices"
+        )
+
+    assert dev1.schedule["list"][0]["action"] == "start_framed_mosaic"
+    assert dev1.schedule["list"][0]["params"]["panel_time_sec"] == 10
+    assert dev2.schedule["list"][0]["action"] == "start_framed_mosaic"
+    assert dev2.schedule["list"][0]["params"]["panel_time_sec"] == 10
+
+    # add_schedule_item populates schedule["list"] synchronously, before the
+    # background scheduler_thread_fn thread flips schedule["state"] to
+    # "working". stop_scheduler is a silent no-op unless state == "working",
+    # so wait for that state on both devices before stopping -- otherwise the
+    # real background thread would race ahead and run the framed mosaic item
+    # to completion against the real simulator, unseen by this test.
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if dev1.schedule["state"] == "working" and dev2.schedule["state"] == "working":
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("Timed out waiting for both devices' schedulers to start working")
+
+    # Don't wait out the full stacking duration on both real devices — stop
+    # both schedulers now that the routing/splitting behavior is confirmed.
+    stop1 = dev1.stop_scheduler({})
+    stop2 = dev2.stop_scheduler({})
+    assert stop1["code"] == 0, f"dev1 stop_scheduler did not succeed: {stop1}"
+    assert stop2["code"] == 0, f"dev2 stop_scheduler did not succeed: {stop2}"
+
+    # Confirm the stop actually took effect rather than silently no-op'ing --
+    # if it had, the scheduler would still show "working" and a real capture
+    # would keep running against the simulator after this test returns.
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if dev1.schedule["state"] != "working" and dev2.schedule["state"] != "working":
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("Timed out waiting for both devices' schedulers to stop")
+
+    assert dev1.schedule["state"] == "stopped"
+    assert dev2.schedule["state"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Tests 28-35: Stack type and wide angle camera (added with firmware 3.2.0)
+# ---------------------------------------------------------------------------
+
+
+def test_28_simulator_handles_set_stack_type(simulator_server):
+    """Simulator accepts set_stack_type and persists the value in state."""
+    host = simulator_server["host"]
+    port = simulator_server["tcp_port"]
+
+    for stack_type in ("SolarSystem", "MilkyWay", "DeepSky"):
+        _send_tcp_command(
+            host,
+            port,
+            {"id": 2800, "method": "set_stack_type", "params": {"type": stack_type}},
+        )
+        state = _send_tcp_command(
+            host, port, {"id": 2801, "method": "get_device_state"}
+        )
+        assert state["result"]["stack_type"] == stack_type, (
+            f"Expected stack_type={stack_type!r} in device state"
+        )
+
+
+def test_38_simulator_mosaic_setting_round_trips(simulator_server):
+    """set_setting with a mosaic sub-object updates get_setting's response."""
+    host = simulator_server["host"]
+    port = simulator_server["tcp_port"]
+
+    _send_tcp_command(
+        host,
+        port,
+        {
+            "id": 3100,
+            "method": "set_setting",
+            "params": {"mosaic": {"scale": 1.5, "angle": 45.0}},
+        },
+    )
+    state = _send_tcp_command(host, port, {"id": 3101, "method": "get_setting"})
+    assert state["result"]["mosaic"]["scale"] == 1.5
+    assert state["result"]["mosaic"]["angle"] == 45.0
+
+    _send_tcp_command(
+        host,
+        port,
+        {
+            "id": 3102,
+            "method": "set_setting",
+            "params": {"mosaic": {"scale": 1.0, "angle": 0.0}},
+        },
+    )
+    reset_state = _send_tcp_command(host, port, {"id": 3103, "method": "get_setting"})
+    assert reset_state["result"]["mosaic"]["scale"] == 1.0
+    assert reset_state["result"]["mosaic"]["angle"] == 0.0
+
+
+def test_29_stack_type_in_image_form_reaches_device_layer(
+    monkeypatch, front_sim_bridge
+):
+    """stackType from an image POST is included in the start_mosaic payload."""
+    captured = {}
+
+    # Extend the bridge to capture start_mosaic params
+    original_action = front_app.do_action_device
+
+    def capturing_do_action(action, dev_num, params, is_schedule=False):
+        if action == "start_mosaic":
+            captured["start_mosaic_params"] = params
+            return {"ErrorNumber": 0, "Value": {}}
+        return original_action(action, dev_num, params, is_schedule)
+
+    monkeypatch.setattr(front_app, "do_action_device", capturing_do_action)
+
+    # Add the image route to the test app so we can POST to it
+    app = falcon.App()
+    app.add_route("/{telescope_id:int}/image", front_app.ImageResource())
+    client = testing.TestClient(app)
+
+    form = {
+        "targetName": "Mars",
+        "ra": "1.5",
+        "dec": "10.0",
+        "panelTime": "600",
+        "gain": "80",
+        "num_tries": "1",
+        "retry_wait_s": "300",
+        "stackType": "SolarSystem",
+    }
+    resp = client.simulate_post("/1/image", json=form)
+    assert resp.status_code == 200
+    assert captured.get("start_mosaic_params", {}).get("stack_type") == "SolarSystem"
+
+
+def test_39_framed_mosaic_form_reaches_device_layer(monkeypatch, front_sim_bridge):
+    """A Framed Mosaic form POST reaches the device layer as start_framed_mosaic."""
+    captured = {}
+    original_action = front_app.do_action_device
+
+    def capturing_do_action(action, dev_num, params, is_schedule=False):
+        if action == "start_framed_mosaic":
+            captured["params"] = params
+            return {"ErrorNumber": 0, "Value": {}}
+        return original_action(action, dev_num, params, is_schedule)
+
+    monkeypatch.setattr(front_app, "do_action_device", capturing_do_action)
+
+    app = falcon.App()
+    app.add_route("/{telescope_id:int}/framed_mosaic", front_app.FramedMosaicResource())
+    client = testing.TestClient(app)
+
+    form = {
+        "targetName": "M31",
+        "ra": "0.7",
+        "dec": "41.27",
+        "mosaicScale": "1.5",
+        "mosaicAngle": "45",
+        "panelTime": "3600",
+        "gain": "80",
+        "num_tries": "1",
+        "retry_wait_s": "300",
+    }
+    resp = client.simulate_post("/1/framed_mosaic", json=form)
+    assert resp.status_code == 200
+    assert captured["params"]["mosaic_scale"] == 1.5
+    assert captured["params"]["mosaic_angle"] == 45.0
+    assert captured["params"]["target_name"] == "M31"
+
+
+def test_30_invalid_stack_type_normalised_to_deepsky_before_device(
+    monkeypatch, front_sim_bridge
+):
+    """A bogus stackType value must be normalised to DeepSky before reaching the device."""
+    captured = {}
+    original_action = front_app.do_action_device
+
+    def capturing_do_action(action, dev_num, params, is_schedule=False):
+        if action == "start_mosaic":
+            captured["stack_type"] = params.get("stack_type")
+            return {"ErrorNumber": 0, "Value": {}}
+        return original_action(action, dev_num, params, is_schedule)
+
+    monkeypatch.setattr(front_app, "do_action_device", capturing_do_action)
+
+    app = falcon.App()
+    app.add_route("/{telescope_id:int}/image", front_app.ImageResource())
+    client = testing.TestClient(app)
+
+    form = {
+        "targetName": "Test",
+        "ra": "1.5",
+        "dec": "10.0",
+        "panelTime": "600",
+        "gain": "80",
+        "num_tries": "1",
+        "retry_wait_s": "300",
+        "stackType": "HACK_INJECTION; rm -rf /",
+    }
+    resp = client.simulate_post("/1/image", json=form)
+    assert resp.status_code == 200
+    assert captured.get("stack_type") == "DeepSky"
+
+
+def test_31_set_stack_type_tcp_round_trip_all_types(simulator_server):
+    """All three valid stack types survive a TCP round-trip through the simulator."""
+    host = simulator_server["host"]
+    port = simulator_server["tcp_port"]
+
+    for stack_type in ("DeepSky", "SolarSystem", "MilkyWay"):
+        set_resp = _send_tcp_command(
+            host,
+            port,
+            {"id": 3100, "method": "set_stack_type", "params": {"type": stack_type}},
+        )
+        assert set_resp.get("result") == 0, f"set_stack_type failed for {stack_type}"
+
+        state_resp = _send_tcp_command(
+            host, port, {"id": 3101, "method": "get_device_state"}
+        )
+        assert state_resp["result"]["stack_type"] == stack_type
+
+
+def test_32_wide_cam_settings_shown_for_s30_model(monkeypatch, front_sim_bridge):
+    """GET /settings for an S30 device (experimental on) renders wide cam fields."""
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    # Config.experimental is already True from the bridge fixture
+
+    resp = front_sim_bridge["client"].simulate_get("/1/settings")
+    assert resp.status_code == 200
+    assert "Wide Angle Camera" in resp.text
+    assert "Wide Camera 4K Mode" in resp.text
+    assert "Wide Camera Denoise" in resp.text
+    assert "Wide Camera Focal Position" in resp.text
+
+
+def test_33_wide_cam_settings_absent_for_s50_model(monkeypatch, front_sim_bridge):
+    """GET /settings for an S50 device must NOT include wide cam fields."""
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S50")
+
+    resp = front_sim_bridge["client"].simulate_get("/1/settings")
+    assert resp.status_code == 200
+    assert "Wide Angle Camera" not in resp.text
+    assert "Wide Camera 4K Mode" not in resp.text
+
+
+def test_34_wide_cam_settings_absent_when_experimental_off(
+    monkeypatch, front_sim_bridge
+):
+    """Even for S30, wide cam settings must not render when experimental is disabled."""
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+    monkeypatch.setattr(Config, "experimental", False)
+
+    resp = front_sim_bridge["client"].simulate_get("/1/settings")
+    assert resp.status_code == 200
+    assert "Wide Angle Camera" not in resp.text
+
+
+def test_35_wide_cam_settings_round_trip_via_simulator(monkeypatch, front_sim_bridge):
+    """POST wide cam settings for S30 → verify the simulator received them."""
+    monkeypatch.setattr(front_app, "get_device_model", lambda _tid: "Seestar S30")
+
+    payload = {
+        **_settings_payload(),
+        "wide_cam": "true",
+        "wide_4k": "false",
+        "wide_denoise": "true",
+        "wide_focal_pos": "1600",
+    }
+
+    post_resp = front_sim_bridge["client"].simulate_post("/1/settings", json=payload)
+    assert post_resp.status_code == 200
+    assert "Successfully Updated Settings." in post_resp.text
+
+    # Confirm the simulator absorbed the wide cam values via get_setting
+    state = _send_tcp_command(
+        front_sim_bridge["host"],
+        front_sim_bridge["tcp_port"],
+        {"id": 3500, "method": "get_setting"},
+    )
+    setting = state.get("result", {})
+    assert setting.get("wide_cam") is True
+    assert setting.get("wide_4k") is False
+    assert setting.get("wide_focal_pos") == 1600
+    # wide_denoise is a stack member; at the top level the firmware answers
+    # 109 and skips the rest of the request (seestar-spec, READ).
+    assert "wide_denoise" not in setting
+    assert setting.get("stack", {}).get("wide_denoise") is True
+
+
+def test_36_force_stop_goto_unwedges_device(two_device_federation):
+    """A wedged AutoGoto state on a real device (connected to the simulator)
+    is force-cleared by the force_stop_goto ALPACA action, and the firmware
+    stop round-trips through the simulator."""
+    dev1 = two_device_federation["dev1"]
+    dev1.event_state["AutoGoto"] = {"state": "working"}
+    dev1.event_state["PlateSolve"] = {"state": "fail"}
+    assert dev1.is_goto() is True
+
+    resp = two_device_federation["alpaca_action"](1, "force_stop_goto", {})
+
+    assert resp.status_code == 200
+    value = resp.json["Value"]
+    assert value["ok"] is True
+    assert value["stop_slew_result"] is not None
+    assert dev1.is_goto() is False
+    assert dev1.event_state["AutoGoto"]["state"] == "stopped"
+    assert dev1.event_state["PlateSolve"]["state"] == "stopped"
+
+
+def test_37_force_stop_goto_front_endpoint(two_device_federation):
+    """The front /api/{id}/force_stop_goto endpoint clears a wedged goto end
+    to end (front → device layer → simulator) and serves both JSON and HTMX
+    fragment responses."""
+    dev1 = two_device_federation["dev1"]
+    front_client = two_device_federation["front_client"]
+
+    dev1.event_state["AutoGoto"] = {"state": "working"}
+    resp = front_client.simulate_post("/api/1/force_stop_goto")
+    assert resp.status_code == 200
+    assert resp.json["Value"]["ok"] is True
+    assert dev1.is_goto() is False
+
+    # HTMX variant returns a status fragment for the goto page.
+    dev1.event_state["AutoGoto"] = {"state": "working"}
+    resp = front_client.simulate_post(
+        "/api/1/force_stop_goto", headers={"HX-Request": "true"}
+    )
+    assert resp.status_code == 200
+    assert "Cleared. Mount free." in resp.text
+    assert dev1.is_goto() is False
+
+
+def test_41_auto_af_shown_in_settings(monkeypatch, front_sim_bridge):
+    """GET /settings renders the Automatic Autofocus field once the simulator
+    reports auto_af (a real key, confirmed present/settable since firmware
+    2732 (v3.1.2) against the live QEMU emulator running real firmware)."""
+    _send_tcp_command(
+        front_sim_bridge["host"],
+        front_sim_bridge["tcp_port"],
+        {"id": 3601, "method": "set_setting", "params": {"auto_af": True}},
+    )
+
+    resp = front_sim_bridge["client"].simulate_get("/1/settings")
+    assert resp.status_code == 200
+    assert "Automatic Autofocus" in resp.text
+
+
+def test_42_auto_af_round_trip_via_simulator(front_sim_bridge):
+    """POST auto_af → verify the simulator received it via get_setting."""
+    payload = {**_settings_payload(), "auto_af": "true"}
+
+    post_resp = front_sim_bridge["client"].simulate_post("/1/settings", json=payload)
+    assert post_resp.status_code == 200
+    assert "Successfully Updated Settings." in post_resp.text
+
+    state = _send_tcp_command(
+        front_sim_bridge["host"],
+        front_sim_bridge["tcp_port"],
+        {"id": 3600, "method": "get_setting"},
+    )
+    setting = state.get("result", {})
+    assert setting.get("auto_af") is True
+
+
+# Sends the double-nested params the firmware rejects, on purpose.
+@pytest.mark.allow_nonconforming_requests(
+    "scope_goto: params[", "scope_sync: params[", "pi_set_time: params["
+)
+def test_43_scope_goto_and_pi_set_time_reject_double_nested_params(simulator_server):
+    """Regression test for issues #748/#758. Decompiled firmware confirms
+    scope_goto/scope_sync's Params::Params and pi_set_time's json_array2obj
+    accept EITHER a keyed object OR a plain positional list/single-element
+    list-wrap -- what real firmware actually rejects is the DOUBLE nesting
+    that transform_message_for_verify used to produce when injecting the
+    auth "verify" flag into list params: [[ra, dec], "verify"] instead of
+    [ra, dec, "verify"], and [[date_json], "verify"] instead of
+    [date_json, "verify"]. The simulator mirrors that real contract so a
+    regression back to the double-nesting bug is caught by CI."""
+    host = simulator_server["host"]
+    port = simulator_server["tcp_port"]
+
+    # Both real shapes succeed for scope_goto: keyed object (what ALP sends
+    # today) and a plain positional list (what older/no-verify-injection
+    # callers, e.g. the CLI, still send).
+    good_goto_obj = _send_tcp_command(
+        host,
+        port,
+        {"id": 200, "method": "scope_goto", "params": {"ra": 1.0, "dec": 2.0}},
+    )
+    assert "error" not in good_goto_obj
+
+    good_goto_list = _send_tcp_command(
+        host, port, {"id": 201, "method": "scope_goto", "params": [1.0, 2.0]}
+    )
+    assert "error" not in good_goto_list
+
+    good_goto_list_with_verify = _send_tcp_command(
+        host, port, {"id": 202, "method": "scope_goto", "params": [1.0, 2.0, "verify"]}
+    )
+    assert "error" not in good_goto_list_with_verify
+
+    # The double-nested shape (the actual pre-fix bug) is rejected.
+    bad_goto = _send_tcp_command(
+        host,
+        port,
+        {"id": 203, "method": "scope_goto", "params": [[1.0, 2.0], "verify"]},
+    )
+    assert bad_goto.get("code") == 108
+    assert "error" in bad_goto
+
+    good_sync_obj = _send_tcp_command(
+        host,
+        port,
+        {"id": 204, "method": "scope_sync", "params": {"ra": 1.0, "dec": 2.0}},
+    )
+    assert "error" not in good_sync_obj
+
+    bad_sync = _send_tcp_command(
+        host,
+        port,
+        {"id": 205, "method": "scope_sync", "params": [[1.0, 2.0], "verify"]},
+    )
+    assert bad_sync.get("code") == 108
+
+    good_time_obj = _send_tcp_command(
+        host,
+        port,
+        {"id": 206, "method": "pi_set_time", "params": {"year": 2026, "mon": 1}},
+    )
+    assert "error" not in good_time_obj
+
+    good_time_list = _send_tcp_command(
+        host,
+        port,
+        {"id": 207, "method": "pi_set_time", "params": [{"year": 2026, "mon": 1}]},
+    )
+    assert "error" not in good_time_list
+
+    bad_time = _send_tcp_command(
+        host,
+        port,
+        {
+            "id": 208,
+            "method": "pi_set_time",
+            "params": [[{"year": 2026, "mon": 1}], "verify"],
+        },
+    )
+    assert bad_time.get("code") == 107
+    assert "error" in bad_time

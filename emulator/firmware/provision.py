@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""CI firmware acquisition: download (or reuse a cached) APKPure XAPK for a
+pinned version, extract iscope, and dpkg -x the .deb packages into the
+deb/out tree emulator/run.sh expects.
+
+Adapted from seestar-api-research/scripts/install_firmware.py's
+download_version() — trimmed to just the non-interactive download path
+(no interactive version picker, no real-device upload; those are irrelevant
+to CI provisioning).
+
+Fetches from api.pureapk.com — the backend API APKPure's own Android app
+talks to — rather than the consumer website (d.apkpure.com/apkpure.com).
+The website is fronted by a Cloudflare bot challenge that blocks GitHub
+Actions runners outright (confirmed via a live CI run: "cf-mitigated:
+challenge", a "Just a moment..." interstitial). The same challenge also
+blocks other Cloudflare-fronted mirrors (apkcombo.com), so it isn't
+APKPure-specific — it's Cloudflare flagging GitHub Actions' well-known IP
+ranges. api.pureapk.com is not behind that challenge (verified via a live
+CI run: clean HTTP 200s all the way through a real XAPK download). This
+mirrors the approach used by EFForg's `apkeep` tool (github.com/EFForg/apkeep),
+including its header set and its regex-based extraction of a version's
+download URL from the API's binary (protobuf-ish) response body.
+"""
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+import requests
+import yaml
+
+from emulator.firmware.apk_utils import NoMatchingSplitError
+from emulator.firmware.extract_iscope import extract_iscope_from_apk
+from emulator.firmware.extract_pem import extract_interop_pem
+
+SEESTAR_PACKAGE = "com.zwo.seestar"
+
+PUREAPK_APP_VERSION_URL = "https://api.pureapk.com/m/v3/cms/app_version"
+# Headers mimicking APKPure's own Android app (x-cv/x-sv = client/SDK
+# version, x-abis = supported ABIs, x-gp = "has Google Play" flag) — this is
+# what api.pureapk.com expects from legitimate app traffic.
+PUREAPK_HEADERS = {
+    "x-cv": "3172501",
+    "x-sv": "29",
+    "x-abis": "arm64-v8a,armeabi-v7a,armeabi,x86,x86_64",
+    "x-gp": "1",
+}
+# Matches an "(X?APKJ)" file-type marker followed by 2 bytes then a URL.
+_DOWNLOAD_URL_RE = (
+    rb"(X?APKJ)..(https?://(?:www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}"
+    rb"\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_+.~#?&//=]*))"
+)
+
+
+def _extract_download_url(body: bytes, version: str) -> str:
+    """Find the download URL for `version` in an app_version API response.
+
+    The response body mixes protobuf binary framing with embedded UTF-8
+    strings (version numbers, URLs). This searches for the literal version
+    string (preceded by a non-digit byte, so e.g. "3.0.0" doesn't match
+    inside "23.0.0") followed by ":" and, somewhere after it, that version's
+    download URL.
+    """
+    pattern = re.compile(
+        rb"[^0-9]" + re.escape(version.encode()) + rb":(?s:.)+?" + _DOWNLOAD_URL_RE
+    )
+    match = pattern.search(body)
+    if not match:
+        raise RuntimeError(
+            f"Could not find a download URL for version {version} in the app_version API response"
+        )
+    return match.group(2).decode()
+
+
+def _fetch_xapk_bytes(version: str) -> bytes:
+    """Download the XAPK bytes for a given human-readable version string."""
+    response = requests.get(
+        PUREAPK_APP_VERSION_URL,
+        params={"hl": "en-US", "package_name": SEESTAR_PACKAGE},
+        headers=PUREAPK_HEADERS,
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not query app_version for {SEESTAR_PACKAGE} (HTTP {response.status_code})"
+        )
+    download_url = _extract_download_url(response.content, version)
+
+    file_response = requests.get(download_url, timeout=120)
+    if file_response.status_code != 200:
+        raise RuntimeError(
+            f"Could not download version={version} from {download_url} (HTTP {file_response.status_code})"
+        )
+    return file_response.content
+
+
+def download_xapk(version: str, dest_dir: Path) -> Path:
+    """Return the path to the version's XAPK, downloading only on a cache miss."""
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / f"firmware-{version}.xapk"
+    if dest_path.exists():
+        print(f"  Using cached XAPK: {dest_path}")
+        return dest_path
+    print(f"  Downloading firmware v{version}...")
+    data = _fetch_xapk_bytes(version)
+    dest_path.write_bytes(data)
+    return dest_path
+
+
+def _unpack_debs(deb_dir: Path, out_dir: Path) -> None:
+    """dpkg -x whatever .deb files are present into out_dir.
+
+    Firmware ~3.3.1+ ships the `asiair` app pre-exploded under
+    `iscope/deb-build/asiair_armhf/` (rsync-installed on real hardware, not
+    dpkg-installed) instead of as a .deb, so `deb_dir` may contain zero,
+    some, or all of the packages a given version needs — see
+    `_merge_deb_build`, which layers that tree on top of whatever this
+    function produces.
+    """
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
+    debs = sorted(deb_dir.glob("*.deb"))
+    if not debs:
+        print(
+            f"  No .deb files in {deb_dir} (newer packaging — asiair ships pre-exploded)"
+        )
+        return
+    if shutil.which("dpkg") is None:
+        raise RuntimeError(
+            "'dpkg' not found on PATH — required to unpack firmware .deb files"
+        )
+    failed: list[str] = []
+    for deb in debs:
+        result = subprocess.run(["dpkg", "-x", str(deb), str(out_dir)])
+        if result.returncode != 0:
+            print(
+                f"  Warning: dpkg failed for {deb.name} (exit {result.returncode})",
+                file=sys.stderr,
+            )
+            failed.append(deb.name)
+    if failed:
+        raise RuntimeError(
+            f"dpkg -x failed for {len(failed)} package(s), unpacked tree at "
+            f"{out_dir} is incomplete: {', '.join(failed)}"
+        )
+
+
+def _ensure_deb_build_dir(iscope_dir: Path) -> None:
+    """Extract iscope/deb-build.tar.bz2 to iscope/deb-build/ if only the tarball shipped.
+
+    Firmware 3.3.2 ships the pre-exploded app tree compressed, where 3.3.1
+    shipped it as a plain directory. Same contents either way, so unpack it
+    up front and let everything downstream keep reading deb-build/.
+    """
+    deb_build_dir = iscope_dir / "deb-build"
+    tarball = iscope_dir / "deb-build.tar.bz2"
+    if deb_build_dir.is_dir() or not tarball.is_file():
+        return
+    print(f"  extracting {tarball.name} -> {iscope_dir}/")
+    with tarfile.open(tarball, "r:bz2") as tar:
+        # "tar" filter: refuses absolute paths and .. escapes but keeps the
+        # symlinks the app tree legitimately contains.
+        tar.extractall(iscope_dir, filter="tar")
+
+
+def _merge_deb_build(iscope_dir: Path, out_dir: Path) -> None:
+    """Merge iscope/deb-build/{sysfiles,asiair_armhf} onto out_dir, if present.
+
+    Mirrors what the firmware's own update_package.sh does on real hardware
+    via update_asiair()'s rsync calls, but into the local staging tree
+    instead of onto a live device's `/`.
+    """
+    deb_build_dir = iscope_dir / "deb-build"
+    if not deb_build_dir.is_dir():
+        return
+    for sub in ("sysfiles", "asiair_armhf"):
+        src = deb_build_dir / sub
+        if src.is_dir():
+            print(f"  merging deb-build/{sub}/ -> {out_dir}/")
+            shutil.copytree(src, out_dir, dirs_exist_ok=True, symlinks=True)
+
+
+def _load_delta_base() -> dict[str, str]:
+    """Load the delta_base map from versions.yaml (empty if absent)."""
+    versions_path = Path(__file__).parent / "versions.yaml"
+    doc = yaml.safe_load(versions_path.read_text())
+    return doc.get("delta_base") or {}
+
+
+def _overlay_tree(src: Path, dst: Path) -> None:
+    """Copy every file under src onto dst, overwriting matches in dst.
+
+    Files that exist in dst but not in src are left untouched -- this is an
+    overlay, not a mirror.
+    """
+    for item in src.rglob("*"):
+        if item.is_dir():
+            continue
+        target = dst / item.relative_to(src)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, target)
+
+
+# The XAPK carries two firmware builds: assets/iscope (32-bit armhf: S30/S50)
+# and, from 3.3.0 on, assets/iscope_64 (aarch64: S30 Pro/S50 Pro/S30 Plus/S80).
+VARIANTS = ("iscope", "iscope_64")
+
+
+def variant_dir_name(version: str, variant: str) -> str:
+    """Directory (under work_dir) holding `version`'s `variant` tree.
+
+    The 32-bit tree keeps the plain version name so existing callers and the
+    CI cache keys are unchanged; the 64-bit tree gets a "-64" suffix so the two
+    can coexist without one overwriting the other.
+    """
+    return version if variant == "iscope" else f"{version}-64"
+
+
+def provision_firmware(
+    version: str,
+    work_dir: Path,
+    delta_base: dict[str, str] | None = None,
+    variant: str = "iscope",
+) -> Path:
+    """Ensure firmware `version` is downloaded and extracted under work_dir.
+
+    Also extracts the firmware's interop private key (see extract_pem.py)
+    from the same XAPK, writing it to <work_dir>/<version>/interop.pem —
+    firmware 7.18+ requires interop authentication and the emulator is no
+    exception, but older firmware (pre-7.18) doesn't ship libopenssllib.so
+    at all, so no key exists to extract. tests/system's --pem option should
+    point at that file; device/seestar_device.py already treats a missing
+    file at that path as "no interop auth needed" (self-healing), so it's
+    fine for interop.pem to simply not exist for those versions.
+
+    Firmware ~3.3.1+ drops the asiair .deb entirely: iscope/deb/ has no
+    asiair .deb, and asiair instead ships pre-exploded under
+    iscope/deb-build/asiair_armhf/ (rsync-installed on real hardware via
+    update_package.sh's update_asiair(), not dpkg-installed). Verified this
+    is a *complete* app tree, not a partial delta -- 3.3.1's tree has the
+    same file count and identical lib/ contents as 3.3.0's full .deb --
+    so provisioning just merges deb-build/ onto whatever dpkg -x produced
+    (see `_merge_deb_build`), unconditionally, no base version needed.
+
+    `delta_base` exists for the separate, currently-hypothetical case of a
+    firmware release that ships a genuinely *partial* deb-build/ overlay
+    (only the files that changed, not a full tree). None of today's pinned
+    versions need it -- versions.yaml's delta_base map is empty -- but the
+    mechanism stays: if `version` is declared in the map, its base version
+    is provisioned first and its home/pi/ASIAIR tree is overlaid with the
+    delta's own overlay to produce a complete tree.
+
+    `variant="iscope_64"` provisions the aarch64 build instead.  That tree has
+    no .debs at all, only deb-build/{sysfiles,asiair_armhf}, which is merged
+    onto an empty out/ exactly like the 3.3.1+ 32-bit case.  It lands in
+    <work_dir>/<version>-64/iscope_64/deb/out so it never collides with the
+    32-bit tree.
+
+    Returns the path to <work_dir>/<version>/iscope/deb/out (or
+    <work_dir>/<version>-64/iscope_64/deb/out for the 64-bit variant),
+    matching what emulator/run.sh's FW_BASE expects.
+    """
+    if variant not in VARIANTS:
+        raise ValueError(f"unknown variant {variant!r}; expected one of {VARIANTS}")
+    if delta_base is None:
+        delta_base = _load_delta_base()
+
+    work_dir = Path(work_dir)
+    version_dir = work_dir / variant_dir_name(version, variant)
+    version_dir.mkdir(parents=True, exist_ok=True)
+
+    # delta_base describes 32-bit releases only; the 64-bit tree is always complete.
+    base_version = delta_base.get(version) if variant == "iscope" else None
+    base_out_dir = None
+    if base_version:
+        print(
+            f"  {version} is a delta release of {base_version} -- provisioning base first"
+        )
+        base_out_dir = provision_firmware(
+            version=base_version, work_dir=work_dir, delta_base=delta_base
+        )
+
+    xapk_path = download_xapk(version=version, dest_dir=work_dir / "_xapk_cache")
+    try:
+        extract_interop_pem(str(xapk_path), str(version_dir / "interop.pem"))
+    except NoMatchingSplitError:
+        print(
+            f"  No libopenssllib.so in firmware {version} -- assuming pre-7.18 "
+            f"(no interop auth), skipping PEM extraction"
+        )
+    iscope_dir = extract_iscope_from_apk(
+        str(xapk_path), str(version_dir), variant=variant
+    )
+
+    _ensure_deb_build_dir(iscope_dir)
+
+    deb_dir = iscope_dir / "deb"
+    out_dir = deb_dir / "out"
+    _unpack_debs(deb_dir, out_dir)
+
+    if base_out_dir is not None:
+        # Declared delta: base + delta's own (assumed-partial) overlay only.
+        delta_asiair_home = iscope_dir / "deb-build" / "asiair_armhf" / "home"
+        if not delta_asiair_home.exists():
+            raise RuntimeError(
+                f"{version} is declared as a delta of {base_version} in "
+                f"delta_base, but its XAPK has no "
+                f"iscope/deb-build/asiair_armhf/home overlay"
+            )
+        _overlay_tree(base_out_dir / "home", out_dir / "home")
+        _overlay_tree(delta_asiair_home, out_dir / "home")
+    else:
+        # Not a declared delta: deb-build/, if present, is a complete tree
+        # standing in for a missing/partial .deb -- merge it in full.
+        _merge_deb_build(iscope_dir, out_dir)
+
+    return out_dir
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Provision emulator firmware for CI")
+    parser.add_argument("--version", required=True, help='e.g. "3.1.2"')
+    parser.add_argument(
+        "--work-dir", required=True, help="Directory to download/extract into"
+    )
+    parser.add_argument(
+        "--variant",
+        choices=VARIANTS,
+        default="iscope",
+        help="iscope = 32-bit armhf (S30/S50, default); "
+        "iscope_64 = aarch64 (S30 Pro/S50 Pro/S30 Plus/S80)",
+    )
+    args = parser.parse_args()
+    deb_out = provision_firmware(
+        version=args.version, work_dir=Path(args.work_dir), variant=args.variant
+    )
+    print(deb_out)
+
+
+if __name__ == "__main__":
+    main()

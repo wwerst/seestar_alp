@@ -1,5 +1,9 @@
 import collections
+import json
 import socket
+import struct
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +27,18 @@ class DummyLogger:
 
     def error(self, *args, **kwargs):
         return None
+
+
+@pytest.fixture(autouse=True)
+def _pin_site_unset(monkeypatch):
+    """Pin the observer site to the unset 0/0 pair for every test here.
+
+    With no start-up frame and no configured site, the goto sun pre-flight
+    falls through, so tests that run a real goto never depend on where the
+    real sun is. Sun pre-flight tests set the frame or site explicitly.
+    """
+    monkeypatch.setattr(Config, "init_lat", 0, raising=False)
+    monkeypatch.setattr(Config, "init_long", 0, raising=False)
 
 
 @pytest.fixture
@@ -86,38 +102,38 @@ def test_transform_message_for_verify_list_params(seestar):
     try:
         Config.verify_injection = True
 
-        # Pre-7.06 firmware: list params nested with "verify".
+        # Positional params stay a flat list with "verify" appended, on every
+        # firmware. (The fork used to skip injection on 7.06+ to dodge the
+        # double-nesting bug [[ra, dec], "verify"] -> code 108; upstream fixed
+        # that at the root, so the skip is gone.)
         seestar.firmware_ver_int = 2705
         out = seestar.transform_message_for_verify(
             {"method": "scope_goto", "params": [12.3, 45.6]}
         )
-        assert out["params"] == [[12.3, 45.6], "verify"]
+        assert out["params"] == [12.3, 45.6, "verify"]
 
         wheel = seestar.transform_message_for_verify(
             {"method": "set_wheel_position", "params": [1]}
         )
         assert wheel["params"] == [1, "verify"]
 
-        # 7.06+ firmware: verify must NOT be injected into list params at all.
-        # scope_goto with [[ra, dec], "verify"] returns code 108
-        # "expected float param" on 7.06+. SSL-authenticated devices don't
-        # need verify on list-param commands either.
+        # 7.06+ firmware: still flat, never double-nested.
         seestar.firmware_ver_int = 2706
         out = seestar.transform_message_for_verify(
             {"method": "scope_goto", "params": [12.3, 45.6]}
         )
-        assert out["params"] == [12.3, 45.6]
+        assert out["params"] == [12.3, 45.6, "verify"]
 
         seestar.firmware_ver_int = 3000
         out = seestar.transform_message_for_verify(
             {"method": "scope_goto", "params": [12.3, 45.6]}
         )
-        assert out["params"] == [12.3, 45.6]
+        assert out["params"] == [12.3, 45.6, "verify"]
 
         wheel = seestar.transform_message_for_verify(
             {"method": "set_wheel_position", "params": [1]}
         )
-        assert wheel["params"] == [1]
+        assert wheel["params"] == [1, "verify"]
     finally:
         Config.verify_injection = old_setting
 
@@ -139,9 +155,30 @@ def test_transform_message_for_verify_keeps_existing_verify_list(seestar):
     try:
         Config.verify_injection = True
         out = seestar.transform_message_for_verify(
-            {"method": "scope_goto", "params": [[1.0, 2.0], "verify"]}
+            {"method": "scope_goto", "params": [12.3, 45.6, "verify"]}
         )
-        assert out["params"] == [[1.0, 2.0], "verify"]
+        assert out["params"] == [12.3, 45.6, "verify"]
+    finally:
+        Config.verify_injection = old_setting
+
+
+def test_transform_message_for_verify_does_not_double_nest_list_params(seestar):
+    """Regression test for issues #748/#758: on firmware >= 2706, verify
+    injection was wrapping an already-list-shaped params value in ANOTHER
+    list ([[value...], "verify"]) instead of appending "verify" flatly.
+    Firmware rejects the double-nested shape as 'expected object/float
+    param' (code 107/108). set_wheel_position had a narrow fix for this;
+    this proves the fix now applies to any list-param method, e.g.
+    set_control_value's ["gain", value].
+    """
+    seestar.firmware_ver_int = 2846
+    old_setting = Config.verify_injection
+    try:
+        Config.verify_injection = True
+        out = seestar.transform_message_for_verify(
+            {"method": "set_control_value", "params": ["gain", 80]}
+        )
+        assert out["params"] == ["gain", 80, "verify"]
     finally:
         Config.verify_injection = old_setting
 
@@ -160,6 +197,86 @@ def test_send_message_param_assigns_id_and_serializes(monkeypatch, seestar):
     assert cmd_id == 10000
     assert '"id": 10000' in sent["payload"]
     assert sent["payload"].endswith("\r\n")
+
+
+def test_wire_payload_for_scope_goto_and_pi_set_time_on_firmware_2846(
+    monkeypatch, seestar
+):
+    """End-to-end regression test for issues #748 (firmware 7.75/2775) and
+    #758 (firmware 8.46/2846): drives the REAL production callers
+    (_slew_to_ra_dec, and pi_set_time inside start_up_thread_fn) through the
+    full real pipeline (send_message_param -> transform_message_for_verify
+    -> send_message) and captures the exact JSON that would be written to
+    the socket, for a firmware version where verify injection is active but
+    dict-param verify-injection is skipped (>= 2706). The actual root cause
+    of both reports was transform_message_for_verify double-nesting list
+    params; decompiled firmware confirms scope_goto/pi_set_time would also
+    have accepted a correctly flat-appended list. This test verifies the
+    dict shape this branch adopted defensively still produces clean wire
+    bytes with no leaked "verify" key.
+    """
+    seestar.firmware_ver_int = 2846
+    old_setting = Config.verify_injection
+    sent = []
+
+    def fake_send_message(payload):
+        wire = json.loads(payload.rstrip("\r\n"))
+        sent.append(wire)
+        if wire["method"] == "get_device_state":
+            seestar.response_dict[wire["id"]] = {
+                "result": {"device": {"firmware_ver_int": 2846}}
+            }
+        else:
+            seestar.response_dict[wire["id"]] = {"result": "ok"}
+        return True
+
+    monkeypatch.setattr(seestar, "send_message", fake_send_message)
+    monkeypatch.setattr(seestar, "wait_end_op", lambda _e: True)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+
+    try:
+        Config.verify_injection = True
+
+        # Drive the real production caller for scope_goto (fixed in
+        # Task 2) through the real transform_message_for_verify +
+        # send_message pipeline.
+        seestar._slew_to_ra_dec([22.8737, 67.479])
+        scope_goto_wire = next(w for w in sent if w["method"] == "scope_goto")
+        assert scope_goto_wire["params"] == {"ra": 22.8737, "dec": 67.479}
+
+        # Drive the real production caller for pi_set_time (fixed in
+        # Task 3) through the same real pipeline, via start_up_thread_fn.
+        monkeypatch.setattr(
+            "device.seestar_device.tzlocal.get_localzone_name", lambda: "UTC"
+        )
+        import datetime as _dt
+
+        monkeypatch.setattr(
+            "device.seestar_device.tzlocal.get_localzone",
+            lambda: _dt.timezone.utc,
+        )
+        monkeypatch.setattr(
+            "device.seestar_device.EarthLocation", lambda **_k: object()
+        )
+        monkeypatch.setattr(seestar, "set_setting", lambda *a, **k: {"ok": True})
+        monkeypatch.setattr(seestar, "play_sound", lambda _sid: None)
+
+        seestar.start_up_thread_fn(
+            {
+                "lat": 1.1,
+                "lon": 2.2,
+                "auto_focus": False,
+                "3ppa": False,
+                "dark_frames": False,
+            }
+        )
+        pi_set_time_wire = next(w for w in sent if w["method"] == "pi_set_time")
+        assert isinstance(pi_set_time_wire["params"], dict)
+        assert "year" in pi_set_time_wire["params"]
+        assert "verify" not in pi_set_time_wire["params"]
+    finally:
+        Config.verify_injection = old_setting
 
 
 def test_schedule_create_and_add_item(seestar):
@@ -213,6 +330,11 @@ def test_stop_scheduler_transitions_and_calls_ops(seestar):
     assert called == {"slew": 1, "stack": 1, "sound": 1}
 
 
+# Stand-in for the EarthLocation start-up caches; tests that stub
+# get_altaz_from_eq only need the "frame present" branch of the pre-flight.
+_STARTUP_FRAME = object()
+
+
 def test_slew_to_ra_dec_refuses_inside_sun_cone(monkeypatch, seestar):
     """Spec: _slew_to_ra_dec converts (ra, dec) to sky (az, alt) and
     refuses (returns False, no scope_goto sent) when the target is
@@ -220,6 +342,7 @@ def test_slew_to_ra_dec_refuses_inside_sun_cone(monkeypatch, seestar):
     from device import sun_safety as ss
 
     # Have the method's altaz conversion return a concrete (alt, az).
+    seestar.site_altaz_frame = _STARTUP_FRAME
     seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
     # Force is_sun_safe to refuse.
     monkeypatch.setattr(
@@ -246,6 +369,7 @@ def test_slew_to_ra_dec_proceeds_when_altaz_conversion_unavailable(
     up yet), the pre-flight check falls through and the slew still
     goes out — the SunSafetyMonitor is the runtime backstop."""
     # Sentinel return from get_altaz_from_eq.
+    seestar.site_altaz_frame = _STARTUP_FRAME
     seestar.get_altaz_from_eq = lambda *_a, **_kw: [9999.9, 9999.9]
     seestar.mark_op_state = lambda *_a, **_kw: None
     seestar.wait_end_op = lambda *_a, **_kw: True
@@ -270,6 +394,7 @@ def test_slew_to_ra_dec_refuses_when_altaz_conversion_raises(seestar):
     def _boom(*_a, **_kw):
         raise RuntimeError("astropy transform exploded")
 
+    seestar.site_altaz_frame = _STARTUP_FRAME
     seestar.get_altaz_from_eq = _boom
     seestar.mark_op_state = lambda *_a, **_kw: None
     seestar.wait_end_op = lambda *_a, **_kw: True
@@ -289,6 +414,7 @@ def test_slew_to_ra_dec_refuses_when_is_sun_safe_raises(monkeypatch, seestar):
     a bad config) must refuse the slew, not fall through."""
     from device import sun_safety as ss
 
+    seestar.site_altaz_frame = _STARTUP_FRAME
     seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
 
     def _boom(*_a, **_kw):
@@ -339,6 +465,213 @@ def test_goto_target_sends_expected_request(monkeypatch, seestar):
     assert req["method"] == "iscope_start_view"
     assert req["params"]["target_ra_dec"] == [1.5, 22.25]
     assert req["params"]["target_name"] == "M42"
+
+
+def _goto_target_sun_preflight(monkeypatch, seestar):
+    """Wire goto_target with a fixed parsed coordinate; return the sent list.
+
+    Uses the real mark_op_state so the AutoGoto state can be checked, and
+    marks the start-up site frame as present."""
+
+    class FakeCoord:
+        ra = SimpleNamespace(hour=5.0)
+        dec = SimpleNamespace(deg=30.0)
+
+    seestar.site_altaz_frame = _STARTUP_FRAME
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+    monkeypatch.setattr(
+        "device.seestar_device.Util.parse_coordinate", lambda *args, **kwargs: FakeCoord
+    )
+    return sent
+
+
+_GOTO_PARAMS = {"is_j2000": False, "ra": 5.0, "dec": 30.0, "target_name": "x"}
+
+
+def test_goto_target_refuses_inside_sun_cone(monkeypatch, seestar):
+    """goto_target (web UI / ASCOM slews) runs the same sun pre-flight as
+    _slew_to_ra_dec: no iscope_start_view when the target is in the cone, and
+    the AutoGoto start it marked is undone so the next goto is accepted."""
+    from device import sun_safety as ss
+
+    sent = _goto_target_sun_preflight(monkeypatch, seestar)
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
+    monkeypatch.setattr(
+        ss, "is_sun_safe", lambda *a, **kw: (False, "sun_avoidance: forced by test")
+    )
+
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is False
+    assert sent == [], "iscope_start_view must not be sent when sun-safety refuses"
+    assert seestar.is_goto() is False
+
+
+def test_goto_target_refuses_when_altaz_conversion_raises(monkeypatch, seestar):
+    sent = _goto_target_sun_preflight(monkeypatch, seestar)
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("astropy transform exploded")
+
+    seestar.get_altaz_from_eq = _boom
+
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is False
+    assert sent == []
+    assert seestar.is_goto() is False
+
+
+def test_goto_target_refuses_when_is_sun_safe_raises(monkeypatch, seestar):
+    from device import sun_safety as ss
+
+    sent = _goto_target_sun_preflight(monkeypatch, seestar)
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("ephem exploded")
+
+    monkeypatch.setattr(ss, "is_sun_safe", _boom)
+
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is False
+    assert sent == []
+
+
+def test_goto_target_proceeds_when_sun_safe_or_frame_not_ready(monkeypatch, seestar):
+    from device import sun_safety as ss
+
+    sent = _goto_target_sun_preflight(monkeypatch, seestar)
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [33.0, 180.0]
+    monkeypatch.setattr(ss, "is_sun_safe", lambda *a, **kw: (True, ""))
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is True
+    assert [p["method"] for p in sent] == ["iscope_start_view"]
+
+    # 9999.9 sentinel (astropy frame not ready): falls through, as in
+    # _slew_to_ra_dec.
+    sent.clear()
+    seestar.mark_goto_status_as_stopped()
+    seestar.get_altaz_from_eq = lambda *_a, **_kw: [9999.9, 9999.9]
+    assert seestar.goto_target(dict(_GOTO_PARAMS)) is True
+    assert [p["method"] for p in sent] == ["iscope_start_view"]
+
+
+# June solstice noon at Greenwich: the sun is ~62 deg up in the south, at
+# roughly RA 6h / Dec +23.4 (JNow). The opposite point (RA 18h / Dec -23.4)
+# is below the horizon, ~180 deg from the sun.
+_SOLSTICE_NOON = "2026-06-21T12:00:00"
+_SUN_RADEC = (6.0, 23.4)
+_ANTI_SUN_RADEC = (18.0, -23.4)
+
+
+@pytest.fixture
+def no_startup_frame_site(monkeypatch, seestar):
+    """No start-up frame, site configured in Config, clock frozen at noon.
+
+    Runs the real astropy conversion and the real is_sun_safe, both pinned
+    to _SOLSTICE_NOON so the result never depends on the real sun. Returns
+    the list of (az, alt, safe) results is_sun_safe produced.
+    """
+    from datetime import datetime, timezone
+
+    from astropy.time import Time
+    from astropy.utils import iers
+
+    from device import sun_safety as ss
+
+    monkeypatch.setattr(iers.conf, "auto_download", False)
+    monkeypatch.setattr(Config, "init_lat", 51.48)
+    monkeypatch.setattr(Config, "init_long", -0.01)
+    frozen = Time(_SOLSTICE_NOON, scale="utc")
+    monkeypatch.setattr(Time, "now", classmethod(lambda cls: frozen))
+    when = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+    real_is_sun_safe = ss.is_sun_safe
+    results = []
+
+    def _pinned(az, el, **kw):
+        out = real_is_sun_safe(az, el, when=when, **kw)
+        results.append((az, el, out[0]))
+        return out
+
+    monkeypatch.setattr(ss, "is_sun_safe", _pinned)
+    seestar.site_altaz_frame = None
+    seestar.mark_op_state = lambda *_a, **_kw: None
+    seestar.wait_end_op = lambda *_a, **_kw: True
+    return results
+
+
+def test_slew_refuses_sun_target_without_startup_frame(seestar, no_startup_frame_site):
+    """Start-up never ran but the site is configured: the frame is built
+    from Config on demand and a target at the sun is refused."""
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+
+    assert seestar._slew_to_ra_dec(list(_SUN_RADEC)) is False
+    assert sent == []
+    assert len(no_startup_frame_site) == 1
+    _az, alt, safe = no_startup_frame_site[0]
+    assert safe is False
+    assert 55.0 < alt < 70.0  # the real transform ran: target ~ sun altitude
+    # The on-demand site is not cached; start-up still owns site_altaz_frame.
+    assert seestar.site_altaz_frame is None
+
+
+def test_slew_allows_far_target_without_startup_frame(seestar, no_startup_frame_site):
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+
+    assert seestar._slew_to_ra_dec(list(_ANTI_SUN_RADEC)) is True
+    assert [p["method"] for p in sent] == ["scope_goto"]
+    assert len(no_startup_frame_site) == 1
+    assert no_startup_frame_site[0][2] is True
+
+
+def test_goto_target_refuses_sun_target_without_startup_frame(
+    seestar, no_startup_frame_site
+):
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+    params = {
+        "is_j2000": False,
+        "ra": _SUN_RADEC[0],
+        "dec": _SUN_RADEC[1],
+        "target_name": "sun",
+    }
+
+    assert seestar.goto_target(params) is False
+    assert sent == []
+    assert seestar.is_goto() is False
+    assert [r[2] for r in no_startup_frame_site] == [False]
+
+
+def test_slew_falls_through_without_startup_frame_or_site(monkeypatch, seestar):
+    """Compatibility: no start-up frame and the site unset (0/0) must not
+    block the goto; the check is skipped with a warning instead."""
+    from device import sun_safety as ss
+
+    warnings = []
+    seestar.logger.warning = lambda msg, *a, **_kw: warnings.append(msg % a)
+    seestar.site_altaz_frame = None
+    seestar.mark_op_state = lambda *_a, **_kw: None
+    seestar.wait_end_op = lambda *_a, **_kw: True
+
+    def _not_called(*_a, **_kw):
+        raise AssertionError("no altaz/sun check with the site unset")
+
+    seestar.get_altaz_from_eq = _not_called
+    monkeypatch.setattr(ss, "is_sun_safe", _not_called)
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"result": "ok"}
+    )
+
+    assert seestar._slew_to_ra_dec(list(_SUN_RADEC)) is True
+    assert [p["method"] for p in sent] == ["scope_goto"]
+    assert any("location is not set" in w for w in warnings)
 
 
 def test_parse_dec_to_float_positive_and_negative(seestar):
@@ -425,15 +758,17 @@ def test_send_message_paths(monkeypatch, seestar):
     seestar.s = _DummySocket(send_error=socket.timeout())
     assert seestar.send_message("x") is False
 
-    disconnected = {"count": 0}
-    monkeypatch.setattr(
-        seestar, "disconnect", lambda: disconnected.__setitem__("count", 1)
-    )
-    monkeypatch.setattr(seestar, "reconnect", lambda: False)
+    reconnects = {"count": 0}
+
+    def fake_reconnect(wait=True):
+        reconnects["count"] += 1
+        return False
+
+    monkeypatch.setattr(seestar, "reconnect", fake_reconnect)
     seestar.is_watch_events = True
     seestar.s = _DummySocket(send_error=socket.error("boom"))
     assert seestar.send_message("x") is False
-    assert disconnected["count"] == 1
+    assert reconnects["count"] == 1
 
     class GeneralSock:
         def sendall(self, _payload):
@@ -460,6 +795,9 @@ def test_socket_force_close_and_disconnect(seestar):
 def test_reconnect_success_and_fail_paths(monkeypatch, seestar):
     monkeypatch.setattr(seestar, "send_udp_intro", lambda: None)
     monkeypatch.setattr(seestar, "disconnect", lambda: None)
+    # Isolate from the developer's local config.toml: if interop_pem is set
+    # there, reconnect() would enter the auth handshake path.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
 
     class Sock:
         def __init__(self):
@@ -489,6 +827,195 @@ def test_reconnect_success_and_fail_paths(monkeypatch, seestar):
     assert seestar.reconnect() is False
 
 
+def test_authenticate_timeout_returns_false_without_raising(monkeypatch, seestar):
+    # A busy scope (mid-imaging) stalls get_verify_str; _auth_rpc_sync times
+    # out and returns None. authenticate() must return False cleanly (retry
+    # later) and must never touch the socket.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem")
+    monkeypatch.setattr(seestar, "_auth_rpc_sync", lambda *_a, **_kw: None)
+
+    # Guard: the socket must NOT be touched on an auth timeout.
+    sentinel_sock = object()
+    seestar.s = sentinel_sock
+    disconnect_calls = {"n": 0}
+    monkeypatch.setattr(
+        seestar,
+        "disconnect",
+        lambda: disconnect_calls.__setitem__("n", disconnect_calls["n"] + 1),
+    )
+
+    assert seestar.authenticate() is False
+    assert disconnect_calls["n"] == 0
+    assert seestar.s is sentinel_sock
+
+
+def test_maybe_authenticate_noop_when_pem_unset(monkeypatch, seestar):
+    monkeypatch.setattr(Config, "seestar_interop_pem", "")
+    called = {"n": 0}
+    monkeypatch.setattr(
+        seestar,
+        "authenticate",
+        lambda: called.__setitem__("n", called["n"] + 1) or True,
+    )
+    seestar._maybe_authenticate()
+    assert called["n"] == 0
+    assert seestar.is_authenticated is False
+
+
+def test_maybe_authenticate_retries_until_scope_idle(monkeypatch, seestar):
+    # Auth is configured; first attempt times out (scope busy), a later attempt
+    # succeeds (scope idle). The socket must never be dropped in between.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem")
+    # A connected scope: auth is only ever published for a live socket.
+    seestar.s = _DummySocket()
+    seestar.is_connected = True
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr("device.seestar_device.time.time", lambda: clock["t"])
+
+    attempts = {"n": 0}
+
+    def fake_authenticate():
+        attempts["n"] += 1
+        return attempts["n"] >= 2  # busy first, idle second
+
+    monkeypatch.setattr(seestar, "authenticate", fake_authenticate)
+    disconnect_calls = {"n": 0}
+    monkeypatch.setattr(
+        seestar,
+        "disconnect",
+        lambda: disconnect_calls.__setitem__("n", disconnect_calls["n"] + 1),
+    )
+
+    # Attempt #1: busy -> stays unauthenticated, socket untouched.
+    seestar._maybe_authenticate()
+    assert attempts["n"] == 1
+    assert seestar.is_authenticated is False
+
+    # Immediate re-call is throttled (< _AUTH_RETRY_INTERVAL_S later): no attempt.
+    clock["t"] += 5
+    seestar._maybe_authenticate()
+    assert attempts["n"] == 1
+
+    # After the retry interval, attempt #2 succeeds.
+    clock["t"] += seestar._AUTH_RETRY_INTERVAL_S
+    seestar._maybe_authenticate()
+    assert attempts["n"] == 2
+    assert seestar.is_authenticated is True
+
+    # Once authenticated it short-circuits (no further attempts).
+    clock["t"] += 100
+    seestar._maybe_authenticate()
+    assert attempts["n"] == 2
+
+    # Never disconnected the socket across the whole retry sequence.
+    assert disconnect_calls["n"] == 0
+
+
+def test_reconnect_auth_failure_is_non_fatal(monkeypatch, seestar):
+    # Regression: connect must stay up regardless of auth. With auth configured,
+    # reconnect() attempts the handshake inline (so a fresh connection is
+    # authenticated before start_watch_thread sends commands), but a failure
+    # must NOT close the socket — it throttles the heartbeat retry instead.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem")
+    monkeypatch.setattr(seestar, "send_udp_intro", lambda: None)
+    monkeypatch.setattr(seestar, "disconnect", lambda: None)
+
+    auth_calls = {"n": 0}
+    monkeypatch.setattr(
+        seestar,
+        "authenticate",
+        lambda: auth_calls.__setitem__("n", auth_calls["n"] + 1) or False,
+    )
+
+    class Sock:
+        def settimeout(self, _v):
+            return None
+
+        def connect(self, _addr):
+            return None
+
+    monkeypatch.setattr("device.seestar_device.socket.socket", lambda *_a: Sock())
+    seestar.is_connected = False
+    seestar._last_auth_attempt = 0.0
+
+    before = time.time()
+    assert seestar.reconnect() is True  # auth failed, connection stays up
+    assert seestar.is_connected is True
+    assert auth_calls["n"] == 1
+    assert seestar.is_authenticated is False
+    # Failed inline attempt throttles the heartbeat retry (scope is busy).
+    assert seestar._last_auth_attempt >= before
+
+
+def test_reconnect_auth_success_marks_authenticated(monkeypatch, seestar):
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem")
+    monkeypatch.setattr(seestar, "send_udp_intro", lambda: None)
+    monkeypatch.setattr(seestar, "authenticate", lambda: True)
+
+    class Sock:
+        def settimeout(self, _v):
+            return None
+
+        def connect(self, _addr):
+            return None
+
+    monkeypatch.setattr("device.seestar_device.socket.socket", lambda *_a: Sock())
+    seestar.is_connected = False
+
+    assert seestar.reconnect() is True
+    assert seestar.is_authenticated is True
+
+    # Auth state is per-connection: disconnect() must reset it.
+    seestar.disconnect()
+    assert seestar.is_authenticated is False
+
+
+def test_auth_rpc_sync_never_reads_socket_while_receive_thread_alive(seestar):
+    # With the receive thread draining the socket, a raw recv() here would race
+    # it (bytes split arbitrarily between the two readers, events stranded in
+    # _auth_leftover). _auth_rpc_sync must instead wait on response_dict, which
+    # the receive thread populates.
+    class NoRecvSock:
+        def __init__(self):
+            self.sent = []
+
+        def sendall(self, payload):
+            self.sent.append(payload)
+
+        def gettimeout(self):
+            raise AssertionError("must not touch the socket while rx thread runs")
+
+        def settimeout(self, _t):
+            raise AssertionError("must not touch the socket while rx thread runs")
+
+        def recv(self, _n):
+            raise AssertionError("raw recv would race the receive thread")
+
+    seestar.s = NoRecvSock()
+
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    seestar.get_msg_thread = AliveThread()
+
+    # Reply delivered by the receive thread into response_dict.
+    reply = {
+        "jsonrpc": "2.0",
+        "method": "get_verify_str",
+        "result": {"str": "CHALLENGE"},
+        "id": 4242,
+    }
+    seestar.response_dict[4242] = reply
+    seestar._send_json = lambda data: (4242, True)
+    assert seestar._auth_rpc_sync("get_verify_str") is reply
+
+    # No reply arriving: times out and returns None, still no socket reads.
+    seestar.response_dict.pop(4242)
+    assert seestar._auth_rpc_sync("get_verify_str", timeout=0.25) is None
+
+
 def test_get_socket_msg_paths(monkeypatch, seestar):
     monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
 
@@ -498,21 +1025,60 @@ def test_get_socket_msg_paths(monkeypatch, seestar):
     seestar.s = _DummySocket(recv_error=socket.timeout())
     assert seestar.get_socket_msg() is None
 
-    disconnected = {"count": 0}
-    monkeypatch.setattr(
-        seestar, "disconnect", lambda: disconnected.__setitem__("count", 1)
-    )
-    monkeypatch.setattr(seestar, "reconnect", lambda: False)
+    reconnects = {}
+
+    def fake_reconnect(wait=True):
+        reconnects["wait"] = wait
+        return False
+
+    monkeypatch.setattr(seestar, "reconnect", fake_reconnect)
     seestar.is_watch_events = True
     seestar.s = _DummySocket(recv_error=socket.error("x"))
     assert seestar.get_socket_msg() is None
-    assert disconnected["count"] == 1
+    assert reconnects == {"wait": False}
+    assert seestar.s is None
 
     seestar.s = _DummySocket(recv_value=b"")
     assert seestar.get_socket_msg() is None
 
     seestar.s = _DummySocket(recv_value=b"hello")
     assert seestar.get_socket_msg() == "hello"
+
+
+def test_get_socket_msg_logs_socket_none_at_debug_not_warning(monkeypatch, seestar):
+    # A dead device's receive thread used to warn "socket not
+    # initialized!" every loop (~20/min); it now waits quietly at
+    # DEBUG for the heartbeat thread's backed-off reconnect.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    debugs = []
+    warnings = []
+    monkeypatch.setattr(
+        seestar.logger, "debug", lambda msg, *a, **k: debugs.append(msg)
+    )
+    monkeypatch.setattr(
+        seestar.logger, "warning", lambda msg, *a, **k: warnings.append(msg)
+    )
+    seestar.s = None
+    assert seestar.get_socket_msg() is None
+    assert any("socket not initialized!" in msg for msg in debugs)
+    assert not any("socket not initialized!" in msg for msg in warnings)
+
+
+def test_get_socket_msg_treats_peer_close_as_disconnect(monkeypatch, seestar):
+    # recv() returning b"" (peer closed) used to spin the receive
+    # thread on a dead socket; it now drops the socket and reconnects.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    reconnects = []
+    monkeypatch.setattr(
+        seestar, "reconnect", lambda wait=True: reconnects.append(wait) or False
+    )
+    seestar.is_watch_events = True
+    sock = _DummySocket(recv_value=b"")
+    seestar.s = sock
+    assert seestar.get_socket_msg() is None
+    assert seestar.s is None
+    assert sock.closed is True
+    assert reconnects == [False]
 
 
 def test_update_equ_coord_and_view_state(seestar):
@@ -530,12 +1096,13 @@ def test_update_equ_coord_and_view_state(seestar):
     assert seestar.view_state == {"a": 1}
 
 
-def test_json_message_increments_cmdid(monkeypatch, seestar):
+def test_json_message_stamps_unique_auto_ids(monkeypatch, seestar):
     sent = []
     monkeypatch.setattr(seestar, "send_message", lambda payload: sent.append(payload))
-    start = seestar.cmdid
-    seestar.json_message("scope_get_equ_coord", id=420)
-    assert seestar.cmdid == start + 1
+    seestar.json_message("scope_get_equ_coord")
+    seestar.json_message("scope_get_equ_coord")
+    ids = [json.loads(p)["id"] for p in sent]
+    assert ids[1] == ids[0] + 1
     assert '"method": "scope_get_equ_coord"' in sent[0]
 
 
@@ -633,6 +1200,127 @@ def test_send_message_param_sync_records_rtt_on_success(monkeypatch, seestar):
     assert st["last_ms"] is not None
 
 
+def _run_one_sync_timeout(monkeypatch, seestar, cmdid, method="get_device_state"):
+    """Drive send_message_param_sync through exactly one 10s-timeout cycle."""
+    monkeypatch.setattr(seestar, "send_message_param", lambda _d: cmdid)
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    times = iter([0.0, 2.1, 11.2])
+    monkeypatch.setattr("device.seestar_device.time.time", lambda: next(times))
+    return seestar.send_message_param_sync({"method": method})
+
+
+def test_no_reply_timeout_logs_auth_gap_guidance_without_pem(monkeypatch, seestar):
+    # Firmware that requires auth but is unauthenticated ignores every sync
+    # command while still streaming events -- issue #759. With no interop_pem
+    # configured, the very first no-reply timeout on a fresh connection must
+    # produce one clear ERROR pointing at the PEM / seestar-proxy, not silence
+    # forever. (A busy-vs-unauthenticated cold start looks identical no
+    # matter how many timeouts you count, so this fires on the first one.)
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+    errors = []
+    monkeypatch.setattr(seestar.logger, "error", lambda msg: errors.append(msg))
+    gap_errors = lambda: [m for m in errors if "since connecting" in m]  # noqa: E731
+
+    _run_one_sync_timeout(monkeypatch, seestar, 1, "get_device_state")
+    assert len(gap_errors()) == 1
+    assert "interop_pem" in gap_errors()[0]
+    assert "seestar-proxy" in gap_errors()[0]
+
+    # Further timeouts on the same connection must not repeat the log.
+    _run_one_sync_timeout(monkeypatch, seestar, 2, "get_view_state")
+    assert len(gap_errors()) == 1
+
+
+def test_no_reply_timeout_logs_auth_gap_guidance_with_pem_configured(
+    monkeypatch, seestar
+):
+    # Same symptom, but interop_pem IS configured -- the guidance must point
+    # at a failing handshake, not "go configure a PEM" (already have one).
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem")
+    errors = []
+    monkeypatch.setattr(seestar.logger, "error", lambda msg: errors.append(msg))
+
+    _run_one_sync_timeout(monkeypatch, seestar, 1)
+
+    gap_errors = [m for m in errors if "since connecting" in m]
+    assert len(gap_errors) == 1
+    assert "interop_pem" in gap_errors[0]
+    assert "Authentication is likely failing" in gap_errors[0]
+
+
+def test_busy_scope_with_prior_reply_never_triggers_auth_gap(monkeypatch, seestar):
+    # A scope that already answered once (e.g. mid-imaging, temporarily busy)
+    # must never be accused of needing a PEM just because later calls stall.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+    errors = []
+    monkeypatch.setattr(seestar.logger, "error", lambda msg: errors.append(msg))
+
+    monkeypatch.setattr(seestar, "send_message_param", lambda _d: 42)
+    seestar.response_dict[42] = {"id": 42, "result": "ok"}
+    seestar.send_message_param_sync({"method": "get_device_state"})
+
+    for i in range(1, 6):
+        _run_one_sync_timeout(monkeypatch, seestar, 100 + i)
+
+    assert [m for m in errors if "since connecting" in m] == []
+
+
+def test_old_firmware_error_reply_counts_as_a_reply_and_never_gaps(
+    monkeypatch, seestar
+):
+    # The critical compatibility contract: pre-auth firmware doesn't time out
+    # at all, it replies immediately with an error (e.g. pi_is_verified is
+    # "unknown method" on old firmware). That error reply must count as proof
+    # the scope is talking to us, permanently disabling auth-gap detection
+    # for this connection -- old firmware must never see the PEM warning.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+    errors = []
+    monkeypatch.setattr(seestar.logger, "error", lambda msg: errors.append(msg))
+
+    monkeypatch.setattr(seestar, "send_message_param", lambda _d: 7)
+    monkeypatch.setattr("device.seestar_device.time.time", lambda: 0.0)
+    seestar.response_dict[7] = {
+        "id": 7,
+        "method": "pi_is_verified",
+        "code": 102,
+        "error": "unknown method",
+    }
+    seestar.send_message_param_sync({"method": "pi_is_verified"})
+    assert seestar._connection_had_sync_reply is True
+
+    for i in range(1, 6):
+        _run_one_sync_timeout(monkeypatch, seestar, 200 + i)
+
+    assert [m for m in errors if "since connecting" in m] == []
+
+
+def test_sync_reply_after_auth_gap_logs_recovery_and_resets(monkeypatch, seestar):
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+    errors = []
+    infos = []
+    monkeypatch.setattr(seestar.logger, "error", lambda msg: errors.append(msg))
+    monkeypatch.setattr(seestar.logger, "info", lambda msg: infos.append(msg))
+
+    _run_one_sync_timeout(monkeypatch, seestar, 1)
+    assert len([m for m in errors if "since connecting" in m]) == 1
+    assert seestar._auth_gap_logged is True
+
+    monkeypatch.setattr(seestar, "send_message_param", lambda _d: 999)
+    monkeypatch.setattr("device.seestar_device.time.time", lambda: 0.0)
+    seestar.response_dict[999] = {"id": 999, "result": "ok"}
+    seestar.send_message_param_sync({"method": "pi_is_verified"})
+
+    assert seestar._auth_gap_logged is False
+    assert seestar._connection_had_sync_reply is True
+    assert any("answering commands again" in m for m in infos)
+
+    # And it must be able to trip again cleanly on a later reconnect.
+    seestar.disconnect()
+    assert seestar._connection_had_sync_reply is False
+    assert seestar._consecutive_sync_timeouts == 0
+    assert seestar._auth_gap_logged is False
+
+
 def test_get_event_state_and_is_client_master(seestar):
     seestar.schedule["state"] = "working"
     seestar.event_state["3PPA"] = {"eq_offset_alt": 0, "eq_offset_az": 0}
@@ -645,6 +1333,1179 @@ def test_get_event_state_and_is_client_master(seestar):
     assert seestar.is_client_master() is True
     seestar.event_state["Client"] = {"is_master": False}
     assert seestar.is_client_master() is False
+
+
+def test_get_event_state_aliases_eqmodepa_event_field_to_3ppa(seestar):
+    # Firmware sends the raw polar-align event under "EqModePA"; get_event_state
+    # aliases it to a "3PPA" entry so classic/v2 UIs can display it. The classic
+    # UI's eventstatus.html matches entries via Jinja's
+    # `selectattr('Event', 'equalto', '3PPA')`, which inspects each entry's own
+    # embedded "Event" field -- not the dict key it's stored under. If the
+    # aliased entry still carries "Event": "EqModePA" (copied verbatim from the
+    # source), that selectattr never matches, so classic's PolarAlign card
+    # renders its default "no data" placeholder forever, even after a real,
+    # successful polar-align completion.
+    seestar.event_state["EqModePA"] = {
+        "Event": "EqModePA",
+        "state": "complete",
+        "total": 0.146283,
+        "x": 0.093825,
+        "y": 0.112230,
+    }
+    out = seestar.get_event_state({"event_name": "3PPA"})
+    assert out["result"]["state"] == "complete"
+    assert out["result"]["Event"] == "3PPA"
+
+
+def test_get_event_state_returns_a_copy_not_a_live_reference(seestar):
+    # EventStatus.on_get (front/app.py) iterates the whole-dict result with
+    # .items(). If get_event_state() ever returns self.event_state itself
+    # rather than a copy, a later write to event_state (e.g. from
+    # IncomingMsgThread) mutates the object the caller is still iterating.
+    seestar.event_state["WheelMove"] = {"Event": "WheelMove", "state": "start"}
+    out = seestar.get_event_state()
+    result = out["result"]
+    assert result is not seestar.event_state
+    seestar.event_state["NewEvent"] = {"Event": "NewEvent", "state": "start"}
+    assert "NewEvent" not in result
+
+
+def test_get_event_state_survives_concurrent_event_state_inserts(seestar):
+    # Regression for a real, reproduced crash: get_event_state() used to
+    # return self.event_state directly, and EventStatus.on_get
+    # (front/app.py) iterates that dict with .items(). IncomingMsgThread
+    # inserts a new top-level key for every previously-unseen firmware
+    # "Event" name -- during an active goto's event burst (View,
+    # ContinuousExposure, WheelMove, ScopeGoto, Exposure, PlateSolve, ...
+    # arriving within milliseconds of each other), this raced with the ALP
+    # request thread's iteration and raised "RuntimeError: dictionary
+    # changed size during iteration", which the emulator's
+    # tests/system/test_flow.py::test_goto caught: the classic UI's
+    # eventStatusContent never swapped past "Loading event status..." no
+    # matter how long the test waited, because the request silently 500'd.
+    import threading
+
+    stop = threading.Event()
+    errors = []
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            with seestar.event_state_lock:
+                seestar.event_state[f"BurstEvent{i}"] = {
+                    "Event": f"BurstEvent{i}",
+                    "state": "working",
+                }
+            i += 1
+            time.sleep(0)  # yield -- a lock-holding busy loop can starve the reader
+
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    writer_thread.start()
+    try:
+        for _ in range(200):
+            try:
+                out = seestar.get_event_state()
+                for _key, value in out["result"].items():
+                    isinstance(value, dict)
+            except RuntimeError as e:
+                errors.append(str(e))
+                break
+    finally:
+        stop.set()
+        writer_thread.join(timeout=2)
+        assert not writer_thread.is_alive()
+
+    assert errors == []
+
+
+def _receive_device_replies(monkeypatch, seestar, *replies):
+    """Feed JSON-RPC replies through the real receive loop, one per socket read.
+
+    The scope answers on the event socket; the receive thread caches the mount
+    mode and publishes each reply for any sync waiter.
+    """
+    pending = [json.dumps(reply) + "\r\n" for reply in replies]
+    was_watching = seestar.is_watch_events
+    seestar.is_watch_events = True
+
+    def fake_get_socket_msg():
+        if not pending:
+            seestar.is_watch_events = False
+            return None
+        return pending.pop(0)
+
+    monkeypatch.setattr(seestar, "get_socket_msg", fake_get_socket_msg)
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    try:
+        seestar.receive_message_thread_fn()
+    finally:
+        seestar.is_watch_events = was_watching
+
+
+def test_send_message_param_sync_confirms_eq_mode_from_device_state(
+    monkeypatch, seestar
+):
+    reply = {
+        "jsonrpc": "2.0",
+        "method": "get_device_state",
+        "result": {"mount": {"equ_mode": True}},
+        "id": 123,
+    }
+
+    def send(_data):
+        # The scope answers on the socket; the receive thread files the reply.
+        _receive_device_replies(monkeypatch, seestar, reply)
+        return 123
+
+    monkeypatch.setattr(seestar, "send_message_param", send)
+    out = seestar.send_message_param_sync({"method": "get_device_state"})
+    assert out["result"]["mount"]["equ_mode"] is True
+    assert seestar.is_EQ_mode is True
+    assert seestar.is_EQ_mode_confirmed is True
+
+
+def test_async_get_device_state_reply_confirms_eq_mode(monkeypatch, seestar):
+    # No sync waiter: an async poll or reauth-wait reply must still update the mode.
+    _receive_device_replies(
+        monkeypatch,
+        seestar,
+        {
+            "jsonrpc": "2.0",
+            "method": "get_device_state",
+            "result": {"mount": {"equ_mode": False}},
+            "id": 900,
+        },
+    )
+    assert seestar.is_EQ_mode_confirmed is True
+    assert seestar.is_EQ_mode is False
+
+
+def test_late_get_device_state_reply_after_sync_timeout_confirms_eq_mode(
+    monkeypatch, seestar
+):
+    out = _run_one_sync_timeout(monkeypatch, seestar, 41)
+    assert "Exceeded" in out["result"]  # timeout returns the request, not a reply
+    assert seestar.is_EQ_mode_confirmed is False
+
+    # The scope's reply lands after the caller gave up: it must still count.
+    _receive_device_replies(
+        monkeypatch,
+        seestar,
+        {
+            "jsonrpc": "2.0",
+            "method": "get_device_state",
+            "result": {"mount": {"equ_mode": True}},
+            "id": 41,
+        },
+    )
+    assert seestar.is_EQ_mode_confirmed is True
+    assert seestar.is_EQ_mode is True
+
+
+def test_sync_timeout_error_result_never_confirms_eq_mode(monkeypatch, seestar):
+    out = _run_one_sync_timeout(monkeypatch, seestar, 42)
+    assert out["method"] == "get_device_state"
+    assert isinstance(out["result"], str)  # the error string, not a device reply
+    assert seestar.is_EQ_mode_confirmed is False
+
+
+def test_firmware_error_reply_does_not_confirm_eq_mode(monkeypatch, seestar):
+    _receive_device_replies(
+        monkeypatch,
+        seestar,
+        {
+            "jsonrpc": "2.0",
+            "method": "get_device_state",
+            "error": {"code": -1, "message": "busy"},
+            "id": 7,
+        },
+    )
+    assert seestar.response_dict[7]["error"]["message"] == "busy"
+    assert seestar.is_EQ_mode_confirmed is False
+
+
+@pytest.mark.parametrize("equ_mode", ["false", "true", None, 1.0, [], {}])
+def test_sync_get_device_state_rejects_non_integer_equ_mode(
+    monkeypatch, seestar, equ_mode
+):
+    # "false" is truthy and 1.0 is not a firmware flag: neither may confirm.
+    reply = {
+        "jsonrpc": "2.0",
+        "method": "get_device_state",
+        "result": {"mount": {"equ_mode": equ_mode}},
+        "id": 11,
+    }
+
+    def send(_data):
+        _receive_device_replies(monkeypatch, seestar, reply)
+        return 11
+
+    monkeypatch.setattr(seestar, "send_message_param", send)
+    seestar.send_message_param_sync({"method": "get_device_state"})
+    assert seestar.is_EQ_mode_confirmed is False
+    assert seestar.is_EQ_mode is False
+
+
+@pytest.mark.parametrize(
+    "equ_mode, expected", [(True, True), (False, False), (1, True), (0, False)]
+)
+def test_get_device_state_confirms_bool_and_int_equ_mode(
+    monkeypatch, seestar, equ_mode, expected
+):
+    _receive_device_replies(
+        monkeypatch,
+        seestar,
+        {
+            "jsonrpc": "2.0",
+            "method": "get_device_state",
+            "result": {"mount": {"equ_mode": equ_mode}},
+            "id": 12,
+        },
+    )
+    assert seestar.is_EQ_mode_confirmed is True
+    assert seestar.is_EQ_mode is expected
+
+
+def test_disconnect_clears_confirmed_eq_mode(seestar):
+    seestar.is_EQ_mode = True
+    seestar.is_EQ_mode_confirmed = True
+    seestar.is_connected = True
+    seestar.s = _DummySocket()
+    seestar.disconnect()
+    assert seestar.is_EQ_mode is False
+    assert seestar.is_EQ_mode_confirmed is False
+    assert seestar.get_event_state()["result"]["mount"]["equ_mode"] is None
+
+
+def test_reconnect_clears_stale_eq_mode_from_previous_connection(monkeypatch, seestar):
+    # A power-cycled scope must not keep reporting the previous session's mode.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+    monkeypatch.setattr(seestar, "send_udp_intro", lambda: None)
+
+    class Sock:
+        def settimeout(self, _v):
+            return None
+
+        def connect(self, _addr):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("device.seestar_device.socket.socket", lambda *_a: Sock())
+    seestar.is_EQ_mode = True
+    seestar.is_EQ_mode_confirmed = True
+    seestar.is_connected = False
+    assert seestar.reconnect() is True
+    assert seestar.is_EQ_mode_confirmed is False
+    assert seestar.is_EQ_mode is False
+
+
+def test_concurrent_sends_never_share_a_cmdid_or_overlap_on_the_socket(seestar):
+    # The Alpaca server is threaded: concurrent requests must each get a unique
+    # command id (replies are matched by id) and must not interleave writes.
+    import threading
+
+    guard = threading.Lock()
+    active = {"n": 0, "max": 0}
+    sent_ids = []
+
+    class SlowSock:
+        def sendall(self, payload):
+            with guard:
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+            time.sleep(0.01)  # widen the window a racing writer would hit
+            sent_ids.append(json.loads(payload)["id"])
+            with guard:
+                active["n"] -= 1
+
+    seestar.s = SlowSock()
+    seestar.transform_message_for_verify = lambda data: data
+    returned = []
+
+    def worker():
+        returned.append(seestar.send_message_param({"method": "get_device_state"}))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert active["max"] == 1  # writes never overlapped
+    assert len(set(sent_ids)) == 8
+    assert sorted(returned) == sorted(sent_ids)
+
+
+def test_reconnect_holds_no_socket_or_cmdid_lock(seestar):
+    # A failed write drops the socket and reconnects, which re-authenticates and
+    # can wait seconds on the scope. Neither send-path lock may be held then.
+    import threading
+
+    held_free = {}
+    in_reconnect = threading.Event()
+    release_reconnect = threading.Event()
+
+    class Sock:
+        def sendall(self, payload):
+            raise socket.error("boom")
+
+    def slow_reconnect(wait=True):
+        for name, lock in (
+            ("socket", seestar._socket_write_lock),
+            ("cmdid", seestar._cmdid_lock),
+        ):
+            held_free[name] = lock.acquire(timeout=1)
+            if held_free[name]:
+                lock.release()
+        in_reconnect.set()
+        release_reconnect.wait(timeout=5)
+        return False
+
+    seestar.s = Sock()
+    seestar.is_watch_events = True
+    seestar.reconnect = slow_reconnect
+
+    failing = threading.Thread(target=lambda: seestar.json_message("fails"))
+    failing.start()
+    assert in_reconnect.wait(timeout=5)
+    release_reconnect.set()
+    failing.join(timeout=5)
+    assert held_free == {"socket": True, "cmdid": True}
+
+
+class _RecordingLogger(DummyLogger):
+    """Collects error() calls; debug() can pause a thread at a named log line."""
+
+    def __init__(self):
+        self.errors = []
+        self.debug_hook = None
+
+    def debug(self, *args, **kwargs):
+        if self.debug_hook is not None and args:
+            self.debug_hook(str(args[0]))
+
+    def error(self, *args, **kwargs):
+        self.errors.append(args)
+
+
+class _ScopeServer:
+    """A real TCP listener standing in for the scope; reconnect() dials it."""
+
+    def __init__(self):
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._listener.settimeout(0.05)
+        self.port = self._listener.getsockname()[1]
+        self._stopped = False
+        self.conns = []
+        self._cond = threading.Condition()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self._cond:
+                self.conns.append(conn)
+                self._cond.notify_all()
+
+    def wait_for_conns(self, n, timeout=5.0):
+        with self._cond:
+            return self._cond.wait_for(lambda: len(self.conns) >= n, timeout)
+
+    def stop(self):
+        """Stop listening and return every connection the client completed."""
+        if not self._stopped:
+            self._stopped = True
+            self._stop.set()
+            self._thread.join(timeout=5)
+            self._listener.setblocking(False)
+            while True:
+                try:
+                    conn, _ = self._listener.accept()
+                except OSError:
+                    break
+                self.conns.append(conn)
+            self._listener.close()
+        return self.conns
+
+    def close(self):
+        self.stop()
+        for conn in self.conns:
+            conn.close()
+
+
+def _recv_lines(sock, n, timeout=2.0):
+    """Read until ``n`` CRLF-terminated lines arrived; return the raw text."""
+    sock.settimeout(timeout)
+    buf = b""
+    while buf.count(b"\r\n") < n:
+        try:
+            chunk = sock.recv(65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode()
+
+
+def _recv_until_eof(sock, timeout=2.0):
+    sock.settimeout(timeout)
+    buf = b""
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode()
+
+
+def _assert_threads_finished(threads, timeout=5.0):
+    for thread in threads:
+        thread.join(timeout=timeout)
+    assert not [t.name for t in threads if t.is_alive()], "threads hung"
+
+
+def test_force_close_mid_send_never_tears_a_message(monkeypatch):
+    # socket_force_close() used to close (and null) self.s while another thread
+    # was inside sendall(): the scope got half a message, and queued writers
+    # hit `None.sendall` (AttributeError). Close must wait for the write.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    logger = _RecordingLogger()
+    scope = Seestar(logger, "127.0.0.1", 4700, "TestScope", 1, True)
+    ours, peer = socket.socketpair()
+    in_send = threading.Event()
+    resume = threading.Event()
+    closed = threading.Event()
+
+    class PausingSock:
+        """Real socket; the first write pauses halfway through."""
+
+        first = True
+
+        def sendall(self, data):
+            if PausingSock.first:
+                PausingSock.first = False
+                half = len(data) // 2
+                ours.sendall(data[:half])
+                in_send.set()
+                resume.wait(timeout=5)
+                ours.sendall(data[half:])
+            else:
+                ours.sendall(data)
+
+        def close(self):
+            closed.set()
+            ours.close()
+
+    scope.s = PausingSock()
+
+    def send(i):
+        scope.send_message(json.dumps({"id": i, "method": "m"}) + "\r\n")
+
+    first = threading.Thread(target=send, args=(0,))
+    first.start()
+    try:
+        assert in_send.wait(timeout=5)
+        others = [threading.Thread(target=send, args=(i,)) for i in range(1, 5)]
+        for thread in others:
+            thread.start()
+        closer = threading.Thread(target=scope.socket_force_close)
+        closer.start()
+        # Unfixed, the close lands now, mid-write; fixed, it waits for the lock.
+        closed.wait(timeout=0.3)
+    finally:
+        resume.set()
+    _assert_threads_finished([first, *others, closer])
+    assert closed.is_set()
+    received = _recv_until_eof(peer)
+    peer.close()
+
+    assert logger.errors == []  # no AttributeError from a nulled socket
+    assert received.endswith("\r\n"), f"torn message on the wire: {received!r}"
+    ids = [json.loads(line)["id"] for line in received.split("\r\n")[:-1]]
+    assert ids[0] == 0
+    assert len(ids) == len(set(ids))
+
+
+def test_simultaneous_send_failures_reconnect_and_authenticate_once(monkeypatch):
+    # N writers all fail on the same dead socket. Each used to run its own
+    # disconnect + reconnect + auth, killing the others' fresh sockets.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem", raising=False)
+    server = _ScopeServer()
+    logger = _RecordingLogger()
+    scope = Seestar(logger, "127.0.0.1", server.port, "TestScope", 1, True)
+    monkeypatch.setattr(scope, "send_udp_intro", lambda: None)
+    auth_calls = []
+
+    def authenticate():
+        auth_calls.append(threading.current_thread().name)
+        return True
+
+    monkeypatch.setattr(scope, "authenticate", authenticate)
+    n = 4
+    others_done = threading.Event()
+
+    class DeadSock:
+        def sendall(self, data):
+            raise ConnectionResetError("connection reset by peer")
+
+        def close(self):
+            pass
+
+    def send(i):
+        results[i] = scope.send_message(json.dumps({"id": i, "method": "m"}) + "\r\n")
+
+    others = [threading.Thread(target=send, args=(i,)) for i in range(1, n)]
+
+    def start_others_while_first_recovers(msg):
+        # Logged by the first failed writer after it retired the dead socket and
+        # before it reconnects. Run the other N-1 writers concurrently now: they
+        # find the socket retired and must share one reconnect, not start N.
+        if msg.startswith("Send socket error") and not others_done.is_set():
+            others_done.set()
+            for thread in others:
+                thread.start()
+            _assert_threads_finished(others)
+
+    logger.debug_hook = start_others_while_first_recovers
+    scope.s = DeadSock()
+    scope.is_connected = True
+    scope.is_watch_events = True
+    results = {}
+    first = threading.Thread(target=send, args=(0,))
+    try:
+        first.start()
+        _assert_threads_finished([first])
+        assert others_done.is_set()
+        conns = server.stop()
+        assert len(conns) == 1, f"{len(conns)} reconnects"
+        assert len(auth_calls) == 1, f"{len(auth_calls)} auth handshakes"
+        assert results == {i: True for i in range(n)}
+        received = _recv_lines(conns[0], n)
+        ids = sorted(json.loads(line)["id"] for line in received.split("\r\n")[:-1])
+        assert ids == list(range(n))
+    finally:
+        scope.is_watch_events = False
+        scope.socket_force_close()
+        server.close()
+
+
+def test_command_waits_for_reconnect_auth_while_auth_rpc_goes_through(monkeypatch):
+    # While a reconnect authenticates its fresh socket, its own handshake RPC
+    # must reach the scope, and any other command must wait until auth finishes
+    # (unauthenticated firmware drops it). Nothing may deadlock.
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem", raising=False)
+    server = _ScopeServer()
+    scope = Seestar(DummyLogger(), "127.0.0.1", server.port, "TestScope", 1, True)
+    monkeypatch.setattr(scope, "send_udp_intro", lambda: None)
+    auth_sent = threading.Event()
+    finish_auth = threading.Event()
+
+    def authenticate():
+        _cmdid, sent = scope._send_json({"id": None, "method": "get_verify_str"})
+        if sent:
+            auth_sent.set()
+        finish_auth.wait(timeout=5)
+        return sent
+
+    monkeypatch.setattr(scope, "authenticate", authenticate)
+    results = []
+    reconnecting = threading.Thread(target=scope.reconnect)
+    command = threading.Thread(
+        target=lambda: results.append(
+            scope.send_message('{"id": 1, "method": "get_device_state"}\r\n')
+        )
+    )
+    try:
+        reconnecting.start()
+        assert auth_sent.wait(timeout=5), "the leader's own auth RPC was blocked"
+        command.start()
+        command.join(timeout=0.3)
+        assert command.is_alive(), "command reached the scope mid-handshake"
+    finally:
+        finish_auth.set()
+        _assert_threads_finished([reconnecting, command])
+    try:
+        conns = server.stop()
+        assert len(conns) == 1
+        received = _recv_lines(conns[0], 2)
+        methods = [json.loads(line)["method"] for line in received.split("\r\n")[:-1]]
+        assert methods == ["get_verify_str", "get_device_state"]
+        assert results == [True]
+        assert scope.is_authenticated
+    finally:
+        scope.socket_force_close()
+        server.close()
+
+
+def test_heartbeat_auth_retry_does_not_hold_back_commands(monkeypatch):
+    # A heartbeat retry runs on a socket already carrying traffic. While a busy
+    # scope stalls get_verify_str (up to ~8 s of every retry interval), ordinary
+    # commands must keep going straight out, not wait for the handshake.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem", raising=False)
+    scope = Seestar(DummyLogger(), "127.0.0.1", 4700, "TestScope", 1, True)
+    ours, peer = socket.socketpair()
+    scope.s = ours
+    scope.is_connected = True
+    auth_sent = threading.Event()
+    finish_auth = threading.Event()
+
+    def authenticate():
+        _cmdid, sent = scope._send_json({"id": None, "method": "get_verify_str"})
+        if sent:
+            auth_sent.set()
+        finish_auth.wait(timeout=5)  # the busy scope hasn't answered yet
+        return sent
+
+    monkeypatch.setattr(scope, "authenticate", authenticate)
+    results = []
+    auth = threading.Thread(target=scope._maybe_authenticate)
+    command = threading.Thread(
+        target=lambda: results.append(
+            scope.send_message('{"id": 1, "method": "get_device_state"}\r\n')
+        )
+    )
+    try:
+        auth.start()
+        assert auth_sent.wait(timeout=5)
+        command.start()
+        command.join(timeout=2)
+        assert not command.is_alive(), "command held back by a heartbeat auth retry"
+        assert results == [True]
+    finally:
+        finish_auth.set()
+        _assert_threads_finished([auth, command])
+    try:
+        received = _recv_lines(peer, 2)
+        methods = [json.loads(line)["method"] for line in received.split("\r\n")[:-1]]
+        assert methods == ["get_verify_str", "get_device_state"]
+        assert scope.is_authenticated
+    finally:
+        ours.close()
+        peer.close()
+
+
+def test_heartbeat_auth_does_not_mark_a_replaced_socket_authenticated(monkeypatch):
+    # Without leadership, a reconnect can replace the socket while a heartbeat
+    # handshake is in flight. That handshake's success belongs to the old
+    # socket; the new one must not be reported authenticated because of it.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem", raising=False)
+    scope = Seestar(DummyLogger(), "127.0.0.1", 4700, "TestScope", 1, True)
+    old, old_peer = socket.socketpair()
+    new, new_peer = socket.socketpair()
+    scope.s = old
+    scope.is_connected = True
+
+    def authenticate():
+        scope.s = new  # a reconnect lands mid-handshake
+        return True
+
+    monkeypatch.setattr(scope, "authenticate", authenticate)
+    try:
+        scope._maybe_authenticate()
+        assert scope.is_authenticated is False
+    finally:
+        for s in (old, old_peer, new, new_peer):
+            s.close()
+
+
+def test_disconnect_between_socket_check_and_auth_publish_is_not_authenticated(
+    monkeypatch,
+):
+    # The heartbeat's handshake succeeded; it re-reads self.s to check the socket
+    # is still current, then publishes is_authenticated. A disconnect() landing
+    # between those two steps used to reset the state first, after which the
+    # stale True was written over the reset. Pause the heartbeat at that read
+    # and run the disconnect there.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem", raising=False)
+    auth_done = threading.Event()
+    paused = {"done": False}
+    disconnector = {}
+
+    class PausingScope(Seestar):
+        @property
+        def s(self):
+            value = self._s_real  # the value this read returns
+            if (
+                auth_done.is_set()
+                and not paused["done"]
+                and threading.current_thread() is disconnector["auth_thread"]
+            ):
+                paused["done"] = True
+                # The check has its answer; now disconnect before it publishes.
+                # Fixed, disconnect() blocks on the write lock held around this
+                # read and runs after the publish; unfixed, it finishes here.
+                t = threading.Thread(target=self.disconnect)
+                disconnector["t"] = t
+                t.start()
+                t.join(timeout=0.5)
+            return value
+
+        @s.setter
+        def s(self, value):
+            self._s_real = value
+
+    scope = PausingScope(DummyLogger(), "127.0.0.1", 4700, "TestScope", 1, True)
+    ours, peer = socket.socketpair()
+    scope.s = ours
+    scope.is_connected = True
+
+    def authenticate():
+        auth_done.set()
+        return True
+
+    monkeypatch.setattr(scope, "authenticate", authenticate)
+    auth = threading.Thread(target=scope._maybe_authenticate)
+    disconnector["auth_thread"] = auth
+    try:
+        auth.start()
+        _assert_threads_finished([auth])
+        assert paused["done"], "never reached the post-handshake socket check"
+        _assert_threads_finished([disconnector["t"]])
+        assert scope._s_real is None
+        assert scope.is_authenticated is False
+    finally:
+        ours.close()
+        peer.close()
+
+
+def test_timed_out_partial_write_drops_socket_and_next_send_uses_new_one(
+    monkeypatch,
+):
+    # A sendall() that times out may have put part of the message on the wire.
+    # That socket must never be written again: the next message on it would be
+    # glued to the fragment. Drop it, reconnect, and send on the new socket.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+    server = _ScopeServer()
+    scope = Seestar(DummyLogger(), "127.0.0.1", server.port, "TestScope", 1, True)
+    monkeypatch.setattr(scope, "send_udp_intro", lambda: None)
+    ours, old_peer = socket.socketpair()
+    first_msg = json.dumps({"id": 1, "method": "first"}) + "\r\n"
+    second_msg = json.dumps({"id": 2, "method": "second"}) + "\r\n"
+
+    class StalledSock:
+        def sendall(self, data):
+            ours.sendall(data[: len(data) // 2])
+            raise socket.timeout("timed out")
+
+        def close(self):
+            ours.close()
+
+    scope.s = StalledSock()
+    scope.is_connected = True
+    scope.is_watch_events = True
+    try:
+        # Not resent: the scope may already hold part of it.
+        assert scope.send_message(first_msg) is False
+        assert scope.send_message(second_msg) is True
+        stale = _recv_until_eof(old_peer, timeout=0.5)
+        assert stale == first_msg[: len(first_msg.encode()) // 2]
+        conns = server.stop()
+        assert len(conns) == 1
+        assert _recv_lines(conns[0], 1) == second_msg
+    finally:
+        scope.is_watch_events = False
+        scope.socket_force_close()
+        old_peer.close()
+        server.close()
+
+
+def test_failed_write_retires_socket_before_another_writer_can_use_it(monkeypatch):
+    # The failing sender must retire its socket before releasing the write lock.
+    # Pause it once the lock is released (at its "Send socket error" log line)
+    # and let a second writer run: that writer must not append to the stream
+    # that already holds half of the first message.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+    server = _ScopeServer()
+    scope = Seestar(DummyLogger(), "127.0.0.1", server.port, "TestScope", 1, True)
+    monkeypatch.setattr(scope, "send_udp_intro", lambda: None)
+    ours, old_peer = socket.socketpair()
+    first_msg = json.dumps({"id": 1, "method": "first"}) + "\r\n"
+    second_msg = json.dumps({"id": 2, "method": "second"}) + "\r\n"
+
+    class HalfThenHealthySock:
+        calls = 0
+
+        def sendall(self, data):
+            HalfThenHealthySock.calls += 1
+            if HalfThenHealthySock.calls == 1:
+                ours.sendall(data[: len(data) // 2])
+                raise socket.timeout("timed out")
+            ours.sendall(data)
+
+        def close(self):
+            ours.close()
+
+    second_result = []
+    second = threading.Thread(
+        target=lambda: second_result.append(scope.send_message(second_msg))
+    )
+    real_debug = scope.logger.debug
+
+    def debug(msg, *args, **kwargs):
+        if str(msg).startswith("Send socket error") and not second.is_alive():
+            if not second_result and second.ident is None:
+                second.start()
+                second.join(timeout=2)
+        return real_debug(msg, *args, **kwargs)
+
+    monkeypatch.setattr(scope.logger, "debug", debug)
+    scope.s = HalfThenHealthySock()
+    scope.is_connected = True
+    scope.is_watch_events = True
+    try:
+        assert scope.send_message(first_msg) is False
+        assert not second.is_alive()
+        # The second writer reconnected and sent on the new socket.
+        assert second_result == [True]
+        stale = _recv_until_eof(old_peer, timeout=0.5)
+        assert stale == first_msg[: len(first_msg.encode()) // 2]
+        conns = server.stop()
+        assert len(conns) == 1
+        assert _recv_lines(conns[0], 1) == second_msg
+    finally:
+        scope.is_watch_events = False
+        scope.socket_force_close()
+        old_peer.close()
+        server.close()
+
+
+def test_receive_error_during_another_reconnect_does_not_block_reader(monkeypatch):
+    # The receive thread hits a socket error while another thread is mid-
+    # reconnect (waiting on the scope's auth reply). It must return at once and
+    # keep reading -- not start, or wait on, a second reconnect -- or nothing
+    # drains the socket and the handshake reply is never read.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem", raising=False)
+    server = _ScopeServer()
+    scope = Seestar(DummyLogger(), "127.0.0.1", server.port, "TestScope", 1, True)
+    monkeypatch.setattr(scope, "send_udp_intro", lambda: None)
+    auth_started = threading.Event()
+    finish_auth = threading.Event()
+    auth_calls = []
+
+    def authenticate():
+        auth_calls.append(threading.current_thread().name)
+        auth_started.set()
+        finish_auth.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(scope, "authenticate", authenticate)
+    scope.is_watch_events = True
+    out = []
+    reconnecting = threading.Thread(target=scope.reconnect)
+    reader = threading.Thread(target=lambda: out.append(scope.get_socket_msg()))
+    scope.get_msg_thread = reader
+    try:
+        reconnecting.start()
+        assert auth_started.wait(timeout=5)
+        assert server.wait_for_conns(1)
+        # The scope resets the fresh connection, so the reader's recv() fails.
+        conn = server.conns[0]
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        conn.close()
+        reader.start()
+        reader.join(timeout=2)
+        assert not reader.is_alive(), "receive thread blocked behind a reconnect"
+    finally:
+        finish_auth.set()
+        _assert_threads_finished([reconnecting, reader])
+        scope.is_watch_events = False
+        scope.socket_force_close()
+        server.close()
+    assert out == [None]
+    assert len(auth_calls) == 1
+
+
+def test_get_socket_msg_without_socket_reconnects_when_nobody_else_is(
+    monkeypatch, seestar
+):
+    sleeps = []
+    monkeypatch.setattr("device.seestar_device.time.sleep", sleeps.append)
+    new_sock = _DummySocket(recv_value=b"x")
+
+    def reconnect(wait=True):
+        assert wait is False
+        seestar.s = new_sock
+        seestar.is_connected = True
+        return True
+
+    monkeypatch.setattr(seestar, "reconnect", reconnect)
+    seestar.s = None
+    seestar.is_watch_events = True
+    assert seestar.get_socket_msg() is None
+    assert seestar.s is new_sock
+    assert sleeps == []  # reconnected: read the new socket straight away
+
+
+def test_get_socket_msg_without_socket_paces_failed_reconnects(monkeypatch, seestar):
+    # Scope really off: each failed attempt still backs off, so the reader
+    # never spins reconnect + UDP intro + connect in a tight loop.
+    sleeps = []
+    monkeypatch.setattr("device.seestar_device.time.sleep", sleeps.append)
+    reconnects = []
+    monkeypatch.setattr(
+        seestar, "reconnect", lambda wait=True: reconnects.append(wait) or False
+    )
+    seestar.s = None
+    seestar.is_watch_events = True
+    assert seestar.get_socket_msg() is None
+    assert reconnects == [False]
+    assert sleeps == [3]
+
+    # A stale is_connected with no socket must not turn into a hot loop either.
+    monkeypatch.setattr(seestar, "reconnect", lambda wait=True: True)
+    assert seestar.get_socket_msg() is None
+    assert sleeps == [3, 3]
+
+
+def test_get_socket_msg_without_socket_never_reconnects_once_watch_ends(
+    monkeypatch, seestar
+):
+    sleeps = []
+    monkeypatch.setattr("device.seestar_device.time.sleep", sleeps.append)
+    monkeypatch.setattr(
+        seestar, "reconnect", lambda wait=True: pytest.fail("reconnected")
+    )
+    seestar.s = None
+    seestar.is_watch_events = False
+    assert seestar.get_socket_msg() is None
+    assert sleeps == [3]
+
+
+def test_get_socket_msg_without_socket_leaves_reconnect_to_running_heartbeat(
+    monkeypatch, seestar
+):
+    # Once the heartbeat runs it retries every 5 s itself; the reader must not
+    # add a second retry loop in offline mode.
+    sleeps = []
+    monkeypatch.setattr("device.seestar_device.time.sleep", sleeps.append)
+    monkeypatch.setattr(
+        seestar, "reconnect", lambda wait=True: pytest.fail("reconnected")
+    )
+    seestar.heartbeat_msg_thread = SimpleNamespace(is_alive=lambda: True)
+    seestar.s = None
+    seestar.is_watch_events = True
+    assert seestar.get_socket_msg() is None
+    assert sleeps == [3]
+
+
+def test_reset_during_another_reconnect_is_recovered_by_the_reader(monkeypatch):
+    # Issue #798: Docker's port proxy resets the connection a reconnect (here
+    # the start-up one, mid-handshake) just opened. The reader drops the
+    # socket and, finding a reconnect in flight, does not start another. That
+    # reconnect then fails, since its socket is gone. Before the fix the reader
+    # then only logged "socket not initialized!" until the heartbeat started,
+    # after the initial sync call's timeout. Now its next read reconnects.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(Config, "seestar_interop_pem", "/some/key.pem", raising=False)
+    server = _ScopeServer()
+    scope = Seestar(DummyLogger(), "127.0.0.1", server.port, "TestScope", 1, True)
+    monkeypatch.setattr(scope, "send_udp_intro", lambda: None)
+    auth_started = threading.Event()
+    finish_auth = threading.Event()
+    auth_calls = []
+
+    def authenticate():
+        auth_calls.append(threading.current_thread().name)
+        auth_started.set()
+        if len(auth_calls) == 1:
+            finish_auth.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(scope, "authenticate", authenticate)
+    scope.is_watch_events = True
+    results = {}
+    starting = threading.Thread(
+        target=lambda: results.setdefault("startup", scope.reconnect())
+    )
+    reader = threading.Thread(target=lambda: None)
+    scope.get_msg_thread = reader
+    try:
+        starting.start()
+        assert auth_started.wait(timeout=5)
+        assert server.wait_for_conns(1)
+        conn = server.conns[0]
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        conn.close()
+        assert scope.get_socket_msg() is None  # reset seen; reconnect in flight
+        finish_auth.set()
+        _assert_threads_finished([starting])
+        assert results["startup"] is False
+        assert scope.s is None
+
+        # The reader's next pass reconnects on its own.
+        assert scope.get_socket_msg() is None
+        assert server.wait_for_conns(2)
+        assert scope.s is not None
+        assert scope.is_connected
+        assert scope.is_authenticated
+        assert len(auth_calls) == 2
+    finally:
+        finish_auth.set()
+        scope.is_watch_events = False
+        scope.socket_force_close()
+        server.close()
+
+
+@pytest.mark.parametrize("close_with", ["fin", "rst"])
+def test_receive_thread_rides_out_a_port_proxy_until_the_scope_listens(
+    monkeypatch, close_with
+):
+    # End to end: the "scope" port accepts and immediately closes the first
+    # few connections (Docker's proxy before the firmware binds), with FIN or
+    # RST. The receive thread alone must end up on a live connection and
+    # deliver the scope's first message.
+    real_sleep = time.sleep
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: real_sleep(0.01))
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: real_sleep(0.01))
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.05)
+    port = listener.getsockname()[1]
+    stop = threading.Event()
+    held = []
+
+    def serve():
+        dropped = 0
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if dropped < 3:
+                dropped += 1
+                if close_with == "rst":
+                    conn.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                conn.close()
+                continue
+            conn.sendall(b'{"Event":"PiStatus","temp":42}\r\n')
+            held.append(conn)
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    scope = Seestar(DummyLogger(), "127.0.0.1", port, "TestScope", 1, True)
+    monkeypatch.setattr(scope, "send_udp_intro", lambda: None)
+    scope.is_watch_events = True
+    scope.reconnect()
+    reader = threading.Thread(target=scope.receive_message_thread_fn, daemon=True)
+    scope.get_msg_thread = reader
+    try:
+        reader.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "PiStatus" not in scope.event_state:
+            real_sleep(0.02)
+        assert scope.event_state.get("PiStatus", {}).get("temp") == 42
+        assert scope.is_connected
+        assert len(held) == 1
+    finally:
+        scope.is_watch_events = False
+        stop.set()
+        server.join(timeout=5)
+        # Closing the scope side ends the reader's blocking recv() at once.
+        for c in held:
+            c.close()
+        reader.join(timeout=5)
+        assert not reader.is_alive()
+        scope.socket_force_close()
+        listener.close()
+
+
+def test_receive_loop_processes_leftover_from_its_own_reconnect(monkeypatch, seestar):
+    # When the receive thread itself reconnects, the handshake reads the new
+    # socket directly and parks unrelated lines in _auth_leftover. The loop
+    # must pick them up then, not only at thread start, and must drop any
+    # partial line still held from the old socket.
+    calls = []
+
+    def fake_get_socket_msg():
+        calls.append(1)
+        if len(calls) == 1:
+            return '{"Event": "Old", "n": 1}\r\n{"partial-from-old-sock'
+        if len(calls) == 2:
+            # Reconnected on this thread; the handshake parked these.
+            seestar._auth_leftover = (
+                '{"Event": "PiStatus", "temp": 42}\r\n{"Event": "Spl'
+            )
+            return None
+        seestar.is_watch_events = False
+        return 'it", "x": 1}\r\n'
+
+    monkeypatch.setattr(seestar, "get_socket_msg", fake_get_socket_msg)
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    seestar.is_watch_events = True
+    seestar.receive_message_thread_fn()
+
+    assert seestar._auth_leftover == ""
+    assert seestar.event_state.get("PiStatus", {}).get("temp") == 42
+    assert seestar.event_state.get("Split", {}).get("x") == 1
+
+
+def test_pinned_command_ids_are_sent_unchanged_and_never_reallocated(seestar):
+    ours, peer = socket.socketpair()
+    seestar.s = ours
+    try:
+        seestar.json_message("pinned", id=10001)  # inside the auto range
+        for _ in range(3):
+            seestar.json_message("auto")
+        seestar.heartbeat()  # pins 420
+        seestar.json_message("zero", id=0)
+    finally:
+        ours.close()
+    received = _recv_until_eof(peer)
+    peer.close()
+    sent = [json.loads(line) for line in received.split("\r\n")[:-1]]
+    ids = {}
+    for msg in sent:
+        ids.setdefault(msg["method"], []).append(msg["id"])
+    assert ids["pinned"] == [10001]
+    assert ids["scope_get_equ_coord"] == [420]
+    assert ids["zero"] == [0]
+    assert 10001 not in ids["auto"]
+    assert len(set(ids["auto"])) == 3
+
+
+def test_get_event_state_injects_mount_equ_mode(seestar):
+    # The mount block is always present (existing pollers never KeyError), but
+    # equ_mode stays None until the device actually reports it.
+    out = seestar.get_event_state()
+    assert out["result"]["mount"]["equ_mode"] is None
+    assert out["result"]["mount"]["equ_mode_confirmed"] is False
+
+    seestar.is_EQ_mode_confirmed = True
+    seestar.is_EQ_mode = True
+    out = seestar.get_event_state()
+    assert out["result"]["mount"]["Event"] == "Mount"
+    assert out["result"]["mount"]["equ_mode"] is True
+
+    seestar.is_EQ_mode = False
+    out = seestar.get_event_state({"event_name": "mount"})
+    assert out["result"]["equ_mode"] is False
 
 
 def test_get_altaz_from_eq_paths(monkeypatch, seestar):
@@ -754,6 +2615,38 @@ def test_receive_message_thread_updates_state_and_callbacks(monkeypatch, seestar
     assert seestar.event_state["Stack"]["stacked_frame"] == 5
     assert "Simu_Stack" not in seestar.event_state
     assert "EqModePA" in fired
+
+
+def test_receive_message_thread_handles_second_eqmodepa_complete_without_xy(
+    monkeypatch, seestar
+):
+    # Real firmware (v3.1.2/7.32, captured against the sandbox) sends TWO
+    # "EqModePA"/"complete" events per 3PPA run: the first (from
+    # ThreePointPaFunc) carries the measured x/y pa_error; a second one
+    # (pushed after GyroPaFunc finishes) is a bare wrap-up notification with
+    # no x/y at all:
+    #   {"Event":"EqModePA","state":"complete","lapse_ms":22437,
+    #    "total":0.162165,"x":-0.073424,"y":-0.144590,"route":[]}
+    #   {"Event":"EqModePA","state":"complete","lapse_ms":22437,"route":[]}
+    seestar.is_watch_events = True
+
+    messages = (
+        '{"Event":"EqModePA","state":"complete","lapse_ms":22437,'
+        '"total":0.162165,"x":-0.073424,"y":-0.144590,"route":[]}\r\n'
+        '{"Event":"EqModePA","state":"complete","lapse_ms":22437,"route":[]}\r\n'
+    )
+    monkeypatch.setattr(seestar, "get_socket_msg", lambda: messages)
+
+    def fake_sleep(_s):
+        seestar.is_watch_events = False
+
+    monkeypatch.setattr("device.seestar_device.time.sleep", fake_sleep)
+    monkeypatch.setattr("device.seestar_device.Config.log_events_in_info", False)
+
+    seestar.receive_message_thread_fn()
+
+    assert seestar.cur_pa_error_x == -0.073424
+    assert seestar.cur_pa_error_y == -0.144590
 
 
 def test_start_stack_and_stop_plate_and_last_image(monkeypatch, seestar):
@@ -970,6 +2863,119 @@ def test_start_up_thread_fn_success_and_old_firmware(monkeypatch, seestar):
     assert seestar.schedule["state"] == "stopped"
 
 
+@pytest.mark.parametrize(
+    "mount, confirmed, equ_mode",
+    [
+        ({}, False, False),
+        ({"move_type": "none"}, False, False),
+        ({"equ_mode": None}, False, False),
+        ({"equ_mode": True}, True, True),
+        ({"equ_mode": False}, True, False),
+    ],
+)
+def test_start_up_confirms_eq_mode_only_when_equ_mode_present(
+    monkeypatch, seestar, mount, confirmed, equ_mode
+):
+    # A startup get_device_state whose mount block lacks equ_mode must NOT mark
+    # the default as confirmed, or get_event_state would expose it as real.
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr(
+        "device.seestar_device.tzlocal.get_localzone_name", lambda: "UTC"
+    )
+
+    import datetime as _dt
+
+    monkeypatch.setattr(
+        "device.seestar_device.tzlocal.get_localzone", lambda: _dt.timezone.utc
+    )
+    monkeypatch.setattr("device.seestar_device.EarthLocation", lambda **_k: object())
+    monkeypatch.setattr(seestar, "set_setting", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(seestar, "play_sound", lambda _sid: None)
+
+    def fake_sync(payload):
+        if payload["method"] == "get_device_state":
+            reply = {
+                "jsonrpc": "2.0",
+                "method": "get_device_state",
+                "result": {"device": {"firmware_ver_int": 2500}, "mount": mount},
+                "id": 501,
+            }
+            # The receive thread caches the mode from the reply, as on the socket.
+            _receive_device_replies(monkeypatch, seestar, reply)
+            return reply
+        return {"result": "ok"}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_sync)
+
+    seestar.start_up_thread_fn(
+        {"lat": 1.1, "lon": 2.2, "auto_focus": False, "3ppa": False}
+    )
+    assert seestar.is_EQ_mode_confirmed is confirmed
+    assert seestar.is_EQ_mode is equ_mode
+    out = seestar.get_event_state()
+    assert out["result"]["mount"]["equ_mode"] is (equ_mode if confirmed else None)
+
+
+def test_start_up_thread_fn_sends_pi_set_time_as_object_and_logs_failure(
+    monkeypatch, seestar
+):
+    """Regression test for issues #748/#758. Decompiled firmware confirms
+    pi_set_time's json_array2obj unwraps a single-element list fine, so
+    [date_json] alone was never the problem -- the real bug was
+    transform_message_for_verify double-nesting it into [[date_json],
+    "verify"] (fixed separately), which json_array2obj cannot unwrap to an
+    object. Sending a bare object here is a defensive choice that also
+    matches what real-hardware testers confirmed works. Separately, the
+    failure was silently swallowed (logged at info level with no error
+    check), which is how a user could lose a night of imaging to a stale
+    scope clock without any warning in the logs -- that part of this fix
+    stands regardless of the shape question.
+    """
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr(
+        "device.seestar_device.tzlocal.get_localzone_name", lambda: "UTC"
+    )
+    import datetime as _dt
+
+    monkeypatch.setattr(
+        "device.seestar_device.tzlocal.get_localzone", lambda: _dt.timezone.utc
+    )
+    monkeypatch.setattr("device.seestar_device.EarthLocation", lambda **_k: object())
+    monkeypatch.setattr(seestar, "set_setting", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(seestar, "play_sound", lambda _sid: None)
+
+    sent = []
+    warnings = []
+    monkeypatch.setattr(
+        seestar.logger, "warning", lambda *a, **k: warnings.append((a, k))
+    )
+
+    def fake_sync(payload):
+        if payload["method"] == "get_device_state":
+            return {"result": {"device": {"firmware_ver_int": 2846}}}
+        if payload["method"] == "pi_set_time":
+            sent.append(payload)
+            return {"error": "expected object param", "code": 107}
+        return {"result": "ok"}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_sync)
+
+    seestar.start_up_thread_fn(
+        {
+            "lat": 1.1,
+            "lon": 2.2,
+            "auto_focus": False,
+            "3ppa": False,
+            "dark_frames": False,
+        }
+    )
+
+    assert sent, "pi_set_time was never sent"
+    assert isinstance(sent[0]["params"], dict)
+    assert "year" in sent[0]["params"] and "time_zone" in sent[0]["params"]
+    assert warnings, "a failed pi_set_time must be logged as a warning, not swallowed"
+
+
 def test_spectra_thread_and_start_item(monkeypatch, seestar):
     monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
 
@@ -1076,6 +3082,9 @@ def test_udp_intro_and_heartbeat_helpers(monkeypatch, seestar):
 
 
 def test_heartbeat_thread_and_plate_solve(monkeypatch, seestar):
+    # Isolate from the developer's local config.toml: if interop_pem is set
+    # there, the heartbeat loop's _maybe_authenticate() would attempt real auth.
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
     seestar.is_watch_events = True
     seestar.is_connected = False
     reconnect_calls = {"n": 0}
@@ -1122,6 +3131,33 @@ def test_slew_sync_stop_and_sound_paths(monkeypatch, seestar):
     assert seestar.stop_slew()["result"] == "ok"
     assert seestar.play_sound(3)["result"] == "ok"
     assert seestar.stop_stack()["result"] == "ok"
+
+
+def test_slew_to_ra_dec_and_sync_target_send_object_params(monkeypatch, seestar):
+    """Regression test for issue #758. Decompiled firmware confirms scope_goto/
+    scope_sync actually accept EITHER a keyed object OR a positional [ra, dec]
+    list -- the real bug was transform_message_for_verify double-nesting list
+    params into [[ra, dec], "verify"] (fixed separately). Sending a keyed
+    object here is a defensive choice that also matches what real-hardware
+    testers on firmware 7.75/8.46 confirmed works, and it sidesteps the
+    verify-injection wrapper on firmware >= 2706 entirely.
+    """
+    sent = []
+    monkeypatch.setattr(
+        seestar,
+        "send_message_param_sync",
+        lambda d: sent.append(d) or {"result": "ok"},
+    )
+    monkeypatch.setattr(seestar, "wait_end_op", lambda _e: True)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+
+    seestar._slew_to_ra_dec([12.3, 45.6])
+    assert sent[-1]["method"] == "scope_goto"
+    assert sent[-1]["params"] == {"ra": 12.3, "dec": 45.6}
+
+    seestar._sync_target([1.0, 2.0])
+    assert sent[-1]["method"] == "scope_sync"
+    assert sent[-1]["params"] == {"ra": 1.0, "dec": 2.0}
 
 
 def test_send_message_and_shutdown_thread(monkeypatch, seestar):
@@ -1495,6 +3531,100 @@ def test_mosaic_thread_fn_happy_path(monkeypatch, seestar):
     assert seestar.is_cur_scheduler_item_working is False
 
 
+def test_framed_mosaic_thread_fn_happy_path(monkeypatch, seestar):
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(seestar, "mosaic_goto_inner_worker", lambda *_a, **_k: True)
+    monkeypatch.setattr(seestar, "set_target_name", lambda _n: {"ok": True})
+    monkeypatch.setattr(seestar, "start_stack", lambda _p: True)
+    monkeypatch.setattr(seestar, "stop_stack", lambda: {"ok": True})
+
+    sent = []
+    monkeypatch.setattr(
+        seestar,
+        "send_message_param_sync",
+        lambda p: sent.append(p) or {"ok": True},
+    )
+    seestar.schedule["state"] = "working"
+    seestar.schedule["is_skip_requested"] = False
+    seestar.schedule["current_item_id"] = "fm1"
+    seestar.event_state["scheduler"] = {"cur_scheduler_item": {}}
+
+    seestar.framed_mosaic_thread_fn(
+        "T1", 1.0, 2.0, False, 5, 1.5, 45.0, 80, False, 1, 5, "DeepSky"
+    )
+
+    assert (
+        seestar.event_state["scheduler"]["cur_scheduler_item"]["action"] == "complete"
+    )
+    assert seestar.is_cur_scheduler_item_working is False
+
+    mosaic_sets = [
+        p["params"]["mosaic"] for p in sent if "mosaic" in p.get("params", {})
+    ]
+    assert mosaic_sets[0] == {"scale": 1.5, "angle": 45.0}
+    assert mosaic_sets[-1] == {"scale": 1.0, "angle": 0.0}
+
+
+def test_framed_mosaic_thread_fn_skips_mosaic_setting_on_goto_failure(
+    monkeypatch, seestar
+):
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(seestar, "mosaic_goto_inner_worker", lambda *_a, **_k: False)
+
+    sent = []
+    monkeypatch.setattr(
+        seestar,
+        "send_message_param_sync",
+        lambda p: sent.append(p) or {"ok": True},
+    )
+    seestar.schedule["state"] = "working"
+    seestar.schedule["is_skip_requested"] = False
+    seestar.schedule["current_item_id"] = "fm2"
+    seestar.event_state["scheduler"] = {"cur_scheduler_item": {}}
+
+    seestar.framed_mosaic_thread_fn(
+        "T1", 1.0, 2.0, False, 5, 1.5, 45.0, 80, False, 1, 1, "DeepSky"
+    )
+
+    assert seestar.is_cur_scheduler_item_working is False
+    assert not any("mosaic" in p.get("params", {}) for p in sent)
+
+
+def test_framed_mosaic_thread_fn_resets_mosaic_setting_on_stack_failure(
+    monkeypatch, seestar
+):
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(seestar, "mosaic_goto_inner_worker", lambda *_a, **_k: True)
+    monkeypatch.setattr(seestar, "set_target_name", lambda _n: {"ok": True})
+    monkeypatch.setattr(seestar, "start_stack", lambda _p: False)
+
+    sent = []
+    monkeypatch.setattr(
+        seestar,
+        "send_message_param_sync",
+        lambda p: sent.append(p) or {"ok": True},
+    )
+    seestar.schedule["state"] = "working"
+    seestar.schedule["is_skip_requested"] = False
+    seestar.schedule["current_item_id"] = "fm3"
+    seestar.event_state["scheduler"] = {"cur_scheduler_item": {}}
+
+    seestar.framed_mosaic_thread_fn(
+        "T1", 1.0, 2.0, False, 5, 1.5, 45.0, 80, False, 1, 1, "DeepSky"
+    )
+
+    mosaic_sets = [
+        p["params"]["mosaic"] for p in sent if "mosaic" in p.get("params", {})
+    ]
+    assert mosaic_sets == [
+        {"scale": 1.5, "angle": 45.0},
+        {"scale": 1.0, "angle": 0.0},
+    ]
+
+
 def test_start_mosaic_item_paths(monkeypatch, seestar):
     monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
     monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
@@ -1570,6 +3700,67 @@ def test_start_mosaic_item_paths(monkeypatch, seestar):
     seestar.schedule["state"] = "working"
     seestar.start_mosaic_item(good)
     assert started["count"] == 1
+
+
+def test_start_framed_mosaic_item_paths(monkeypatch, seestar):
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+
+    class FakeCoord:
+        ra = SimpleNamespace(hour=1.5)
+        dec = SimpleNamespace(deg=2.5)
+
+    monkeypatch.setattr(
+        "device.seestar_device.Util.parse_coordinate", lambda *_a, **_k: FakeCoord
+    )
+
+    started = {"count": 0}
+
+    class FakeThread:
+        def __init__(self, target=None):
+            self.target = target
+            self.name = ""
+
+        def start(self):
+            started["count"] += 1
+
+    monkeypatch.setattr("device.seestar_device.threading.Thread", FakeThread)
+    monkeypatch.setattr(seestar, "framed_mosaic_thread_fn", lambda *a, **k: None)
+
+    # scheduler not working branch
+    seestar.schedule["state"] = "stopped"
+    assert (
+        seestar.start_framed_mosaic_item({"target_name": "T", "ra": 1, "dec": 2})
+        is None
+    )
+
+    base_params = {
+        "target_name": "T",
+        "ra": 1.0,
+        "dec": 2.0,
+        "is_j2000": False,
+        "is_use_lp_filter": False,
+        "panel_time_sec": 5,
+        "mosaic_scale": 1.5,
+        "mosaic_angle": 45.0,
+        "gain": 80,
+    }
+
+    # invalid scale
+    seestar.schedule["state"] = "working"
+    bad_scale = dict(base_params, mosaic_scale=4.5)
+    assert seestar.start_framed_mosaic_item(bad_scale) is None
+    assert started["count"] == 0
+
+    # invalid angle
+    bad_angle = dict(base_params, mosaic_angle=-91.0)
+    assert seestar.start_framed_mosaic_item(bad_angle) is None
+    assert started["count"] == 0
+
+    # valid params start a thread
+    assert seestar.start_framed_mosaic_item(base_params) is None
+    assert started["count"] == 1
+    assert seestar.is_cur_scheduler_item_working is True
 
 
 def test_startup_sequence_error_branches(monkeypatch, seestar):
@@ -2156,12 +4347,38 @@ def test_move_scope_falls_through_when_horiz_coord_unavailable(seestar):
         set_sun_monitor(prev)
 
 
-# --- P1: send lock serializes cmdid allocation + socket send --------------
+def test_move_scope_refuses_jog_whose_path_enters_sun_cone(monkeypatch, seestar):
+    """The current pointing is just outside the cone (sun at az 180 / alt 30,
+    mount at az 180 / el 65: 35° away). A full-speed jog toward the sun
+    (270° = -el, ~18° in 3 s) would enter the cone and is refused; the same
+    jog away from the sun (90° = +el) goes out."""
+    from device import sun_safety as ss
+    from device.sun_safety import get_sun_monitor, set_sun_monitor
+
+    monkeypatch.setattr(Config, "init_lat", 33.96)
+    monkeypatch.setattr(Config, "init_long", -118.46)
+    monkeypatch.setattr(ss, "compute_sun_altaz", lambda **_kw: (180.0, 30.0))
+    prev = get_sun_monitor()
+    set_sun_monitor(None)
+    sent = []
+    seestar.send_message_param_sync = _horiz_coord_sync(sent, alt=65.0, az=180.0)
+    try:
+        assert seestar.move_scope(270, 1440) is False
+        assert not any(p["method"] == "scope_speed_move" for p in sent)
+
+        sent.clear()
+        assert seestar.move_scope(90, 1440) is True
+        assert any(p["method"] == "scope_speed_move" for p in sent)
+    finally:
+        set_sun_monitor(prev)
+
+
+# --- P1: cmdid allocation is atomic under concurrent senders --------------
 
 
 def test_send_message_param_assigns_unique_ids_under_concurrency(seestar):
-    """Two concurrent senders must never receive the same cmdid: the send
-    lock covers id-allocation + send atomically."""
+    """Two concurrent senders must never receive the same cmdid (ids are
+    claimed atomically under _cmdid_lock in _claim_cmdid)."""
     import threading
 
     seestar.firmware_ver_int = 2000  # no verify injection at this fw
@@ -2193,17 +4410,7 @@ def test_send_message_param_assigns_unique_ids_under_concurrency(seestar):
     assert len(set(ids)) == 50, "cmdids must be unique under concurrent senders"
 
 
-# ---------- audit-fix regressions: send lock + move_scope sun guards ------
-
-
-def test_send_lock_is_reentrant(seestar):
-    """send_message recovers from socket errors by reconnecting; the
-    reconnect auth handshake sends on this same thread while _send_lock is
-    already held. A plain Lock self-deadlocks there, so the lock must allow
-    same-thread reacquisition."""
-    with seestar._send_lock:
-        assert seestar._send_lock.acquire(timeout=1.0)
-        seestar._send_lock.release()
+# ---------- audit-fix regressions: move_scope sun guards ------------------
 
 
 def test_move_scope_zero_speed_stop_bypasses_sun_guards(seestar, monkeypatch):
@@ -2267,3 +4474,942 @@ def test_move_scope_zero_speed_stop_passes_without_jog(seestar, monkeypatch):
     monkeypatch.setattr(ss, "sun_safety_is_locked_out", lambda: True)
     assert seestar.move_scope(0, 0, 1) is True
     assert sent and sent[0]["params"]["speed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# start_stack – stack_type / set_stack_type
+# ---------------------------------------------------------------------------
+
+
+def test_start_stack_sends_set_stack_type_before_iscope_start_stack(
+    monkeypatch, seestar
+):
+    """set_stack_type must be called before iscope_start_stack when stack_type provided."""
+    calls = []
+
+    def fake_send(payload):
+        calls.append(payload["method"])
+        return {"result": 0}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_send)
+
+    result = seestar.start_stack({"restart": True, "stack_type": "SolarSystem"})
+
+    assert result is True
+    assert "set_stack_type" in calls
+    assert "iscope_start_stack" in calls
+    assert calls.index("set_stack_type") < calls.index("iscope_start_stack")
+
+
+def test_start_stack_set_stack_type_carries_correct_type_value(monkeypatch, seestar):
+    sent_params = {}
+
+    def fake_send(payload):
+        if payload["method"] == "set_stack_type":
+            sent_params.update(payload.get("params", {}))
+        return {"result": 0}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_send)
+
+    seestar.start_stack({"restart": False, "stack_type": "MilkyWay"})
+
+    assert sent_params.get("type") == "MilkyWay"
+
+
+def test_start_stack_skips_set_stack_type_when_not_provided(monkeypatch, seestar):
+    calls = []
+
+    def fake_send(payload):
+        calls.append(payload["method"])
+        return {"result": 0}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_send)
+
+    seestar.start_stack({"restart": True})
+
+    assert "set_stack_type" not in calls
+    assert "iscope_start_stack" in calls
+
+
+def test_start_stack_skips_set_stack_type_with_default_params(monkeypatch, seestar):
+    """Calling start_stack() with no args (uses Config defaults) must not call set_stack_type."""
+    calls = []
+
+    def fake_send(payload):
+        calls.append(payload["method"])
+        return {"result": 0, "code": 0}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_send)
+
+    seestar.start_stack()
+
+    assert "set_stack_type" not in calls
+
+
+def test_start_stack_retries_iscope_start_stack_on_error(monkeypatch, seestar):
+    """start_stack retries iscope_start_stack once on error; set_stack_type only sent once."""
+    import time as _time
+
+    call_counts = {"set_stack_type": 0, "iscope_start_stack": 0}
+    attempt = {"n": 0}
+
+    def fake_send(payload):
+        method = payload["method"]
+        if method == "set_stack_type":
+            call_counts["set_stack_type"] += 1
+            return {"result": 0}
+        if method == "iscope_start_stack":
+            call_counts["iscope_start_stack"] += 1
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                return {"error": "busy"}  # first attempt fails
+            return {"result": 0}
+        return {"result": 0}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_send)
+    monkeypatch.setattr(_time, "sleep", lambda _: None)
+
+    result = seestar.start_stack({"restart": True, "stack_type": "DeepSky"})
+
+    assert result is True
+    assert call_counts["iscope_start_stack"] == 2  # retried once
+    assert call_counts["set_stack_type"] == 1  # not re-sent on retry
+
+
+def test_start_stack_returns_false_when_both_attempts_fail(monkeypatch, seestar):
+    import time as _time
+
+    monkeypatch.setattr(
+        seestar, "send_message_param_sync", lambda _p: {"error": "unavailable"}
+    )
+    monkeypatch.setattr(_time, "sleep", lambda _: None)
+
+    result = seestar.start_stack({"restart": True, "stack_type": "SolarSystem"})
+
+    assert result is False
+
+
+def _mosaic_item_params(stack_type=None):
+    p = {
+        "target_name": "M31",
+        "ra": "0.7122",
+        "dec": "41.269",
+        "is_j2000": False,
+        "is_use_lp_filter": False,
+        "panel_time_sec": 60,
+        "ra_num": 1,
+        "dec_num": 1,
+        "panel_overlap_percent": 10,
+        "gain": 80,
+        "is_use_autofocus": False,
+        "selected_panels": "",
+        "num_tries": 1,
+        "retry_wait_s": 300,
+    }
+    if stack_type is not None:
+        p["stack_type"] = stack_type
+    return p
+
+
+def _setup_mosaic_item_test(monkeypatch, seestar):
+    """Shared setup: stub out get_setting call and thread spawning."""
+    received = {}
+
+    # start_mosaic_item calls send_message_param_sync("get_setting") before spawning thread
+    monkeypatch.setattr(
+        seestar,
+        "send_message_param_sync",
+        lambda _p: {"result": {"exp_ms": {}, "stack_dither": {}}},
+    )
+
+    def fake_mosaic_thread_fn(*args, **kwargs):
+        # stack_type is the last positional arg passed by the lambda in start_mosaic_item
+        received["stack_type"] = args[-1] if args else kwargs.get("stack_type")
+        received["check_horizon"] = kwargs.get("check_horizon")
+
+    class FakeThread:
+        def __init__(self, target=None):
+            self.target = target
+            self.name = ""
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr("device.seestar_device.threading.Thread", FakeThread)
+    monkeypatch.setattr(seestar, "mosaic_thread_fn", fake_mosaic_thread_fn)
+    seestar.schedule["state"] = "working"
+
+    return received
+
+
+def test_start_mosaic_item_extracts_stack_type_from_params(monkeypatch, seestar):
+    """start_mosaic_item must pass stack_type down to mosaic_thread_fn."""
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    seestar.start_mosaic_item(_mosaic_item_params(stack_type="SolarSystem"))
+    assert received.get("stack_type") == "SolarSystem"
+
+
+def test_start_mosaic_item_defaults_stack_type_to_deepsky(monkeypatch, seestar):
+    """stack_type absent from params → mosaic_thread_fn receives 'DeepSky'."""
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    seestar.start_mosaic_item(_mosaic_item_params())  # no stack_type key
+    assert received.get("stack_type") == "DeepSky"
+
+
+def test_start_stack_set_stack_type_failure_is_non_fatal(monkeypatch, seestar):
+    """If set_stack_type returns an error, iscope_start_stack is still called."""
+    import time as _time
+
+    calls = []
+
+    def fake_send(payload):
+        method = payload["method"]
+        calls.append(method)
+        if method == "set_stack_type":
+            return {"error": "method not supported"}
+        return {"result": 0}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_send)
+    monkeypatch.setattr(_time, "sleep", lambda _: None)
+
+    result = seestar.start_stack({"restart": True, "stack_type": "SolarSystem"})
+
+    assert "set_stack_type" in calls
+    assert "iscope_start_stack" in calls
+    assert result is True
+
+
+class _AuthFakeSocket:
+    """A socket that answers the auth handshake line-by-line, like the device.
+
+    Crucially it serves replies via recv() directly -- it does NOT depend on
+    the receive_message_thread running, which is exactly the condition under
+    which authenticate() must work (auth runs before that thread starts).
+    Optionally emits an unsolicited event line ahead of a reply so we can
+    assert those bytes are preserved for the receive thread.
+    """
+
+    def __init__(self, replies, pre_events=None):
+        self._replies = list(replies)
+        self._pre_events = list(pre_events or [])
+        self._outbox = b""
+        self._timeout = None
+        self.sent = []
+
+    def gettimeout(self):
+        return self._timeout
+
+    def settimeout(self, t):
+        self._timeout = t
+
+    def sendall(self, payload):
+        self.sent.append(payload)
+        try:
+            req = json.loads(payload.decode("utf-8").strip())
+        except Exception:
+            req = {}
+        if not self._replies:
+            return
+        reply = dict(self._replies.pop(0))
+        reply["id"] = req.get("id")  # device echoes the request id
+        chunk = b""
+        if self._pre_events:
+            ev = self._pre_events.pop(0)
+            chunk += (json.dumps(ev) + "\r\n").encode("utf-8")
+        chunk += (json.dumps(reply) + "\r\n").encode("utf-8")
+        self._outbox += chunk
+
+    def recv(self, _n):
+        if not self._outbox:
+            raise socket.timeout()
+        data, self._outbox = self._outbox, b""
+        return data
+
+    def close(self):
+        pass
+
+
+def test_authenticate_succeeds_without_receive_thread(monkeypatch, seestar):
+    """Regression: authenticate() runs inline from reconnect(), before the
+    receive_message_thread starts, so it must read its own handshake replies
+    off the socket rather than waiting on response_dict (which only the
+    receive thread populates).  Previously it used send_message_param_sync and
+    always timed out, failing with "'str' object has no attribute 'get'"."""
+
+    # Guard: if auth ever routes through the async path again, fail loudly.
+    def _boom(_payload):
+        raise AssertionError("authenticate must not use send_message_param_sync")
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", _boom)
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "SIGNATURE")
+
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "CHALLENGE"}, "code": 0},
+            {"method": "verify_client", "result": 0, "code": 0},
+            {"method": "pi_is_verified", "result": True, "code": 0},
+        ]
+    )
+
+    assert seestar.authenticate() is True
+    methods = [json.loads(p.decode())["method"] for p in seestar.s.sent]
+    assert methods == ["get_verify_str", "verify_client", "pi_is_verified"]
+
+
+def test_authenticate_accepts_key_envelope_verify_reply(monkeypatch, seestar):
+    """Firmware 9.75+ answers verify_client with result={"key_envelope": ...}
+    rather than result==0; that is a success, not a rejection."""
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "SIGNATURE")
+
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "CHALLENGE"}, "code": 0},
+            {
+                "method": "verify_client",
+                "result": {
+                    "key_envelope": {
+                        "version": "1",
+                        "wrap": "RSA-OAEP-SHA256",
+                        "kdf": "HKDF-SHA256",
+                        "cipher": "AES-128-GCM",
+                        "data": "QUJD",
+                    }
+                },
+                "code": 0,
+            },
+            # 9.75 reports the unit's licence state here, not the client's.
+            {"method": "pi_is_verified", "result": False, "code": 0},
+        ]
+    )
+
+    assert seestar.authenticate() is True
+    methods = [json.loads(p.decode())["method"] for p in seestar.s.sent]
+    assert methods == ["get_verify_str", "verify_client"]
+
+
+def test_authenticate_rejects_verify_error_even_with_dict_result(monkeypatch, seestar):
+    """A non-zero code is still a failure; only a key_envelope with code 0 counts."""
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "SIGNATURE")
+
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "CHALLENGE"}, "code": 0},
+            {
+                "method": "verify_client",
+                "result": {"key_envelope": {}},
+                "code": 207,
+                "error": "fail",
+            },
+        ]
+    )
+
+    assert seestar.authenticate() is False
+
+
+def test_authenticate_preserves_events_streamed_during_handshake(monkeypatch, seestar):
+    """Events pushed by the device during the handshake must be handed to the
+    receive thread (via _auth_leftover), not silently dropped."""
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "SIGNATURE")
+
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "CHALLENGE"}, "code": 0},
+            {"method": "verify_client", "result": 0, "code": 0},
+            {"method": "pi_is_verified", "result": True, "code": 0},
+        ],
+        pre_events=[{"Event": "PiStatus", "temp": 42}],
+    )
+
+    assert seestar.authenticate() is True
+    assert "PiStatus" in seestar._auth_leftover
+
+    # The buffered event must actually be processed once the receive thread
+    # starts: run one iteration of receive_message_thread_fn and verify the
+    # event reaches event_state/event_queue.
+    def fake_get_socket_msg():
+        seestar.is_watch_events = False  # stop after this iteration
+        # A later chunk from the device; triggers draining of the leftover.
+        return json.dumps({"Event": "Later"}) + "\r\n"
+
+    monkeypatch.setattr(seestar, "get_socket_msg", fake_get_socket_msg)
+    seestar.is_watch_events = True
+    seestar.receive_message_thread_fn()
+
+    assert seestar._auth_leftover == ""
+    assert seestar.event_state.get("PiStatus", {}).get("temp") == 42
+    assert "Later" in seestar.event_state
+
+
+def test_auth_rpc_sync_accepts_reply_from_response_dict(seestar):
+    """Mid-session re-auth: reconnect() can also run while the receive thread
+    is alive (heartbeat thread, send_message error-recovery path).  If the
+    receive thread consumes the handshake reply into response_dict before
+    _auth_rpc_sync reads it off the socket, the reply must be accepted from
+    there instead of timing out."""
+    seestar.s = _AuthFakeSocket(replies=[])  # socket never yields the reply
+
+    stolen = {
+        "jsonrpc": "2.0",
+        "method": "get_verify_str",
+        "result": {"str": "CHALLENGE"},
+        "code": 0,
+        "id": 4242,
+    }
+    seestar.response_dict[4242] = stolen
+    seestar._send_json = lambda data: (4242, True)
+
+    assert seestar._auth_rpc_sync("get_verify_str") is stolen
+
+
+def test_authenticate_discards_stale_leftover_from_previous_connection(
+    monkeypatch, seestar
+):
+    """authenticate() only runs right after a fresh socket is created, so
+    leftover bytes from a previous connection (stranded by a mid-session
+    re-auth) are stale and must not be replayed into the new stream."""
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "SIGNATURE")
+    seestar._auth_leftover = '{"Event": "Stale"}\r\n{"partial'
+
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "CHALLENGE"}, "code": 0},
+            {"method": "verify_client", "result": 0, "code": 0},
+            {"method": "pi_is_verified", "result": True, "code": 0},
+        ]
+    )
+
+    assert seestar.authenticate() is True
+    assert "Stale" not in seestar._auth_leftover
+    assert "partial" not in seestar._auth_leftover
+
+
+def test_reconnect_without_interop_pem_never_attempts_auth(monkeypatch, seestar):
+    """Auth is strictly opt-in via the interop_pem config: without it,
+    reconnect() must succeed without ever entering the handshake — older
+    firmware has none of these codepaths."""
+    monkeypatch.setattr(seestar, "send_udp_intro", lambda: None)
+    monkeypatch.setattr(seestar, "disconnect", lambda: None)
+    monkeypatch.setattr(Config, "seestar_interop_pem", "", raising=False)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("auth must not run when interop_pem is not configured")
+
+    monkeypatch.setattr(seestar, "authenticate", _boom)
+    monkeypatch.setattr(seestar, "_auth_rpc_sync", _boom)
+
+    class Sock:
+        def settimeout(self, _v):
+            return None
+
+        def connect(self, _addr):
+            return None
+
+    monkeypatch.setattr("device.seestar_device.socket.socket", lambda *_args: Sock())
+    seestar.is_connected = False
+    assert seestar.reconnect() is True
+
+
+def test_authenticate_fails_gracefully_on_old_firmware_error_reply(seestar):
+    """If interop_pem is configured but the firmware predates the handshake,
+    the device answers get_verify_str with an error reply (no challenge in
+    result).  authenticate() must return False promptly without raising."""
+    seestar.s = _AuthFakeSocket(
+        replies=[{"method": "get_verify_str", "code": 102, "error": "unknown method"}]
+    )
+
+    assert seestar.authenticate() is False
+    assert len(seestar.s.sent) == 1  # gave up after the challenge request
+
+
+def test_force_stop_goto_clears_wedged_state(monkeypatch, seestar):
+    """A wedged AutoGoto (state stuck on 'working') is force-cleared and the
+    firmware stop is sent with the narrow stage:AutoGoto parameter."""
+    seestar.event_state["AutoGoto"] = {"state": "working"}
+    seestar.event_state["PlateSolve"] = {"state": "fail"}
+    seestar.event_state["Exposure"] = {"state": "working"}
+    calls = []
+    monkeypatch.setattr(
+        seestar,
+        "send_message_param_sync",
+        lambda p: calls.append(p) or {"result": "ok"},
+    )
+    assert seestar.is_goto() is True
+
+    result = seestar.force_stop_goto()
+
+    assert result["ok"] is True
+    assert result["stop_slew_result"] == {"result": "ok"}
+    assert seestar.is_goto() is False
+    assert seestar.event_state["AutoGoto"]["state"] == "stopped"
+    assert seestar.event_state["PlateSolve"]["state"] == "stopped"
+    assert seestar.event_state["Exposure"]["state"] == "stopped"
+    assert calls[0]["method"] == "iscope_stop_view"
+    assert calls[0]["params"] == {"stage": "AutoGoto"}
+
+
+def test_force_stop_goto_reports_failure_when_stop_slew_raises(monkeypatch, seestar):
+    def _boom():
+        raise RuntimeError("socket dead")
+
+    monkeypatch.setattr(seestar, "stop_slew", _boom)
+    seestar.event_state["AutoGoto"] = {"state": "working"}
+
+    result = seestar.force_stop_goto()
+
+    assert result["ok"] is False
+    assert result["stop_slew_result"] is None
+    # Local state is still force-cleared even though the firmware send failed,
+    # so the next goto_target is accepted.
+    assert seestar.is_goto() is False
+
+
+def test_force_stop_goto_idempotent_when_no_goto(monkeypatch, seestar):
+    monkeypatch.setattr(seestar, "stop_slew", lambda: {"result": "ok"})
+
+    result = seestar.force_stop_goto()
+
+    assert result["ok"] is True
+    assert seestar.is_goto() is False
+
+
+def test_start_framed_mosaic_rejects_when_scheduler_active(seestar):
+    seestar.schedule["state"] = "working"
+    out = seestar.start_framed_mosaic({"target_name": "T", "ra": 1, "dec": 2})
+    assert out["code"] == -1
+
+
+def test_start_framed_mosaic_creates_and_starts_schedule(monkeypatch, seestar):
+    seestar.schedule["state"] = "stopped"
+    calls = []
+    monkeypatch.setattr(
+        seestar, "create_schedule", lambda p: calls.append(("create_schedule", p))
+    )
+    monkeypatch.setattr(
+        seestar,
+        "add_schedule_item",
+        lambda item: calls.append(("add_schedule_item", item)),
+    )
+    monkeypatch.setattr(
+        seestar, "start_scheduler", lambda p: calls.append(("start_scheduler", p))
+    )
+
+    params = {"target_name": "T", "ra": 1, "dec": 2}
+    seestar.start_framed_mosaic(params)
+
+    assert calls[0] == ("create_schedule", params)
+    assert calls[1] == (
+        "add_schedule_item",
+        {"action": "start_framed_mosaic", "params": params},
+    )
+    assert calls[2] == ("start_scheduler", params)
+
+
+def test_scheduler_thread_fn_dispatches_start_framed_mosaic(monkeypatch, seestar):
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    calls = []
+    monkeypatch.setattr(
+        seestar,
+        "start_framed_mosaic_item",
+        lambda p: calls.append(p)
+        or setattr(seestar, "is_cur_scheduler_item_working", False),
+    )
+    monkeypatch.setattr(seestar, "play_sound", lambda _v: None)
+
+    seestar.schedule = {
+        "state": "stopped",
+        "list": [
+            {
+                "action": "start_framed_mosaic",
+                "schedule_item_id": "fm1",
+                "params": {"target_name": "T"},
+            }
+        ],
+        "item_number": 1,
+        "is_stacking": False,
+        "is_stacking_paused": False,
+    }
+    seestar.scheduler_thread_fn()
+
+    assert calls == [{"target_name": "T"}]
+
+
+# ---------------------------------------------------------------------------
+# Scheduler: skipping targets below the horizon
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def horizon_site(monkeypatch, tmp_path):
+    """Skip enabled, site set; returns a function writing the horizon file.
+
+    A profile at +90 degrees hides every target and one at -90 hides none,
+    whatever the time the test runs at.
+    """
+    from astropy.utils import iers
+
+    from device import horizon
+
+    monkeypatch.setattr(iers.conf, "auto_download", False)
+    monkeypatch.setattr(Config, "init_lat", 44.06)
+    monkeypatch.setattr(Config, "init_long", 0.65)
+    monkeypatch.setattr(Config, "horizon_skip_hidden_targets", True)
+    monkeypatch.setattr(Config, "horizon_margin", 0.0)
+    horizon._cache.update(key=None, profile=None, error=None)
+
+    def write(text):
+        path = tmp_path / "site.hrz"
+        path.write_text(text)
+        monkeypatch.setattr(Config, "horizon_file", str(path))
+        horizon._cache.update(key=None, profile=None, error=None)
+
+    return write
+
+
+def test_start_mosaic_item_skips_a_target_below_the_horizon(
+    monkeypatch, seestar, horizon_site
+):
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    calls = []
+    monkeypatch.setattr(
+        seestar, "send_message_param_sync", lambda p: calls.append(p) or {}
+    )
+    horizon_site("0 90\n")
+    assert seestar.start_mosaic_item(_mosaic_item_params()) is None
+    assert received == {}  # no mosaic thread
+    assert calls == []  # nothing sent to the scope
+    assert seestar.is_cur_scheduler_item_working is False
+
+
+def test_start_mosaic_item_runs_a_target_above_the_horizon(
+    monkeypatch, seestar, horizon_site
+):
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    horizon_site("0 -90\n")
+    seestar.start_mosaic_item(_mosaic_item_params())
+    assert received.get("stack_type") == "DeepSky"
+    assert received.get("check_horizon") is True  # panels checked in turn
+
+
+def test_start_mosaic_item_shows_a_skipped_target_in_the_scheduler_state(
+    monkeypatch, seestar, horizon_site
+):
+    _setup_mosaic_item_test(monkeypatch, seestar)
+    seestar.schedule["current_item_id"] = "item-7"
+    horizon_site("0 90\n")
+    seestar.start_mosaic_item(_mosaic_item_params())
+    item = seestar.event_state["scheduler"]["cur_scheduler_item"]
+    assert item["schedule_item_id"] == "item-7"
+    assert item["action"] == "skipped: below the local horizon"
+
+
+def _run_mosaic_panels(monkeypatch, seestar, n_ra, n_dec, check_horizon):
+    """Run mosaic_thread_fn; return the panels it slewed to, in order."""
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr("device.seestar_device.sleep", lambda _s: None)
+    monkeypatch.setattr(
+        "device.seestar_device.Util.mosaic_next_center_spacing", lambda *_a: [0.1, 0.2]
+    )
+    slewed = []
+
+    def goto(*_a, **_k):
+        item = seestar.event_state["scheduler"]["cur_scheduler_item"]
+        slewed.append(f"{item['cur_ra_panel_num']}{item['cur_dec_panel_num']}")
+        return True
+
+    monkeypatch.setattr(seestar, "mosaic_goto_inner_worker", goto)
+    monkeypatch.setattr(seestar, "set_target_name", lambda _n: {"ok": True})
+    monkeypatch.setattr(seestar, "start_stack", lambda _p: True)
+    monkeypatch.setattr(seestar, "stop_stack", lambda: {"ok": True})
+    monkeypatch.setattr(seestar, "send_message_param_sync", lambda _p: {"ok": True})
+    seestar.schedule["state"] = "working"
+    seestar.schedule["is_skip_requested"] = False
+    seestar.schedule["current_item_id"] = "m1"
+    seestar.event_state["scheduler"] = {"cur_scheduler_item": {}}
+    seestar.mosaic_thread_fn(
+        "M31",
+        0.7122,
+        41.269,
+        False,
+        5,
+        n_ra,
+        n_dec,
+        10,
+        80,
+        False,
+        "",
+        1,
+        5,
+        check_horizon=check_horizon,
+    )
+    return slewed
+
+
+def test_mosaic_thread_fn_skips_only_the_hidden_panels(monkeypatch, seestar):
+    monkeypatch.setattr(Config, "horizon_skip_hidden_targets", True)
+    checked = []
+
+    def hidden(name, coord):
+        checked.append(name)
+        return name == "M31_11"
+
+    monkeypatch.setattr(seestar, "is_hidden_by_horizon", hidden)
+    slewed = _run_mosaic_panels(monkeypatch, seestar, 2, 1, check_horizon=True)
+    assert checked == ["M31_11", "M31_21"]
+    assert slewed == ["21"]
+
+
+def test_mosaic_thread_fn_checks_no_panel_unless_asked(monkeypatch, seestar):
+    monkeypatch.setattr(Config, "horizon_skip_hidden_targets", True)
+    monkeypatch.setattr(
+        seestar, "is_hidden_by_horizon", lambda *_a: pytest.fail("checked")
+    )
+    assert _run_mosaic_panels(monkeypatch, seestar, 2, 1, check_horizon=False) == [
+        "11",
+        "21",
+    ]
+
+
+def test_mosaic_thread_fn_single_panel_relies_on_the_item_check(monkeypatch, seestar):
+    monkeypatch.setattr(Config, "horizon_skip_hidden_targets", True)
+    monkeypatch.setattr(
+        seestar, "is_hidden_by_horizon", lambda *_a: pytest.fail("checked twice")
+    )
+    assert _run_mosaic_panels(monkeypatch, seestar, 1, 1, check_horizon=True) == ["11"]
+
+
+def test_panel_with_an_impossible_position_is_kept(monkeypatch, seestar):
+    monkeypatch.setattr(Config, "horizon_skip_hidden_targets", True)
+    assert seestar.is_panel_hidden_by_horizon("M31_12", 0.7, 95.0) is False
+
+
+def test_start_mosaic_item_ignores_the_horizon_unless_enabled(
+    monkeypatch, seestar, horizon_site
+):
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    horizon_site("0 90\n")
+    monkeypatch.setattr(Config, "horizon_skip_hidden_targets", False)
+    seestar.start_mosaic_item(_mosaic_item_params())
+    assert received.get("stack_type") == "DeepSky"
+
+
+def test_start_mosaic_item_at_current_position_is_not_checked(
+    monkeypatch, seestar, horizon_site
+):
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    horizon_site("0 90\n")
+    seestar.ra, seestar.dec = 0.7122, 41.269
+    params = dict(_mosaic_item_params(), ra=-1, dec=-1)
+    seestar.start_mosaic_item(params)
+    assert received.get("stack_type") == "DeepSky"
+
+
+def test_start_mosaic_item_without_site_location_is_not_checked(
+    monkeypatch, seestar, horizon_site
+):
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    horizon_site("0 90\n")
+    monkeypatch.setattr(Config, "init_lat", 0)
+    monkeypatch.setattr(Config, "init_long", 0)
+    seestar.start_mosaic_item(_mosaic_item_params())
+    assert received.get("stack_type") == "DeepSky"
+
+
+def test_start_mosaic_item_unusable_file_falls_back_to_a_flat_horizon(
+    monkeypatch, seestar, horizon_site
+):
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    horizon_site("not a horizon\n")
+    # Flat horizon at 0 plus a 91-degree margin: no target can clear it.
+    monkeypatch.setattr(Config, "horizon_margin", 91.0)
+    seestar.start_mosaic_item(_mosaic_item_params())
+    assert received == {}
+    # With a margin no target can miss, the item runs.
+    monkeypatch.setattr(Config, "horizon_margin", -91.0)
+    seestar.start_mosaic_item(_mosaic_item_params())
+    assert received.get("stack_type") == "DeepSky"
+
+
+def test_start_framed_mosaic_item_skips_a_target_below_the_horizon(
+    monkeypatch, seestar, horizon_site
+):
+    started = []
+
+    class FakeThread:
+        def __init__(self, target=None):
+            self.name = ""
+
+        def start(self):
+            started.append(True)
+
+    monkeypatch.setattr("device.seestar_device.threading.Thread", FakeThread)
+    params = {
+        "target_name": "M31",
+        "ra": "0.7122",
+        "dec": "41.269",
+        "is_j2000": False,
+        "is_use_lp_filter": False,
+        "panel_time_sec": 60,
+        "mosaic_scale": 1.5,
+        "mosaic_angle": 0.0,
+        "gain": 80,
+    }
+    seestar.schedule["state"] = "working"
+
+    horizon_site("0 90\n")
+    seestar.start_framed_mosaic_item(params)
+    assert started == []
+
+    horizon_site("0 -90\n")
+    seestar.start_framed_mosaic_item(params)
+    assert started == [True]
+
+
+def test_start_mosaic_item_keeps_the_target_when_the_check_fails(
+    monkeypatch, seestar, horizon_site
+):
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    horizon_site("0 90\n")
+
+    def broken(*args, **kwargs):
+        raise ValueError("interpolating from IERS_Auto using predictive values")
+
+    monkeypatch.setattr("device.seestar_device.horizon.visibility", broken)
+    seestar.start_mosaic_item(_mosaic_item_params())
+    assert received.get("stack_type") == "DeepSky"
+
+
+def _run_framed_mosaic(monkeypatch, seestar, scale, angle):
+    """Run framed_mosaic_thread_fn up to the stack start; return all requests."""
+    sent = []
+
+    def send(payload):
+        sent.append(payload)
+        return {"result": 0}
+
+    class FakeCoord:
+        ra = SimpleNamespace(hour=10.0)
+        dec = SimpleNamespace(deg=41.0)
+
+    monkeypatch.setattr(
+        "device.seestar_device.Util.parse_coordinate", lambda *a, **k: FakeCoord
+    )
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    seestar.send_message_param_sync = send
+    seestar.is_goto = lambda: False
+    seestar.wait_end_op = lambda _op: True
+    seestar.start_stack = lambda _params: False  # end the item after the goto
+    seestar.schedule["current_item_id"] = "item-1"
+    seestar.event_state["scheduler"] = {"cur_scheduler_item": {}}
+
+    seestar.framed_mosaic_thread_fn(
+        "M31", 10.0, 41.0, False, 60, scale, angle, 80, False, 1, 0
+    )
+    return sent
+
+
+def test_framed_mosaic_goto_carries_the_mosaic_frame(monkeypatch, seestar):
+    # seestar-spec (READ): set_setting {"mosaic": ...} only estimates hours; the
+    # capture mosaic comes from iscope_start_view's mosaic object, and capture
+    # setup resets it when absent, so the goto must carry all three members.
+    sent = _run_framed_mosaic(monkeypatch, seestar, 2.0, 30.0)
+
+    views = [r for r in sent if r["method"] == "iscope_start_view"]
+    assert len(views) == 1
+    assert views[0]["params"]["mosaic"] == {
+        "scale": 2.0,
+        "angle": 30.0,
+        "star_map_angle": 0.0,
+    }
+
+
+def test_plain_goto_sends_no_mosaic_frame(monkeypatch, seestar):
+    class FakeCoord:
+        ra = SimpleNamespace(hour=1.5)
+        dec = SimpleNamespace(deg=22.25)
+
+    sent = []
+    seestar.is_goto = lambda: False
+    seestar.mark_op_state = lambda *args, **kwargs: None
+    seestar.send_message_param_sync = lambda payload: sent.append(payload) or {}
+    monkeypatch.setattr(
+        "device.seestar_device.Util.parse_coordinate", lambda *a, **k: FakeCoord
+    )
+
+    seestar.goto_target({"is_j2000": False, "ra": 1.5, "dec": 22.25})
+
+    assert "mosaic" not in sent[0]["params"]
+
+
+def _run_startup_recording(monkeypatch, seestar, reply_for=None):
+    """Run start_up_thread_fn (no AF/3PPA/darks); return every request sent."""
+    import datetime as _dt
+
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr(
+        "device.seestar_device.tzlocal.get_localzone_name", lambda: "UTC"
+    )
+    monkeypatch.setattr(
+        "device.seestar_device.tzlocal.get_localzone", lambda: _dt.timezone.utc
+    )
+    monkeypatch.setattr("device.seestar_device.EarthLocation", lambda **_k: object())
+    monkeypatch.setattr(seestar, "set_setting", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(seestar, "play_sound", lambda _sid: None)
+    monkeypatch.setattr(Config, "init_save_good_frames", True)
+    monkeypatch.setattr(Config, "init_save_all_frames", False)
+
+    sent = []
+
+    def fake_sync(payload):
+        sent.append(payload)
+        if payload["method"] == "get_device_state":
+            return {"result": {"device": {"firmware_ver_int": 2975}}}
+        if reply_for:
+            reply = reply_for(payload)
+            if reply is not None:
+                return reply
+        return {"result": 0, "code": 0}
+
+    monkeypatch.setattr(seestar, "send_message_param_sync", fake_sync)
+    seestar.start_up_thread_fn(
+        {
+            "lat": 1.1,
+            "lon": 2.2,
+            "auto_focus": False,
+            "3ppa": False,
+            "dark_frames": False,
+        }
+    )
+    return sent
+
+
+def test_startup_saves_frame_options_through_set_setting_stack(monkeypatch, seestar):
+    # set_stack_setting is in no analyzed firmware table (103 on 9.x); the
+    # documented path is set_setting {"stack": {...}} (seestar-spec, READ).
+    sent = _run_startup_recording(monkeypatch, seestar)
+
+    stack_sets = [
+        r["params"]["stack"]
+        for r in sent
+        if r["method"] == "set_setting" and "stack" in r.get("params", {})
+    ]
+    assert {"save_discrete_ok_frame": True, "save_discrete_frame": False} in stack_sets
+    assert "set_stack_setting" not in [r["method"] for r in sent]
+
+
+def test_startup_falls_back_to_set_stack_setting_when_stack_is_rejected(
+    monkeypatch, seestar
+):
+    def reject_stack(payload):
+        if payload["method"] == "set_setting" and "stack" in payload["params"]:
+            return {"error": "unexpected param", "code": 109}
+        return None
+
+    sent = _run_startup_recording(monkeypatch, seestar, reject_stack)
+
+    legacy = [r for r in sent if r["method"] == "set_stack_setting"]
+    assert legacy == [
+        {
+            "method": "set_stack_setting",
+            "params": {"save_discrete_ok_frame": True, "save_discrete_frame": False},
+        }
+    ]

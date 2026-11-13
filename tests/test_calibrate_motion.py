@@ -646,3 +646,57 @@ def test_motion_session_threshold_default_below_smallest_increment():
     nudge so a single 0.005° nudge actually shows ``settled=False`` until
     the mount has moved through it."""
     assert DEFAULT_SETTLED_THRESHOLD_DEG <= 0.0025 + 1e-9
+
+
+# ---------- persisted cable-wrap state is loaded, not discarded ------
+
+
+def test_session_run_loads_persisted_cable_wrap_state(monkeypatch, tmp_path):
+    """_run must read the encoder az and pass it to
+    CumulativeAzTracker.load_or_fresh (whose current_wrapped_az_deg argument
+    is required). Before the fix the no-argument call always raised
+    TypeError and a fresh tracker silently replaced the persisted state."""
+    import json
+    import types
+
+    import device.calibrate_motion as cm
+    from device.plant_limits import CumulativeAzTracker
+
+    state = tmp_path / "plant_limits_state.json"
+    state.write_text(
+        json.dumps({"cum_az_deg": 300.0, "wrapped_az_deg": -60.0}),
+        encoding="utf-8",
+    )
+    real_load = CumulativeAzTracker.load_or_fresh.__func__
+    seen: dict = {}
+
+    def _load(cls, current_wrapped_az_deg, path=None, tol_deg=2.0):
+        seen["current_wrapped_az_deg"] = current_wrapped_az_deg
+        return real_load(cls, current_wrapped_az_deg, path=str(state), tol_deg=tol_deg)
+
+    monkeypatch.setattr(CumulativeAzTracker, "load_or_fresh", classmethod(_load))
+
+    captured: dict = {}
+
+    def _fake_track(cli, provider, **kwargs):
+        captured["az_tracker"] = kwargs.get("az_tracker")
+        return types.SimpleNamespace(exit_reason="stop_signal", errors=[])
+
+    monkeypatch.setattr(cm, "track", _fake_track)
+
+    cli = FakeMountClient()
+    cli.set_position(az_deg=-60.0, el_deg=30.0)
+    _install_fake_cli(monkeypatch, cli)
+
+    session = CalibrateMotionSession(
+        telescope_id=99,
+        log_dir=tmp_path,
+        max_duration_s=5.0,
+        dry_run=True,
+    )
+    session._run()
+
+    assert seen["current_wrapped_az_deg"] == pytest.approx(-60.0)
+    tracker = captured["az_tracker"]
+    assert tracker is not None
+    assert tracker.cum_az_deg == pytest.approx(300.0)
