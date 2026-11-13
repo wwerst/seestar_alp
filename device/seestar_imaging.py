@@ -10,6 +10,7 @@
 # .   jpeg_quality    — cv2 JPEG encode quality for served frames (default 95)
 #
 import datetime
+import math
 import os
 import threading
 from collections import deque
@@ -410,9 +411,14 @@ class SeestarImaging:
         """Coerce a JPEG-quality value to an int in [JPEG_QUALITY_MIN, MAX].
 
         Raises ``TypeError``/``ValueError`` on non-numeric input so the
-        settings endpoint can reject it with a 400.
+        settings endpoint can reject it with a 400. Non-finite input (NaN,
+        +/-Infinity) also raises ``ValueError``: ``round(inf)`` would
+        otherwise raise ``OverflowError``, which callers do not catch.
         """
-        q = int(round(float(value)))
+        f = float(value)
+        if not math.isfinite(f):
+            raise ValueError(f"non-finite jpeg_quality: {value!r}")
+        q = int(round(f))
         return max(
             SeestarImaging.JPEG_QUALITY_MIN,
             min(SeestarImaging.JPEG_QUALITY_MAX, q),

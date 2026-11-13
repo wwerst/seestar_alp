@@ -89,6 +89,83 @@ def test_reload_spins_monitor_up_when_reenabled(monkeypatch, _stub_load_toml):
     assert ss.get_sun_monitor() is not None
 
 
+def test_monitor_resolves_site_from_config_each_tick(monkeypatch, _stub_load_toml):
+    """The site can be set at runtime (start_up_sequence writes
+    Config.init_lat/init_long). The monitor must not keep the 0/0 captured at
+    boot: a tick after the site is set must use the new site, not stay
+    blind."""
+    from device.config import Config
+
+    monkeypatch.setattr(ss.SunSafetyMonitor, "start", lambda self: None)
+    monkeypatch.setattr(Config, "init_lat", 0.0, raising=False)
+    monkeypatch.setattr(Config, "init_long", 0.0, raising=False)
+
+    main = LiveTrackerMain()
+    main.start()
+    m = ss.get_sun_monitor()
+    assert m._lat_deg is None and m._lon_deg is None
+
+    blind: list[int] = []
+    monkeypatch.setattr(m, "_warn_location_unset", lambda: blind.append(1))
+    sites: list[tuple] = []
+
+    def _fake_sun(*, lat_deg=None, lon_deg=None, when=None):
+        sites.append((lat_deg, lon_deg))
+        return (180.0, -80.0)  # far below any threshold: tick ends here
+
+    monkeypatch.setattr(ss, "compute_sun_altaz", _fake_sun)
+
+    m._tick()
+    assert blind == [1], "0/0 site: monitor reports itself blind"
+    assert sites == []
+
+    monkeypatch.setattr(Config, "init_lat", 33.96, raising=False)
+    monkeypatch.setattr(Config, "init_long", -118.46, raising=False)
+    m._tick()
+    assert blind == [1], "site set at runtime: monitor must no longer be blind"
+    assert sites == [(33.96, -118.46)]
+    main.stop()
+
+
+def test_start_survives_invalid_config_and_still_installs_monitor(monkeypatch):
+    """An unparseable config.toml must not raise out of start(), and must not
+    stop the sun-safety monitor from starting on the last-good config."""
+    from device.config import Config, ConfigError
+
+    def _bad_load(*_a, **_kw):
+        raise ConfigError("bad toml")
+
+    monkeypatch.setattr(Config, "load_toml", _bad_load)
+    monkeypatch.setattr(ss.SunSafetyMonitor, "start", lambda self: None)
+
+    main = LiveTrackerMain()
+    main.start()
+    assert isinstance(ss.get_sun_monitor(), ss.SunSafetyMonitor)
+    main.stop()
+
+
+def test_reload_ignores_invalid_config(monkeypatch, _stub_load_toml):
+    """reload() runs on the config watcher thread; an unparseable
+    config.toml must not raise there, and the monitor keeps its last-good
+    thresholds."""
+    from device.config import Config, ConfigError
+
+    monkeypatch.setattr(ss.SunSafetyMonitor, "start", lambda self: None)
+    main = LiveTrackerMain()
+    main.start()
+    m = ss.get_sun_monitor()
+    assert m.min_separation_deg == 30.0
+
+    def _bad_load(*_a, **_kw):
+        raise ConfigError("bad toml")
+
+    monkeypatch.setattr(Config, "load_toml", _bad_load)
+    monkeypatch.setattr(Config, "sun_avoidance_min_sep_deg", 45.0, raising=False)
+    main.reload()
+    assert m.min_separation_deg == 30.0
+    main.stop()
+
+
 def test_abort_active_sessions_stops_every_mount_driver_per_seestar(monkeypatch):
     """The default abort_active callback iterates over Config.seestars and
     stops ALL six mount-driving managers — any survivor re-slews right after
