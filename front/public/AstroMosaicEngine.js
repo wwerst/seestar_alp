@@ -126,16 +126,7 @@ function AstroMosaicEngine(target, params, target_div, day_div, year_div, radec_
         panel_view_text : null
     };
 
-    if (engine_params.horizonSoft != null && engine_params.horizonHard == null) {
-        // we have only soft horizon, use it as hard horizon
-        console.log('AstroMosaicEngine, use soft horizon as hard horizon');
-        engine_params.horizonHard = engine_params.horizonSoft;
-        engine_params.horizonSoft = null;
-    }
-    if (engine_params.horizonSoft != null) {
-        engine_params.horizonSoft = fillHorizonLimits(engine_params.horizonSoft);
-    }
-    engine_params.horizonHard = fillHorizonLimits(engine_params.horizonHard);
+    normalizeHorizonLimits(engine_params);
 
     if (engine_params.UTCdate_ms == null) {
         // Use current date
@@ -166,23 +157,56 @@ function getAstroMosaicFov(fov)
     return (fov*60.0)/3600.0;
 }
 
-/* 
- * Ensure that we have horizon limits fov every 5 arcminutes.
+/*
+ * Ensure that we have horizon limits for every 5 degrees, 0 to 355.
  */
 function fillHorizonLimits(horizon_limits)
 {
     if (horizon_limits == null || horizon_limits.length == 0) {
         horizon_limits = [0];
+    } else {
+        // A copy: the caller's array is left as it was.
+        horizon_limits = horizon_limits.slice();
     }
     var len = horizon_limits.length;
-    if (len < 71) {
-        // we need limit for every 5 arcminutes
+    if (len < 72) {
+        // we need limit for every 5 degrees
         var last = horizon_limits[len-1];
-        for (var k = len; k < 71; k++) {
+        for (var k = len; k < 72; k++) {
             horizon_limits[k] = last;
         }
     }
     return horizon_limits;
+}
+
+/*
+ * Soft and hard horizon limits of engine_params, padded to one value every
+ * 5 degrees. With only a soft horizon, it is used as the hard one; with
+ * neither, the hard horizon is flat at 0 degrees. Padding is idempotent, so
+ * the AstroMosaicEngine() wrapper and direct callers of
+ * StartAstroMosaicViewerEngine() get the same horizon.
+ */
+function normalizeHorizonLimits(engine_params)
+{
+    if (engine_params.horizonSoft != null && engine_params.horizonHard == null) {
+        // we have only soft horizon, use it as hard horizon
+        console.log('AstroMosaicEngine, use soft horizon as hard horizon');
+        engine_params.horizonHard = engine_params.horizonSoft;
+        engine_params.horizonSoft = null;
+    }
+    if (engine_params.horizonSoft != null) {
+        engine_params.horizonSoft = fillHorizonLimits(engine_params.horizonSoft);
+    }
+    engine_params.horizonHard = fillHorizonLimits(engine_params.horizonHard);
+}
+
+/*
+ * Index in the horizon limits of azimuth az, in degrees. Azimuths of
+ * 357.5 degrees and more round to 360, which is limit 0.
+ */
+function horizonLimitIndex(az)
+{
+    return Math.round(az / 5) % 72;
 }
 
 function filterImageTargetList(image_target_list)
@@ -340,6 +364,10 @@ function StartAstroMosaicViewerEngine(
         engine_native_resources.getTargetAboveRightNow = getTargetAboveRightNow;
         return;
     }
+
+    // Callers that bypass the AstroMosaicEngine() wrapper, like the planner
+    // card, may pass a partial horizon: normalize it as the wrapper does.
+    normalizeHorizonLimits(engine_params);
 
     if (!engine_params.timezoneOffset) {
         engine_params.timezoneOffset = 0;
@@ -1037,7 +1065,7 @@ function StartAstroMosaicViewerEngine(
             var softalt = null;        // target below soft horizon
             var hardalt = null;        // target below hard horizon or meridian transit
 
-            var horizon_index = Math.round(altaz.az / 5);
+            var horizon_index = horizonLimitIndex(altaz.az);
 
             if (prevaz != null) {
                 if ((prevaz > 180 && altaz.az < 180) || // from 360 to 0
@@ -2031,14 +2059,117 @@ function StartAstroMosaicViewerEngine(
         return aladin;
     }
 
-    function createMosaicTableElement(txt)
+    /* Builds an SVG diagram of the mosaic grid sized to nRA x nDec, showing
+     * for each panel: capture order number, panel code, and RA/Dec center.
+     * Arrows show the actual capture order (row-major, no alternating
+     * direction), matching Seestar.mosaic_thread_fn in the device backend.
+     *
+     * panel_radec is indexed [x][y] using the engine's own coordinate scan
+     * order, which runs RA high-to-low and Dec high-to-low -- the reverse
+     * of the device's panel index order (which starts at RA-low/Dec-low).
+     * deviceRA/deviceDec (1-based) are converted to that engine index via
+     * engineX = nRA - deviceRA, engineY = nDec - deviceDec so the panel
+     * code and coordinate shown always describe the same physical panel.
+     */
+    function buildMosaicOrderDiagramSvg(nRA, nDec, panel_radec)
     {
-        var tabdata = document.createElement("TD");
-        var celltext = document.createTextNode(txt);
-        tabdata.style.border = "1px solid #dddddd";
-        tabdata.style.padding = "4px";
-        tabdata.appendChild(celltext);
-        return tabdata;
+        var gap = 10;
+        var maxWidth = 640;
+        var cellSize = Math.floor((maxWidth - gap * (nRA - 1)) / nRA);
+        cellSize = Math.max(36, Math.min(90, cellSize));
+
+        var marginLeft = 20;
+        var marginTop = 20;
+        var loopMargin = Math.max(15, gap * 1.5);
+        var leftLoopX = Math.max(4, marginLeft - 10);
+
+        var orderFontSize = Math.max(11, Math.min(20, Math.floor(cellSize * 0.28)));
+        var codeFontSize = Math.max(8, Math.min(11, Math.floor(cellSize * 0.16)));
+        var radecFontSize = Math.max(7, Math.min(10, Math.floor(cellSize * 0.13)));
+        var showRadec = cellSize >= 46;
+
+        var gridWidth = nRA * cellSize + (nRA - 1) * gap;
+        var gridHeight = nDec * cellSize + (nDec - 1) * gap;
+        var svgWidth = marginLeft + gridWidth + loopMargin + 10;
+        var svgHeight = marginTop + gridHeight + marginTop;
+
+        var markerId = "mosaicOrderArrowLiveGrid";
+        var rects = [];
+        var texts = [];
+        var arrows = [];
+
+        function cellX(col) { return marginLeft + col * (cellSize + gap); }
+        function cellY(displayRow) { return marginTop + displayRow * (cellSize + gap); }
+
+        // captureRow 0 is the first Dec row imaged (RA-low/Dec-low, panel
+        // "11"). Drawn at the BOTTOM of the diagram, since Dec increases
+        // upward (sky-chart / graph convention) -- Dec-low belongs at the
+        // bottom, not the top. Capture then proceeds upward row by row.
+        for (var captureRow = 0; captureRow < nDec; captureRow++) {
+            var deviceDec = captureRow + 1;
+            var displayRow = nDec - 1 - captureRow;
+            for (var col = 0; col < nRA; col++) {
+                var deviceRA = col + 1;
+                var engineX = nRA - deviceRA;
+                var engineY = nDec - deviceDec;
+                var x = cellX(col);
+                var y = cellY(displayRow);
+                var cx = x + cellSize / 2;
+                var orderNum = captureRow * nRA + col + 1;
+                var panelCode = "" + deviceRA + deviceDec;
+
+                rects.push('<rect x="' + x + '" y="' + y + '" width="' + cellSize + '" height="' + cellSize +
+                    '" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.35"></rect>');
+
+                var orderY = showRadec ? (y + cellSize * 0.32) : (y + cellSize * 0.42);
+                texts.push('<text x="' + cx + '" y="' + orderY + '" text-anchor="middle" font-family="sans-serif" font-weight="700" font-size="' +
+                    orderFontSize + '" fill="currentColor">' + orderNum + '</text>');
+
+                var codeY = orderY + orderFontSize * 0.9;
+                texts.push('<text x="' + cx + '" y="' + codeY + '" text-anchor="middle" font-family="sans-serif" font-size="' +
+                    codeFontSize + '" fill="currentColor" opacity="0.75">panel ' + panelCode + '</text>');
+
+                if (showRadec) {
+                    var radec = (panel_radec[engineX] && panel_radec[engineX][engineY] !== undefined) ? panel_radec[engineX][engineY] : "";
+                    var radecY = codeY + codeFontSize + 2;
+                    texts.push('<text x="' + cx + '" y="' + radecY + '" text-anchor="middle" font-family="sans-serif" font-size="' +
+                        radecFontSize + '" fill="currentColor" opacity="0.65">' + radec + '</text>');
+                }
+
+                if (col < nRA - 1) {
+                    var midY = y + cellSize / 2;
+                    arrows.push('<line x1="' + (x + cellSize) + '" y1="' + midY + '" x2="' + (x + cellSize + gap - 2) + '" y2="' + midY +
+                        '" stroke="currentColor" stroke-width="2" marker-end="url(#' + markerId + ')"></line>');
+                }
+            }
+            if (captureRow < nDec - 1) {
+                // Next captured row is drawn ABOVE this one (smaller
+                // displayRow / smaller y), since capture proceeds upward.
+                var nextDisplayRow = displayRow - 1;
+                var rightEdge = marginLeft + gridWidth;
+                var loopX = rightEdge + loopMargin;
+                var curMidY = cellY(displayRow) + cellSize / 2;
+                var nextMidY = cellY(nextDisplayRow) + cellSize / 2;
+                var betweenY = cellY(displayRow) - gap / 2;
+                var d = 'M' + rightEdge + ',' + curMidY +
+                        ' L' + loopX + ',' + curMidY +
+                        ' L' + loopX + ',' + betweenY +
+                        ' L' + leftLoopX + ',' + betweenY +
+                        ' L' + leftLoopX + ',' + nextMidY +
+                        ' L' + (marginLeft - 2) + ',' + nextMidY;
+                arrows.push('<path d="' + d + '" fill="none" stroke="currentColor" stroke-width="2" marker-end="url(#' + markerId + ')"></path>');
+            }
+        }
+
+        return '<svg viewBox="0 0 ' + svgWidth + ' ' + svgHeight + '" width="' + svgWidth + '" height="' + svgHeight +
+            '" style="max-width:none;height:auto;" role="img" aria-label="Mosaic panel capture order and coordinates for a ' +
+            nRA + ' by ' + nDec + ' grid.">' +
+            '<defs><marker id="' + markerId + '" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">' +
+            '<path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path></marker></defs>' +
+            '<g>' + rects.join('') + '</g>' +
+            '<g>' + texts.join('') + '</g>' +
+            '<g>' + arrows.join('') + '</g>' +
+            '</svg>';
     }
 
     function amISOdatestring(amdate)
@@ -2183,31 +2314,8 @@ function StartAstroMosaicViewerEngine(
         }
         if (grid_type == "mosaic") {
             if (engine_panels.aladin_panel_text) {
-                document.getElementById(engine_panels.aladin_panel_text).innerHTML = panel_radec[1][1];
-                var tab = document.createElement("TABLE");
-                tab.style.width = "100%";
-                tab.style.borderCollapse="collapse";
-                var tabrow = document.createElement("TR");
-                tab.appendChild(tabrow);
-                var tabdata = createMosaicTableElement("");
-                tabrow.appendChild(tabdata);
-                var colnames = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-                for (var x = 0; x < grid_size_x; x++) {
-                    var tabdata = createMosaicTableElement(colnames[x]);
-                    tabrow.appendChild(tabdata);
-                }
-                for (var y = 0; y < grid_size_y; y++) {
-                    var tabrow = document.createElement("TR");
-                    tab.appendChild(tabrow);
-                    var tabdata = createMosaicTableElement(y+1);
-                    tabrow.appendChild(tabdata);
-                    for (var x = 0; x < grid_size_x; x++) {
-                        var tabdata = createMosaicTableElement(panel_radec[x][y]);
-                        tabrow.appendChild(tabdata);
-                    }
-                }
-                document.getElementById(engine_panels.aladin_panel_text).innerHTML = "";
-                document.getElementById(engine_panels.aladin_panel_text).appendChild(tab);
+                document.getElementById(engine_panels.aladin_panel_text).innerHTML =
+                    buildMosaicOrderDiagramSvg(grid_size_x, grid_size_y, panel_radec);
             }
         } else {
             if (engine_view_type == "all" || engine_view_type == "embedded") {

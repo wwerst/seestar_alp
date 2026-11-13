@@ -16,6 +16,7 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from pathlib import Path
 import urllib.parse
 import requests
+import urllib3
 import humanize
 import json
 import csv
@@ -43,7 +44,7 @@ from skyfield.constants import GM_SUN_Pitjeva_2005_km3_s2 as GM_SUN
 from device.config import Config  # type: ignore
 from device.log import init_logging, get_logger  # type: ignore
 from device.version import Version  # type: ignore
-from device import telescope
+from device import horizon, telescope
 import threading
 import pydash
 
@@ -51,8 +52,10 @@ logger = init_logging()
 load = Loader("data/")
 _last_context_get_time = {}
 _context_cached = {}
+_context_cache_lock = threading.Lock()
 _last_api_state_get_time = {}
 _api_state_cached = {}
+_api_state_cache_lock = threading.Lock()
 _planning_cards_cache = None
 _planning_cards_cache_mtime = None
 _planning_cards_cache_lock = threading.Lock()
@@ -151,6 +154,18 @@ def get_telescope(telescope_id):
     return matches[0] if matches else None
 
 
+def is_emulator_telescope(telescope_id):
+    """True if this telescope's config.toml entry is flagged is_emulator = true.
+
+    The QEMU emulator (emulator/) can't be made to pass firmware's license
+    signature check without a real device's captured signing key (see
+    emulator/README.md), so it always reports unverified. Devices flagged
+    this way skip the auth warning rather than showing a nag no one can clear.
+    """
+    telescope = get_telescope(telescope_id)
+    return bool(telescope and telescope.get("is_emulator", False))
+
+
 def get_root(telescope_id):
     if telescope_id == 0:
         root = "/0"
@@ -188,6 +203,106 @@ def get_imager_root(telescope_id, req):
             root = f"{scheme}://{hostname}:{Config.imgport}/{telescope['device_num']}"
             return root
     return ""
+
+
+# --- Serving under a URL prefix (reverse-proxy sub-path) ----------------------
+# SSC's own routes stay at the server root. When a reverse proxy serves it under
+# a sub-path (e.g. https://host/ssc/), the proxy strips the prefix on the way in,
+# so every URL SSC *emits* must carry it. The prefix comes, per request, from a
+# valid X-Forwarded-Prefix header, else from [webui_settings] root_path, else "".
+# With no prefix (the default) nothing below changes what SSC renders.
+_ROOT_PATH_RE = re.compile(r"^(/[A-Za-z0-9._~-]+)+$")
+
+
+def normalize_root_path(value):
+    """Return ``value`` as a ``/a/b`` prefix, ``""`` for none, ``None`` if invalid."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return None
+    value = value.strip().rstrip("/")
+    if not value:
+        return ""
+    if not _ROOT_PATH_RE.match(value):
+        return None
+    # "." and ".." would let asset URLs climb out of the prefix.
+    if any(segment in (".", "..") for segment in value.split("/")):
+        return None
+    return value
+
+
+_warned_root_paths = set()
+
+
+def _warn_invalid_root_path(value):
+    # Warn once per distinct value; a rejected [webui_settings] root_path would
+    # otherwise be dropped silently on every request.
+    if repr(value) not in _warned_root_paths:
+        _warned_root_paths.add(repr(value))
+        logger.warning(f"Ignoring invalid [webui_settings] root_path: {value!r}")
+
+
+def get_root_path(req):
+    """The URL prefix SSC is served under for this request ("" when none).
+
+    An empty or "/" X-Forwarded-Prefix means the proxy added no prefix, so the
+    configured [webui_settings] root_path still applies.
+    """
+    header = req.get_header("X-Forwarded-Prefix")
+    if header is not None:
+        prefix = normalize_root_path(header)
+        if prefix:
+            return prefix
+        if prefix is None:
+            logger.debug(f"Ignoring invalid X-Forwarded-Prefix header: {header!r}")
+    configured = normalize_root_path(Config.root_path)
+    if configured is None:
+        _warn_invalid_root_path(Config.root_path)
+    return configured or ""
+
+
+def with_root_path(root_path, url):
+    """Prefix a root-relative route ``url`` with ``root_path``.
+
+    Callers pass SSC route URLs only (never an already-prefixed one), so the
+    prefix is applied unconditionally; absolute and protocol-relative URLs
+    are left alone.
+    """
+    if (
+        not root_path
+        or not isinstance(url, str)
+        or not url.startswith("/")
+        or url.startswith("//")
+    ):
+        return url
+    return root_path + url
+
+
+def _template_context(req, context):
+    """Return a copy of ``context`` ready to render for ``req``.
+
+    Page contexts (and the shared get_context cache) hold route URLs only; this
+    is the single place the request's prefix is added, so it happens exactly
+    once. ``root`` and ``action`` gain the prefix. ``imager_root`` normally
+    points the browser at the imaging port, which a sub-path proxy cannot
+    reach, so it is swapped for the same-origin relay (ImagingProxyResource).
+    """
+    root_path = get_root_path(req)
+    out = dict(context)
+    out["root_path"] = root_path
+    if not root_path:
+        return out
+    if "root" in out:
+        # "" (no matching telescope) means the server root, i.e. the prefix.
+        out["root"] = (
+            with_root_path(root_path, out["root"]) if out["root"] else root_path
+        )
+    if "action" in out:
+        out["action"] = with_root_path(root_path, out["action"])
+    if out.get("imager_root"):
+        device_num = out["imager_root"].rsplit("/", 1)[-1]
+        out["imager_root"] = f"{root_path}/{device_num}/imaging"
+    return out
 
 
 def _get_context_real(telescope_id, req):
@@ -255,6 +370,8 @@ def _get_context_real(telescope_id, req):
                 else:  # in case we are dealing with federation with device id 0
                     current_exp = 0
 
+    needs_auth_warning = online and telescope_id > 0 and check_needs_auth(telescope_id)
+
     return {
         "telescope": telescope,
         "telescopes": telescopes,
@@ -276,17 +393,19 @@ def _get_context_real(telescope_id, req):
         "platform": os_platform,
         "defgain": defgain,
         "current_exp": current_exp,
+        "needs_auth_warning": needs_auth_warning,
     }
 
 
 def get_context(telescope_id, req):
-    if (
-        telescope_id not in _context_cached
-        or time.time() - _last_context_get_time[telescope_id] > 1.0
-    ):
-        _last_context_get_time[telescope_id] = time.time()
-        _context_cached[telescope_id] = _get_context_real(telescope_id, req)
-    return _context_cached[telescope_id]
+    with _context_cache_lock:
+        if (
+            telescope_id not in _context_cached
+            or time.time() - _last_context_get_time[telescope_id] > 1.0
+        ):
+            _last_context_get_time[telescope_id] = time.time()
+            _context_cached[telescope_id] = _get_context_real(telescope_id, req)
+        return _context_cached[telescope_id]
 
 
 def get_flash_cookie(req, resp):
@@ -297,10 +416,38 @@ def get_flash_cookie(req, resp):
     return []
 
 
+def site_timezone():
+    """Time zone of the telescope site.
+
+    The ``timezone`` setting when it names a known zone, otherwise the time
+    zone of the computer running seestar_alp, which is not the site's when
+    the server runs in UTC or far from the scope (remote observatories).
+    """
+    name = str(Config.init_timezone or "").strip()
+    if name:
+        try:
+            return pytz.timezone(name)
+        except pytz.UnknownTimeZoneError:
+            logger.warning(
+                f"Unknown time zone {name!r} in the settings; using this computer's"
+            )
+    return tzlocal.get_localzone()
+
+
+def site_utc_offset_hours(when=None):
+    """UTC offset of the telescope site, in hours, at ``when`` (default: now).
+
+    A float: some zones are offset by half or quarter hours.
+    """
+    if when is None:
+        when = datetime.now(pytz.utc)
+    return when.astimezone(site_timezone()).utcoffset().total_seconds() / 3600
+
+
 def update_twilight_times(latitude=None, longitude=None):
     observer = ephem.Observer()
     observer.date = datetime.now()
-    local_timezone = tzlocal.get_localzone()
+    local_timezone = site_timezone()
     sun = ephem.Sun()
     current_date_formatted = str(datetime.now().strftime("%Y-%m-%d"))
 
@@ -451,24 +598,21 @@ def get_planning_cards():
         card_state_file_location = os.path.abspath(
             os.path.join(sys._MEIPASS, "planning.json")
         )
+        card_state_example_file_location = os.path.abspath(
+            os.path.join(sys._MEIPASS, "planning.json.example")
+        )
     else:
         card_state_file_location = os.path.join(
             os.path.dirname(__file__), "planning.json"
         )
+        card_state_example_file_location = os.path.join(
+            os.path.dirname(__file__), "planning.json.example"
+        )
 
     # Check to see if there is cached planning.json, if not create it.
     if not os.path.isfile(card_state_file_location):
-        if getattr(
-            sys, "frozen", False
-        ):  # frozen means that we are running from a bundled app
-            card_state_example_file_location = os.path.abspath(
-                os.path.join(sys._MEIPASS, "planning.json.example")
-            )
-        else:
-            card_state_example_file_location = os.path.join(
-                os.path.dirname(__file__), "planning.json.example"
-            )
         shutil.copyfile(card_state_example_file_location, card_state_file_location)
+
     file_mtime = os.path.getmtime(card_state_file_location)
     with _planning_cards_cache_lock:
         if (
@@ -478,6 +622,25 @@ def get_planning_cards():
             return json.loads(json.dumps(_planning_cards_cache))
         with open(card_state_file_location, "r") as card_state_file:
             state_data = json.load(card_state_file)
+
+        # Merge in any cards present in the shipped example that the user's
+        # local planning.json (created once, on first run) doesn't have yet —
+        # otherwise a card added after a user's first run is never seen.
+        if os.path.isfile(card_state_example_file_location):
+            with open(card_state_example_file_location, "r") as example_file:
+                example_cards = json.load(example_file)
+            existing_names = {card["card_name"] for card in state_data}
+            missing_cards = [
+                card
+                for card in example_cards
+                if card["card_name"] not in existing_names
+            ]
+            if missing_cards:
+                state_data.extend(missing_cards)
+                with open(card_state_file_location, "w") as card_state_file:
+                    json.dump(state_data, card_state_file, indent=4)
+                file_mtime = os.path.getmtime(card_state_file_location)
+
         _planning_cards_cache = state_data
         _planning_cards_cache_mtime = file_mtime
         return json.loads(json.dumps(state_data))
@@ -568,13 +731,14 @@ def _check_api_state_cached(telescope_id):
 
 
 def check_api_state(telescope_id):
-    if (
-        telescope_id not in _api_state_cached
-        or time.time() - _last_api_state_get_time[telescope_id] > 1.0
-    ):
-        _last_api_state_get_time[telescope_id] = time.time()
-        _api_state_cached[telescope_id] = _check_api_state_cached(telescope_id)
-    return _api_state_cached[telescope_id]
+    with _api_state_cache_lock:
+        if (
+            telescope_id not in _api_state_cached
+            or time.time() - _last_api_state_get_time[telescope_id] > 1.0
+        ):
+            _last_api_state_get_time[telescope_id] = time.time()
+            _api_state_cached[telescope_id] = _check_api_state_cached(telescope_id)
+        return _api_state_cached[telescope_id]
 
 
 def check_internet_connection():
@@ -723,16 +887,138 @@ def get_client_master(telescope_id):
     return client_master
 
 
+# An unfiltered get_device_state opens and closes the focuser, runs shell
+# queries and can wait ~30 s on the mount (seestar-spec, READ), so callers ask
+# for the sections they read. Firmware that ignores "keys" returns them all.
+def _device_state_sections(telescope_id, *keys):
+    return method_sync("get_device_state", telescope_id, params={"keys": list(keys)})
+
+
 def get_firmware_ver_int(telescope_id):
     if check_api_state(telescope_id):
-        state = method_sync("get_device_state", telescope_id)
+        state = _device_state_sections(telescope_id, "device")
         return pydash.get(state, "device.firmware_ver_int", 0)
     return 0
 
 
+# Firmware 7.32 (int 2732) made authentication mandatory.
+_FW_AUTH_REQUIRED = 2732
+
+# Cache check_needs_auth results so every page render doesn't block on a TCP call.
+_auth_needs_cache: dict[
+    int, tuple[bool, float]
+] = {}  # stores confirmed (needs_auth, expiry) pairs
+_AUTH_CACHE_TTL = 10.0  # seconds
+
+
+def check_needs_auth(telescope_id):
+    """Return True if the device requires auth but is not authenticated.
+
+    Calls pi_is_verified directly — this is safe without auth on firmware 7.32+.
+    Skips get_firmware_ver_int because that call itself requires auth, so it
+    returns 0 (< threshold) when unauthenticated, producing a false negative.
+    On older firmware pi_is_verified will error → we return False (no warning).
+
+    Results are cached for _AUTH_CACHE_TTL seconds to avoid a blocking TCP call
+    on every page render.
+    """
+    if is_emulator_telescope(telescope_id):
+        return False
+    now = time.monotonic()
+    cached = _auth_needs_cache.get(telescope_id)
+    if cached is not None:
+        val, expiry = cached
+        if now < expiry:
+            return val
+
+    result_val = _check_needs_auth_uncached(telescope_id)
+    if result_val is None:
+        # Timeout — the device may be busy during an imaging session, which is
+        # indistinguishable from firmware 7.32+ silently ignoring an unauthenticated
+        # connection.  Preserve the last *confirmed-authenticated* state so a transient
+        # timeout doesn't re-raise the dialog mid-session.  If we have no prior
+        # history, or the prior result was "needs auth", keep returning True so the
+        # warning still appears on cold-start and stays until auth is confirmed.
+        if cached is not None and cached[0] is False:
+            _auth_needs_cache[telescope_id] = (False, now + _AUTH_CACHE_TTL)
+            return False
+        return True
+    _auth_needs_cache[telescope_id] = (result_val, now + _AUTH_CACHE_TTL)
+    return result_val
+
+
+def _check_needs_auth_uncached(telescope_id):
+    if not check_api_state(telescope_id):
+        return False
+    try:
+        result = method_sync("pi_is_verified", telescope_id)
+        # Authenticated: firmware returns result: True (bare boolean from method_sync)
+        if isinstance(result, bool):
+            return not result
+        # Not authenticated: firmware returns result: False, wrapped as a dict
+        # by method_sync because False == 0 in Python triggers its == 0 branch.
+        if isinstance(result, dict):
+            if result.get("status") == "success":
+                res_val = result.get("result")
+                if isinstance(res_val, bool):
+                    return not res_val
+                if isinstance(res_val, dict):
+                    return not res_val.get("is_verified", False)
+            # Error dict (method not found on old firmware) → no warning needed.
+            return False
+        # None: the front-layer HTTP request timed out (5s) before the device layer
+        # got any response from the firmware.  Firmware 7.32+ without authentication
+        # silently ignores ALL commands on the control port — it never replies to
+        # pi_is_verified.  Return None so check_needs_auth can fall back to the last
+        # confirmed state rather than treating a busy-device timeout as auth failure.
+        if result is None:
+            return None
+        # A device-layer sync-call timeout, wrapped as an error string, means
+        # exactly what an HTTP-layer timeout (None, above) means: the firmware
+        # never replied. Without this, that error string falls through to the
+        # "Offline" return False below and the auth warning never fires.
+        if isinstance(result, str) and result.startswith(
+            "Error: Exceeded allotted wait time"
+        ):
+            return None
+        # "Offline" string → device layer explicitly says offline.
+        return False
+    except Exception:
+        return False
+
+
+def _model_family(model):
+    """Normalize a product_model string to "S30"/"S50" plus a Pro flag.
+
+    The firmware reports "Seestar " + a short name (S50, S50N, S30, S30P,
+    S50P); older builds and the OTA updater use "S30 Pro"/"S50 Pro". Match
+    loosely so all of them work. Returns (family, is_pro); family is None for unknown models
+    (including S30 Plus, which is not the S30 Pro).
+    """
+    compact = re.sub(r"[\s_-]+", "", str(model or "")).lower()
+    m = re.search(r"s(30|50)(pro|p(?!lus))?", compact)
+    if not m:
+        return None, False
+    return f"S{m.group(1)}", bool(m.group(2))
+
+
+def has_wide_camera(model):
+    """S30, S30 Pro and S50 Pro have a wide angle camera; the S50 does not."""
+    family, is_pro = _model_family(model)
+    return family == "S30" or (family == "S50" and is_pro)
+
+
+def planner_model_key(model):
+    """Key of the matching option in the planner's Seestar model dropdown."""
+    family, is_pro = _model_family(model)
+    if family is None:
+        return None
+    return f"{family} Pro" if is_pro else family
+
+
 def get_device_model(telescope_id):
     if check_api_state(telescope_id):
-        state = method_sync("get_device_state", telescope_id)
+        state = _device_state_sections(telescope_id, "device")
         return pydash.get(state, "device.product_model", 0)
     return 0
 
@@ -746,7 +1032,7 @@ def get_guestmode_state(telescope_id):
         client_list = []
         fw = 0
 
-        result = method_sync("get_device_state", telescope_id)
+        result = _device_state_sections(telescope_id, "device", "setting", "client")
         if result is not None:
             device = result.get("device", {})
             fw = device.get("firmware_ver_int", 0)
@@ -782,7 +1068,18 @@ def get_guestmode_state(telescope_id):
 
 def get_device_state(telescope_id):
     if check_api_state(telescope_id):
-        result = method_sync("get_device_state", telescope_id)
+        result = _device_state_sections(
+            telescope_id,
+            "device",
+            "setting",
+            "focuser",
+            "storage",
+            "balance_sensor",
+            "compass_sensor",
+            "mount",
+            "pi_status",
+            "client",
+        )
         status = method_sync("get_view_state", telescope_id)
         wifi_status = method_sync("pi_station_state", telescope_id)
 
@@ -965,6 +1262,7 @@ def get_device_settings(telescope_id):
             "heater_enable": pydash.get(settings_result, "heater_enable"),
             "auto_power_off": pydash.get(settings_result, "auto_power_off"),
             "stack_lenhance": pydash.get(settings_result, "stack_lenhance"),
+            "auto_lenhance": pydash.get(settings_result, "auto_lenhance", False),
             "dark_mode": pydash.get(settings_result, "dark_mode"),
             "stack_cont_capt": stack_cont_capt,
             "stack_drizzle2x": pydash.get(settings_result, "stack.drizzle2x"),
@@ -1023,12 +1321,42 @@ def get_device_settings(telescope_id):
                     settings_result, "af_before_stack", False
                 ),
             }
-            if model == "Seestar S30 Pro":
+            if planner_model_key(model) == "S30 Pro":
                 settings |= {
                     "stack_star_trails": pydash.get(
                         settings_result, "stack.star_trails", False
                     ),
                 }
+
+        # Wide angle camera settings (S30 and S30P only, experimental)
+        if Config.experimental and has_wide_camera(model):
+            for key, val in {
+                "wide_cam": pydash.get(settings_result, "wide_cam"),
+                "wide_4k": pydash.get(settings_result, "wide_4k"),
+                "wide_denoise": pydash.get(merged_stack_settings, "wide_denoise"),
+                "wide_focal_pos": pydash.get(settings_result, "wide_focal_pos"),
+            }.items():
+                if val is not None:
+                    settings[key] = val
+
+        # Autofocus-enabled toggle. Confirmed present in set_setting/get_setting
+        # since firmware 2732 (v3.1.2); as of firmware 2846 (v3.3.0), enabling it
+        # also gates the new sensor-temp-drift auto-refocus check (decompiled
+        # firmware: NeedViewStarSensorTempAutoFocus reads GetTestSetting()'s
+        # auto_af-backed flag, with a hardcoded 5.0C threshold -- not user
+        # configurable). No version gate needed; the key itself isn't new.
+        auto_af = pydash.get(settings_result, "auto_af")
+        if auto_af is not None:
+            settings["auto_af"] = auto_af
+
+        # On-device ASCOM Alpaca REST server toggle -- new in firmware v3.3.1
+        # (build 9.16). This is ZWO's own Alpaca server running on the device
+        # itself, separate from seestar_alp's own Alpaca API layer. No
+        # confirmed firmware_ver_int threshold for this release, so gate by
+        # payload presence rather than version.
+        alpaca_enable = pydash.get(settings_result, "alpaca_enable")
+        if alpaca_enable is not None:
+            settings["alpaca_enable"] = alpaca_enable
 
         # If either endpoint reports these stack-save fields, expose them.
         for key, value in (
@@ -1099,13 +1427,31 @@ def process_queue(resp, telescope_id):
 
 
 def check_ra_value(raString):
-    valid = [
+    """A bare decimal RA is parsed as hours (Util.parse_coordinate uses
+    unit=u.hourangle, matching the ASCOM RightAscension convention), so it must
+    fall within one wrap of [0, 24) -- astropy silently wraps an out-of-range
+    value via modulo instead of raising, which previously let e.g. "279.2347"
+    (a target's RA in *degrees*, easy to enter by mistake) slew to a completely
+    wrong sky position with no error. Sexagesimal/space-separated formats
+    already carry their own hour component and are left to format-only
+    validation.
+
+    A single negative wrap (-24, 0) is accepted -- e.g. -2 is unambiguously
+    22h, and a real RA-in-degrees mistake can never be negative (RA-in-degrees
+    has no negative convention), so this can't reopen the bug above. The
+    positive side stays a hard cutoff at 24: unlike negative values, values
+    just over 24 (e.g. 24-48) *are* plausible RA-in-degrees mistakes for real
+    targets, so loosening that side would silently let some of them back in.
+    """
+    bare_decimal = re.fullmatch(r"[+-]?(\d+\.?\d*|\.\d+)", raString)
+    if bare_decimal:
+        return -24 < float(raString) < 24
+
+    sexagesimal = [
         r"^\d+h\s*\d+m\s*([0-9.]+s)?$",
-        r"^\d+(\.\d+)?$",
         r"^\d+\s+\d+\s+[0-9.]+$",
-        r"^[+-]?([0-9]*[.])?[0-9]+$",
     ]
-    return any(re.search(pattern, raString) for pattern in valid)
+    return any(re.search(pattern, raString) for pattern in sexagesimal)
 
 
 def check_dec_value(decString):
@@ -1252,6 +1598,14 @@ def get_nearest_csc():
     return dict(closest_site)
 
 
+_VALID_STACK_TYPES = frozenset(("DeepSky", "SolarSystem", "MilkyWay"))
+
+
+def _parse_stack_type(form):
+    st = form.get("stackType", "DeepSky")
+    return st if st in _VALID_STACK_TYPES else "DeepSky"
+
+
 def do_create_mosaic(req, resp, schedule, telescope_id):
     form = req.media
     targetName = form["targetName"]
@@ -1266,6 +1620,7 @@ def do_create_mosaic(req, resp, schedule, telescope_id):
     gain = form["gain"]
     num_tries = form.get("num_tries")
     retry_wait_s = form.get("retry_wait_s")
+    stack_type = _parse_stack_type(form)
     action = form.get("action", "")
     selected_items = form.get("selected_items", "")
     errors = {}
@@ -1284,6 +1639,7 @@ def do_create_mosaic(req, resp, schedule, telescope_id):
         "is_use_autofocus": useAutoFocus,
         "num_tries": int(num_tries) if num_tries else 1,
         "retry_wait_s": int(retry_wait_s) if retry_wait_s else 300,
+        "stack_type": stack_type,
     }
 
     if telescope_id == 0:
@@ -1322,6 +1678,86 @@ def do_create_mosaic(req, resp, schedule, telescope_id):
     return values, errors
 
 
+def do_create_framed_mosaic(req, resp, schedule, telescope_id):
+    form = req.media
+    targetName = form["targetName"]
+    ra = form["ra"]
+    dec = form["dec"]
+    useJ2000 = form.get("useJ2000") == "on"
+    mosaicScale = form["mosaicScale"]
+    mosaicAngle = form["mosaicAngle"]
+    panelTime = hms_to_sec(form["panelTime"])
+    useLpfilter = form.get("useLpFilter") == "on"
+    useAutoFocus = form.get("useAutoFocus") == "on"
+    gain = form["gain"]
+    num_tries = form.get("num_tries")
+    retry_wait_s = form.get("retry_wait_s")
+    stack_type = _parse_stack_type(form)
+    action = form.get("action", "")
+    selected_items = form.get("selected_items", "")
+    errors = {}
+    values = {
+        "target_name": targetName,
+        "is_j2000": useJ2000,
+        "ra": ra,
+        "dec": dec,
+        "mosaic_scale": float(mosaicScale),
+        "mosaic_angle": float(mosaicAngle),
+        "is_use_lp_filter": useLpfilter,
+        "panel_time_sec": int(panelTime),
+        "gain": int(gain),
+        "is_use_autofocus": useAutoFocus,
+        "num_tries": int(num_tries) if num_tries else 1,
+        "retry_wait_s": int(retry_wait_s) if retry_wait_s else 300,
+        "stack_type": stack_type,
+    }
+
+    if telescope_id == 0:
+        fedMode = form.get("federation_mode")
+        if fedMode:
+            values["federation_mode"] = fedMode
+        maxDev = form.get("max_devices")
+        if maxDev:
+            values["max_devices"] = maxDev
+
+    if not check_ra_value(ra):
+        flash(resp, "Invalid RA value")
+        errors["ra"] = ra
+
+    if not check_dec_value(dec):
+        flash(resp, "Invalid DEC Value")
+        errors["dec"] = dec
+
+    if values["mosaic_scale"] < 1.0 or values["mosaic_scale"] > 4.0:
+        flash(resp, "Mosaic scale must be between 1.0 and 4.0")
+        errors["mosaic_scale"] = mosaicScale
+
+    if values["mosaic_angle"] < -90.0 or values["mosaic_angle"] > 90.0:
+        flash(resp, "Mosaic angle must be between -90 and 90")
+        errors["mosaic_angle"] = mosaicAngle
+
+    if errors:
+        flash(resp, "ERROR detected in framed mosaic parameters")
+        return values, errors
+
+    if schedule:
+        if action == "append":
+            response = do_schedule_action_device(
+                "start_framed_mosaic", values, telescope_id
+            )
+        else:
+            response = do_insert_schedule_item(
+                "start_framed_mosaic", values, selected_items, telescope_id
+            )
+
+        logger.info("POST scheduled request %s %s", values, response)
+    else:
+        response = do_action_device("start_framed_mosaic", telescope_id, values, False)
+        logger.info("POST immediate request %s %s", values, response)
+
+    return values, errors
+
+
 def do_create_image(req, resp, schedule, telescope_id):
     form = req.media
     targetName = form["targetName"]
@@ -1336,6 +1772,7 @@ def do_create_image(req, resp, schedule, telescope_id):
     gain = form["gain"]
     num_tries = form.get("num_tries")
     retry_wait_s = form.get("retry_wait_s")
+    stack_type = _parse_stack_type(form)
     action = form.get("action", "")
     selected_items = form.get("selected_items", "")
     errors = {}
@@ -1354,6 +1791,7 @@ def do_create_image(req, resp, schedule, telescope_id):
         "is_use_autofocus": useAutoFocus,
         "num_tries": int(num_tries) if num_tries else 1,
         "retry_wait_s": int(retry_wait_s) if retry_wait_s else 300,
+        "stack_type": stack_type,
     }
 
     if telescope_id == 0:
@@ -1606,7 +2044,7 @@ def do_command(req, resp, telescope_id):
             )
             return output
         case "get_remote_state":
-            output = method_sync("get_device_state, telescope_id")
+            output = method_sync("get_device_state", telescope_id)
             return output
         case _:
             logger.warning("No command found: %s", value)
@@ -1688,6 +2126,21 @@ def redirect(location):
     # raise HTTPTemporaryRedirect(location)
 
 
+class RootPathMiddleware:
+    """Keep server redirects inside the URL prefix SSC is served under.
+
+    SSC's own redirects name route URLs, and this is the only place the
+    prefix is added to them.
+    """
+
+    def process_response(self, req, resp, resource, req_succeeded):
+        location = resp.get_header("Location")
+        if location:
+            prefixed = with_root_path(get_root_path(req), location)
+            if prefixed != location:
+                resp.set_header("Location", prefixed)
+
+
 template_dir = os.path.join(os.path.dirname(__file__), "templates")
 env = Environment(loader=FileSystemLoader(template_dir))
 
@@ -1699,6 +2152,17 @@ def seconds_to_hms(seconds):
 
 
 env.globals["seconds_to_hms"] = seconds_to_hms
+
+
+def mosaic_panel_count(params):
+    """Panel count for a mosaic item, matching Seestar.mosaic_thread_fn's num_panels."""
+    selected_panels = params.get("selected_panels") or ""
+    if selected_panels:
+        return len(selected_panels.split(";"))
+    return params.get("ra_num", 1) * params.get("dec_num", 1)
+
+
+env.globals["mosaic_panel_count"] = mosaic_panel_count
 
 
 def fetch_template(template_name):
@@ -1717,7 +2181,7 @@ def render_template(req, resp, template_name, **context):
     resp.status = falcon.HTTP_200
     resp.content_type = "text/html"
     version = Version.app_version()
-    merged_context = dict(context)
+    merged_context = _template_context(req, context)
     merged_context.setdefault("webui_theme", Config.uitheme)
     merged_context.setdefault("webui_text_color", Config.webui_text_color)
     merged_context.setdefault("webui_font_family", Config.webui_font_family)
@@ -1738,7 +2202,7 @@ def render_fragment(req, resp, template_name, **context):
     resp.status = falcon.HTTP_200
     resp.content_type = "text/html"
     version = Version.app_version()
-    merged_context = dict(context)
+    merged_context = _template_context(req, context)
     merged_context.setdefault("webui_theme", Config.uitheme)
     merged_context.setdefault("webui_text_color", Config.webui_text_color)
     merged_context.setdefault("webui_font_family", Config.webui_font_family)
@@ -1768,7 +2232,7 @@ def get_request_cache_identity(req):
         or req.get_header("Referer")
         or getattr(req, "relative_uri", "")
     )
-    return (remote_addr, user_agent, current_url)
+    return (remote_addr, user_agent, current_url, get_root_path(req))
 
 
 def render_schedule_tab(req, resp, telescope_id, template_name, tab, values, errors):
@@ -2311,6 +2775,39 @@ class MosaicResource(BaseResource):
         )
 
 
+class FramedMosaicResource(BaseResource):
+    def on_get(self, req, resp, telescope_id=0):
+        self.framed_mosaic(req, resp, {}, {}, telescope_id)
+
+    def on_post(self, req, resp, telescope_id=0):
+        values, errors = do_create_framed_mosaic(req, resp, False, telescope_id)
+        self.framed_mosaic(req, resp, values, errors, telescope_id)
+
+    @staticmethod
+    def framed_mosaic(req, resp, values, errors, telescope_id):
+        context = get_context(telescope_id, req)
+        if not context["online"]:
+            telescope_id = 0
+
+        current = do_action_device("get_schedule", telescope_id, {})
+        if current is None:
+            return
+        state = current["Value"]["state"]
+        schedule = current["Value"]
+
+        render_template(
+            req,
+            resp,
+            "framed_mosaic.html",
+            state=state,
+            schedule=schedule,
+            values=values,
+            errors=errors,
+            action=f"/{telescope_id}/framed_mosaic",
+            **context,
+        )
+
+
 class ScheduleResource:
     @staticmethod
     def on_get(req, resp, telescope_id=0):
@@ -2520,6 +3017,39 @@ class ScheduleMosaicResource:
             telescope_id = 0
         render_schedule_tab(
             req, resp, telescope_id, "schedule_mosaic.html", "mosaic", values, errors
+        )
+
+
+class ScheduleFramedMosaicResource:
+    @staticmethod
+    def on_get(req, resp, telescope_id=0):
+        online = check_api_state(telescope_id)
+        if not online:
+            telescope_id = 0
+        render_schedule_tab(
+            req,
+            resp,
+            telescope_id,
+            "schedule_framed_mosaic.html",
+            "framed_mosaic",
+            {},
+            {},
+        )
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=0):
+        values, errors = do_create_framed_mosaic(req, resp, True, telescope_id)
+        online = check_api_state(telescope_id)
+        if not online:
+            telescope_id = 0
+        render_schedule_tab(
+            req,
+            resp,
+            telescope_id,
+            "schedule_framed_mosaic.html",
+            "framed_mosaic",
+            values,
+            errors,
         )
 
 
@@ -2967,6 +3497,18 @@ class ScheduleUploadResource:
         redirect(f"/{telescope_id}/schedule")
 
 
+def _render_schedule_partial(req, resp, template_name, context, **values):
+    """Render one schedule partial (list or state) for this request."""
+    return fetch_template(template_name).render(
+        flashed_messages=get_flash_cookie(req, resp),
+        messages=get_messages(),
+        webui_theme=Config.uitheme,
+        version=Version.app_version(),
+        **values,
+        **_template_context(req, context),
+    )
+
+
 class ScheduleReStartResource(BaseResource):
     def on_get(self, req, resp, telescope_id=0):
         do_action_device("reset_scheduler_cur_item", telescope_id, {})
@@ -2989,36 +3531,14 @@ class ScheduleReStartResource(BaseResource):
         resp.status = falcon.HTTP_200
 
     def render_schedule_list_html(self, req, resp, schedule, context):
-        template = fetch_template("partials/schedule_list.html")
-        webui_theme = Config.uitheme
-        version = Version.app_version()
-
-        html = template.render(
-            flashed_messages=get_flash_cookie(req, resp),
-            messages=get_messages(),
-            webui_theme=webui_theme,
-            version=version,
-            schedule=schedule,
-            **context,
+        return _render_schedule_partial(
+            req, resp, "partials/schedule_list.html", context, schedule=schedule
         )
-
-        return html
 
     def render_schedule_state_html(self, req, resp, state, context):
-        template = fetch_template("partials/schedule_state.html")
-        webui_theme = Config.uitheme
-        version = Version.app_version()
-
-        html = template.render(
-            flashed_messages=get_flash_cookie(req, resp),
-            messages=get_messages(),
-            webui_theme=webui_theme,
-            version=version,
-            state=state,
-            **context,
+        return _render_schedule_partial(
+            req, resp, "partials/schedule_state.html", context, state=state
         )
-
-        return html
 
 
 class ScheduleRefreshResource(BaseResource):
@@ -3037,7 +3557,7 @@ class ScheduleRefreshResource(BaseResource):
 
         open_accordion_id = req.get_param("open_accordion_id", default="")
         html = self.render_schedule_list_html(req, resp, schedule, context)
-        cache_key = (int(telescope_id), open_accordion_id)
+        cache_key = (int(telescope_id), open_accordion_id, get_root_path(req))
         changed = True
         with ScheduleRefreshResource._lock:
             last_html = ScheduleRefreshResource._last_render_by_key.get(cache_key)
@@ -3058,22 +3578,14 @@ class ScheduleRefreshResource(BaseResource):
         resp.status = falcon.HTTP_200
 
     def render_schedule_list_html(self, req, resp, schedule, context):
-        template = fetch_template("partials/schedule_list.html")
-        webui_theme = Config.uitheme
-        version = Version.app_version()
-        open_accordion_id = req.get_param("open_accordion_id", default="")
-
-        html = template.render(
-            flashed_messages=get_flash_cookie(req, resp),
-            messages=get_messages(),
-            webui_theme=webui_theme,
-            version=version,
+        return _render_schedule_partial(
+            req,
+            resp,
+            "partials/schedule_list.html",
+            context,
             schedule=schedule,
-            open_accordion_id=open_accordion_id,
-            **context,
+            open_accordion_id=req.get_param("open_accordion_id", default=""),
         )
-
-        return html
 
 
 class EventStatus:
@@ -3095,7 +3607,7 @@ class EventStatus:
             ]
         elif action == "goto":
             eventlist = ["WheelMove", "AutoGoto", "PlateSolve"]
-        elif action == "image" or action == "mosaic":
+        elif action in ("image", "mosaic", "framed_mosaic"):
             eventlist = [
                 "WheelMove",
                 "AutoGoto",
@@ -3247,6 +3759,38 @@ class LiveModeResource:
         resp.status = falcon.HTTP_200
         resp.content_type = "text/plain"
         resp.text = mode
+
+
+class ForceStopGotoResource:
+    """Unconditional stop + force-clear of the goto-in-progress state.
+
+    Use case: AutoGoto plate-solve has been retrying forever (typical
+    when the actual sky is not visible) and the device-side ``is_goto()``
+    flag is stuck on "working" — every subsequent ``goto_target`` is
+    rejected with "mount is in goto routine". The standard
+    ``stop_goto_target`` only sends ``iscope_stop_view`` to the firmware
+    if ``is_goto()`` returns True; if the state is wedged, that returns
+    "goto stopped already: no action taken" and the loop persists.
+
+    POST -> calls device.force_stop_goto which always sends the firmware
+    stop AND force-clears the local state dict. HTMX requests get a small
+    HTML status fragment for the goto page; other clients get the device
+    response as JSON.
+    """
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=1):
+        response = do_action_device("force_stop_goto", telescope_id, {})
+        resp.status = falcon.HTTP_200
+        if req.get_header("HX-Request"):
+            resp.content_type = "text/html"
+            if response is not None:
+                resp.text = '<span class="text-success">Cleared. Mount free.</span>'
+            else:
+                resp.text = '<span class="text-danger">No response from device.</span>'
+        else:
+            resp.content_type = "application/json"
+            resp.text = json.dumps(response or {"ok": False, "reason": "no response"})
 
 
 class LiveGotoResource(BaseResource):
@@ -3543,6 +4087,54 @@ class LiveVideoKickResource(BaseResource):
         resp.status = falcon.HTTP_204
 
 
+class LiveWideCamResource:
+    def on_get(self, req, resp, telescope_id: int = 1):
+        if not Config.experimental:
+            resp.set_header("HX-Reswap", "none")
+            resp.status = falcon.HTTP_204
+            return
+        model = get_device_model(telescope_id)
+        if not has_wide_camera(model):
+            resp.set_header("HX-Reswap", "none")
+            resp.status = falcon.HTTP_204
+            return
+        output = do_action_device(
+            "method_sync", telescope_id, {"method": "get_setting"}
+        )
+        wide_cam = bool(pydash.get(output, "Value.result.wide_cam", False))
+        render_fragment(
+            req,
+            resp,
+            "partials/live_controls_wide_cam.html",
+            wide_cam=wide_cam,
+            root=f"/{telescope_id}",
+        )
+
+    def on_post(self, req, resp, telescope_id: int = 1):
+        if not Config.experimental:
+            resp.set_header("HX-Reswap", "none")
+            resp.status = falcon.HTTP_204
+            return
+        model = get_device_model(telescope_id)
+        if not has_wide_camera(model):
+            resp.set_header("HX-Reswap", "none")
+            resp.status = falcon.HTTP_204
+            return
+        wide_cam = req.media.get("wide_cam") == "true"
+        do_action_device(
+            "method_sync",
+            telescope_id,
+            {"method": "set_setting", "params": {"wide_cam": wide_cam}},
+        )
+        render_fragment(
+            req,
+            resp,
+            "partials/live_controls_wide_cam.html",
+            wide_cam=wide_cam,
+            root=f"/{telescope_id}",
+        )
+
+
 class LiveFocusResource(BaseResource):
     def __init__(self):
         self.focus = {}
@@ -3750,12 +4342,16 @@ class SettingsResource(BaseResource):
                     return out, True
             return last_output, False
 
+        def _dither_member(form_key, low, high):
+            # Out of range gives 204 and stops the rest of the set_setting;
+            # a missing member is ignored (seestar-spec, READ).
+            value = _safe_int(PostedSettings.get(form_key), None)
+            return value if value is not None and low <= value <= high else None
+
         # Convert the form names back into the required format
         FormattedNewSettings = {
             "stack_lenhance": str2bool(PostedSettings["stack_lenhance"]),
             "stack_dither": {
-                "pix": _safe_int(PostedSettings["stack_dither_pix"], 0),
-                "interval": _safe_int(PostedSettings["stack_dither_interval"], 0),
                 "enable": str2bool(PostedSettings["stack_dither_enable"]),
             },
             "exp_ms": {
@@ -3767,6 +4363,13 @@ class SettingsResource(BaseResource):
             "auto_3ppa_calib": str2bool(PostedSettings["auto_3ppa_calib"]),
             "frame_calib": str2bool(PostedSettings["frame_calib"]),
         }
+        for member, form_key, low, high in (
+            ("pix", "stack_dither_pix", 0, 200),
+            ("interval", "stack_dither_interval", 1, 100),
+        ):
+            value = _dither_member(form_key, low, high)
+            if value is not None:
+                FormattedNewSettings["stack_dither"][member] = value
 
         if fw >= 2670:
             FormattedNewSettings |= {
@@ -3777,6 +4380,37 @@ class SettingsResource(BaseResource):
                 FormattedNewSettings |= {
                     "af_before_stack": str2bool(PostedSettings["af_before_stack"])
                 }
+
+        if fw >= 2775 and "auto_lenhance" in PostedSettings:
+            FormattedNewSettings["auto_lenhance"] = str2bool(
+                PostedSettings["auto_lenhance"]
+            )
+
+        if has_wide_camera(model):
+            for key, converter in (
+                ("wide_cam", str2bool),
+                ("wide_4k", str2bool),
+            ):
+                if key in PostedSettings:
+                    FormattedNewSettings[key] = converter(PostedSettings[key])
+            # A stack member: at the top level set_setting answers 109 and
+            # skips the members after it.
+            if "wide_denoise" in PostedSettings:
+                FormattedNewSettings.setdefault("stack", {})["wide_denoise"] = str2bool(
+                    PostedSettings["wide_denoise"]
+                )
+            if "wide_focal_pos" in PostedSettings:
+                FormattedNewSettings["wide_focal_pos"] = _safe_int(
+                    PostedSettings["wide_focal_pos"], 0
+                )
+
+        if "auto_af" in PostedSettings:
+            FormattedNewSettings["auto_af"] = str2bool(PostedSettings["auto_af"])
+
+        if "alpaca_enable" in PostedSettings:
+            FormattedNewSettings["alpaca_enable"] = str2bool(
+                PostedSettings["alpaca_enable"]
+            )
 
         FormattedNewStackSettings = {}
         has_stack_settings_input = any(
@@ -3836,10 +4470,17 @@ class SettingsResource(BaseResource):
                 },
             )
 
-        settings_output = do_action_device(
-            "method_sync",
-            telescope_id,
-            {"method": "set_setting", "params": FormattedNewSettings},
+        no_response_output = {
+            "ErrorNumber": 1,
+            "ErrorMessage": "No response from device",
+        }
+        settings_output = (
+            do_action_device(
+                "method_sync",
+                telescope_id,
+                {"method": "set_setting", "params": FormattedNewSettings},
+            )
+            or no_response_output
         )
         # For some stupid reason known only to ZWO, dark_mode is returned by get_setting as a boolean.
         # However when you set_setting it expects an integer representation of that boolean
@@ -3847,10 +4488,13 @@ class SettingsResource(BaseResource):
         # It needs to be on its own.
         dark_mode_bool = str2bool(PostedSettings["dark_mode"])
         dark_mode_value = int(dark_mode_bool)
-        dark_mode_output = do_action_device(
-            "method_async",
-            telescope_id,
-            {"method": "set_setting", "params": {"dark_mode": dark_mode_value}},
+        dark_mode_output = (
+            do_action_device(
+                "method_async",
+                telescope_id,
+                {"method": "set_setting", "params": {"dark_mode": dark_mode_value}},
+            )
+            or no_response_output
         )
         # Live Stack Mode is another one like dark_mode.
         cont_capt = str2bool(PostedSettings["stack_cont_capt"])
@@ -3864,10 +4508,13 @@ class SettingsResource(BaseResource):
         # 4k Mode is another one like cont_capt
         drizzle2x = str2bool(PostedSettings["stack_drizzle2x"])
         DrizzleModeSettings = {"stack": {"drizzle2x": drizzle2x}}
-        drizzle_mode_output = do_action_device(
-            "method_sync",
-            telescope_id,
-            {"method": "set_setting", "params": DrizzleModeSettings},
+        drizzle_mode_output = (
+            do_action_device(
+                "method_sync",
+                telescope_id,
+                {"method": "set_setting", "params": DrizzleModeSettings},
+            )
+            or no_response_output
         )
         plan_target_af_output = {"ErrorNumber": 0}
         plan_target_af_success = True
@@ -3892,16 +4539,19 @@ class SettingsResource(BaseResource):
         star_trails_output = {"ErrorNumber": 0}
         if (
             fw <= 2597
-            and model == "Seestar S30 Pro"
+            and planner_model_key(model) == "S30 Pro"
             and "stack_star_trails" in PostedSettings
         ):
             StarTrailsSettings = {
                 "stack": {"star_trails": str2bool(PostedSettings["stack_star_trails"])}
             }
-            star_trails_output = do_action_device(
-                "method_sync",
-                telescope_id,
-                {"method": "set_setting", "params": StarTrailsSettings},
+            star_trails_output = (
+                do_action_device(
+                    "method_sync",
+                    telescope_id,
+                    {"method": "set_setting", "params": StarTrailsSettings},
+                )
+                or no_response_output
             )
         stack_settings_output = {"ErrorNumber": 0}
         stack_settings_success = True
@@ -3994,6 +4644,7 @@ class SettingsResource(BaseResource):
             "heater_enable": 0,
             "auto_power_off": 0,
             "stack_lenhance": 0,
+            "auto_lenhance": 2775,
             "dark_mode": 0,
             "stack_cont_capt": 0,
             "stack_drizzle2x": 0,
@@ -4011,6 +4662,11 @@ class SettingsResource(BaseResource):
             "expert_mode": 2670,
             "af_before_stack": 0,
             "stack_star_trails": 0,
+            "wide_cam": 0,
+            "wide_4k": 0,
+            "wide_denoise": 0,
+            "wide_focal_pos": 0,
+            "auto_af": 0,
         }
         settings = {
             key: value
@@ -4044,16 +4700,22 @@ class SettingsResource(BaseResource):
             "rec_stablzn": "Record Stabilization",
             "isp_exp_ms": "isp_exp_ms",
             "calib_location": "calib_location",
-            "wide_cam": "Wide Cam",
+            "wide_cam": "Wide Angle Camera",
+            "wide_4k": "Wide Camera 4K Mode",
+            "wide_denoise": "Wide Camera Denoise",
+            "wide_focal_pos": "Wide Camera Focal Position",
             "temp_unit": "Temperature Unit",
             "focal_pos": "Focal Position - User Defined",
             "factory_focal_pos": "Default Focal Position",
             "heater_enable": "Dew Heater",
             "auto_power_off": "Auto Power Off",
             "stack_lenhance": "Light Pollution (LP) Filter",
+            "auto_lenhance": "Auto DSO Enhancement",
             "dark_mode": "Dark Mode",
             "stack_cont_capt": "Continuous Capture Mode",
             "stack_drizzle2x": "4k Live Stack Mode (2x Drizzle)",
+            "auto_af": "Automatic Autofocus",
+            "alpaca_enable": "On-Device Alpaca Server",
         }
         # Maybe we can store this better?
         settings_helper_text = {
@@ -4082,16 +4744,22 @@ class SettingsResource(BaseResource):
             "rec_stablzn": "Record Stabilization",
             "isp_exp_ms": "isp_exp_ms",
             "calib_location": "calib_location",
-            "wide_cam": "Wide Cam",
+            "wide_cam": "Enable or disable the wide angle camera (S30/S30P/S50P only).",
+            "wide_4k": "Enable 4K resolution mode for the wide angle camera.",
+            "wide_denoise": "Enable noise reduction for wide angle camera images.",
+            "wide_focal_pos": "User-defined focal position for the wide angle camera.",
             "temp_unit": "Temperature Unit",
             "focal_pos": "Focal Position - User Defined",
             "factory_focal_pos": "Default focal position on startup.",
             "heater_enable": "Enable or disable dew heater.",
             "auto_power_off": "Enable or disable auto power off",
             "stack_lenhance": "Enable or disable light pollution (LP) Filter.",
+            "auto_lenhance": "Enable automatic DSO image enhancement during stacking (firmware 7.75+).",
             "dark_mode": "Enable or disable LEDs while imaging.",
             "stack_cont_capt": "Enabling continuous capture mode disables live stacking",
             "stack_drizzle2x": "Enables 2x drizzle on Live Stack for 4k Mode",
+            "auto_af": "Lets the scope re-run autofocus on its own during a session, e.g. when sensor temperature drifts.",
+            "alpaca_enable": "Enables ZWO's built-in ASCOM Alpaca REST server on the device itself (port 32323, separate from seestar_alp's own Alpaca API). Warning: this server has no authentication by default -- any client on your local network can control the device once enabled.",
         }
         render_template(
             req,
@@ -4117,12 +4785,9 @@ class PlanningResource:
             nearest_csc["full_img"] = ""
 
         planning_cards = get_planning_cards()
-        local_timezone = tzlocal.get_localzone()
-        current_time = datetime.now(local_timezone)
-        utc_offset = current_time.utcoffset()
-        utc_offset = int(
-            utc_offset.total_seconds() / 3600
-        )  # Convert the offset to hours, used for astromosaic
+        # The planner charts are drawn for the configured site, so in the
+        # site's time zone rather than the browser's or the server's.
+        utc_offset = site_utc_offset_hours()
 
         config_lat = round(
             Config.init_lat, 2
@@ -4130,10 +4795,27 @@ class PlanningResource:
         config_long = round(
             Config.init_long, 2
         )  # Some of the 3rd party api's/embeds want rounded down.
+        # Pre-select the planner's Seestar model from the connected scope
+        # (telescope_id 0 is the all-devices view, which has no single model).
+        planner_model = (
+            planner_model_key(get_device_model(telescope_id)) if telescope_id else None
+        )
+        horizon_profile, horizon_error = horizon.configured_profile()
+        horizon_curve = None
+        if horizon_profile is not None:
+            # One point per degree for the Horizon card, clamped to its 0-90 range.
+            horizon_curve = [
+                (
+                    azimuth,
+                    round(min(max(horizon_profile.altitude_at(azimuth), 0), 90), 2),
+                )
+                for azimuth in range(361)
+            ]
         render_template(
             req,
             resp,
             "planning.html",
+            planner_model=planner_model,
             twilight_times=twilight_times,
             config_lat=config_lat,
             config_long=config_long,
@@ -4141,8 +4823,129 @@ class PlanningResource:
             clear_sky_img_src=nearest_csc["full_img"],
             planning_cards=planning_cards,
             utc_offset=utc_offset,
+            horizon_limits=horizon_profile.step_limits() if horizon_profile else None,
+            horizon_curve=horizon_curve,
+            horizon_point_count=len(horizon_profile.points) if horizon_profile else 0,
+            horizon_file=Config.horizon_file,
+            horizon_error=horizon_error,
             **context,
         )
+
+
+class HorizonResource:
+    """Horizon page: the local horizon from a 360-degree panorama.
+
+    The photo is analysed in the browser by the MMhorizon core, compiled to
+    WebAssembly (front/public/mmhorizon); only the resulting profile is posted.
+    """
+
+    # A .hrz has one line per degree or so: a few kilobytes.
+    MAX_UPLOAD = 1024 * 1024
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=0):
+        context = get_context(telescope_id, req)
+        profile, error = horizon.configured_profile()
+        render_template(
+            req,
+            resp,
+            "horizon.html",
+            config_lat=Config.init_lat,
+            config_long=Config.init_long,
+            horizon_file=Config.horizon_file,
+            horizon_error=error,
+            horizon_point_count=len(profile.points) if profile else 0,
+            **context,
+        )
+
+    @staticmethod
+    def on_post(req, resp, telescope_id=0):
+        if (req.content_length or 0) > HorizonResource.MAX_UPLOAD:
+            # HTTPPayloadTooLarge before Falcon 4.
+            too_large = (
+                getattr(falcon, "HTTPContentTooLarge", None)
+                or falcon.HTTPPayloadTooLarge
+            )
+            raise too_large(description="A horizon profile is a few kilobytes")
+        body = req.get_media(default_when_empty=None)
+        if not isinstance(body, dict) or not isinstance(body.get("hrz"), str):
+            raise falcon.HTTPBadRequest(description='Expected {"hrz": "<.hrz text>"}')
+        horizon_json = body.get("horizon_json")
+        if horizon_json is not None and not isinstance(horizon_json, str):
+            raise falcon.HTTPBadRequest(description="horizon_json must be a string")
+        try:
+            path, previous, profile = horizon.save_panorama_profile(
+                body["hrz"], horizon_json
+            )
+        except horizon.HorizonError as e:
+            raise falcon.HTTPBadRequest(description=str(e))
+        except horizon.HorizonSaveError as e:
+            logger.error(str(e))
+            raise falcon.HTTPInternalServerError(
+                description=f"{e}. The previous horizon is still in use."
+            )
+        logger.info(f"Horizon profile saved to {path} ({len(profile.points)} points)")
+        resp.media = {
+            "file": path,
+            "previous_file": previous,
+            "points": len(profile.points),
+        }
+
+
+class HorizonSunResource:
+    """Apparent position of the Sun, to orient a panorama: ?when=ISO&lat=&lon=.
+
+    ``lat`` and ``lon`` are the photo's location; without them, the site's
+    from Settings. 0, 0 stands for an unknown site, as in check_target: the
+    request is refused rather than answered for 0 N 0 E, which would turn
+    the panorama's north by tens of degrees.
+
+    A ``when`` without UTC offset (EXIF often has none) is read in the site's
+    time zone, the planner's, and the answer names it in ``time_zone``: the
+    browser's zone is not the site's when the page is opened from elsewhere.
+    """
+
+    @staticmethod
+    def on_get(req, resp):
+        lat = req.get_param_as_float("lat", min_value=-90, max_value=90)
+        lon = req.get_param_as_float("lon", min_value=-180, max_value=360)
+        if (lat is None) != (lon is None):
+            raise falcon.HTTPBadRequest(description="give both lat and lon, or neither")
+        if lat is None:
+            lat, lon = horizon.site_location() or (0.0, 0.0)
+        if lat == 0 and lon == 0:
+            raise falcon.HTTPBadRequest(
+                description="Site location unknown: set Latitude and Longitude in "
+                "Settings, or use a photo that records where it was taken"
+            )
+        try:
+            when = datetime.fromisoformat(req.get_param("when", required=True))
+        except ValueError:
+            raise falcon.HTTPBadRequest(description="when: expected an ISO 8601 date")
+        time_zone = None
+        if when.tzinfo is None:
+            zone = site_timezone()
+            if hasattr(zone, "localize"):  # pytz
+                when = zone.localize(when)
+            else:
+                when = when.replace(tzinfo=zone)
+            time_zone = str(zone)
+        observer = ephem.Observer()
+        # As angles: nothing rests on how ephem parses a str such as "1e-05".
+        observer.lat = ephem.degrees(math.radians(lat))
+        observer.lon = ephem.degrees(math.radians(lon))
+        observer.elevation = 0
+        observer.date = ephem.Date(when.astimezone(pytz.utc).replace(tzinfo=None))
+        # Apparent position, refraction included (ephem's default 1010 mbar,
+        # 15 degrees C): where the photo shows the Sun.
+        sun = ephem.Sun(observer)
+        resp.media = {
+            "altitude": round(math.degrees(sun.alt), 3),
+            "azimuth": round(math.degrees(sun.az), 3),
+            "latitude": lat,
+            "longitude": lon,
+            "time_zone": time_zone,
+        }
 
 
 class StatsResource:
@@ -7318,7 +8121,7 @@ class StatsContentResource:
             resp,
             StatsContentResource._last_render_by_key,
             StatsContentResource._lock,
-            ("stats-content", int(telescope_id)),
+            ("stats-content", int(telescope_id), get_root_path(req)),
         )
 
 
@@ -7406,6 +8209,19 @@ class GuestModeResource:
         self.on_get(req, resp, telescope_id)
 
 
+class AuthStatusResource:
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        needs_auth = telescope_id > 0 and check_needs_auth(telescope_id)
+        if not needs_auth:
+            resp.set_header("HX-Reswap", "none")
+            resp.status = falcon.HTTP_204
+            return
+        render_fragment(
+            req, resp, "partials/auth_warning.html", needs_auth_warning=needs_auth
+        )
+
+
 class GuestModeContentResource:
     _last_render_by_key = {}
     _lock = threading.Lock()
@@ -7429,7 +8245,7 @@ class GuestModeContentResource:
             resp,
             GuestModeContentResource._last_render_by_key,
             GuestModeContentResource._lock,
-            ("guestmode-content", int(telescope_id)),
+            ("guestmode-content", int(telescope_id), get_root_path(req)),
         )
 
 
@@ -7863,7 +8679,7 @@ class GetBalanceSensorResource:
         referer = req.get_header("Referer")
         referersplit = referer.split("/")[-2:]
         telescope_id = int(referersplit[0])
-        result = method_sync("get_device_state", telescope_id)
+        result = _device_state_sections(telescope_id, "balance_sensor")
         if result is not None:
             balance_sensor = {
                 "x": result["balance_sensor"]["data"]["x"],
@@ -7902,6 +8718,36 @@ class ConfigResource:
         logger.info(f"GOT POST config: {req.media}")
 
         render_template(req, resp, "config.html", now=now, config=Config, **context)
+
+
+class ConfigJsonResource:
+    """Machine-readable view of the configured devices + server ports.
+
+    Lets downstream tools (e.g. a Home Assistant bridge) discover each Seestar's
+    configured network address and the Alpaca/imaging ports without scraping the
+    HTML config page or duplicating that configuration elsewhere.
+    """
+
+    @staticmethod
+    def on_get(req, resp, telescope_id=1):
+        devices = [
+            {
+                "device_num": int(ss.get("device_num", 0)),
+                "name": ss.get("name"),
+                "ip_address": ss.get("ip_address"),
+            }
+            for ss in Config.seestars
+        ]
+        payload = {
+            "server": {
+                "alpaca_port": Config.port,
+                "imaging_port": Config.imgport,
+            },
+            "devices": devices,
+        }
+        resp.status = falcon.HTTP_200
+        resp.content_type = "application/json"
+        resp.text = json.dumps(payload)
 
 
 class BlindPolarAlignResource:
@@ -8300,6 +9146,65 @@ class GetLocalSearch:
             resp.text = rtn
 
 
+def _read_some(raw, size):
+    """Return what has arrived on a urllib3 response body (b"" at end).
+
+    urllib3 2.x exposes read1 on the response; urllib3 1.26 (Debian's armhf
+    build) does not, so fall back to the buffered http.client reader beneath it.
+    """
+    read1 = getattr(raw, "read1", None) or getattr(
+        getattr(raw, "_fp", None), "read1", None
+    )
+    if read1 is not None:
+        return read1(size)
+    return raw.read(size)
+
+
+class ImagingProxyResource:
+    """Relay one of the imaging server's streams through the web-UI port.
+
+    Only referenced when SSC is served under a URL prefix (see
+    _template_context): a sub-path reverse proxy has a single upstream, so the
+    browser cannot open the imaging port directly. The stream (MJPEG or
+    server-sent events) is passed through unchanged.
+    """
+
+    def __init__(self, path):
+        self._path = path
+
+    def on_get(self, req, resp, telescope_id):
+        url = (
+            f"http://{get_listening_ip()}:{Config.imgport}/{telescope_id}/{self._path}"
+        )
+        try:
+            upstream = requests.get(url, stream=True, timeout=(5, 30))
+        except requests.RequestException as e:
+            logger.warning(f"Imaging relay: {url} unreachable: {e}")
+            raise falcon.HTTPBadGateway()
+        resp.status = upstream.status_code
+        resp.content_type = upstream.headers.get(
+            "Content-Type", "application/octet-stream"
+        )
+        resp.set_header("Cache-Control", "no-cache")
+        # Ask buffering proxies (nginx) to pass the stream through as it arrives.
+        resp.set_header("X-Accel-Buffering", "no")
+
+        def relay():
+            # Hand each piece downstream as it arrives; these bodies never end.
+            # The read timeout bounds how long a stalled upstream (or a browser
+            # that left) holds this connection; the stream then ends and an
+            # EventSource client reconnects.
+            try:
+                while chunk := _read_some(upstream.raw, 64 * 1024):
+                    yield chunk
+            except (OSError, urllib3.exceptions.HTTPError) as e:
+                logger.debug(f"Imaging relay: stream ended: {e}")
+            finally:
+                upstream.close()
+
+        resp.stream = relay()
+
+
 class GetAAVSOSearch:
     @staticmethod
     def on_get(req: falcon.Request, resp: falcon.Response) -> None:
@@ -8334,8 +9239,26 @@ class FrontMain:
         """Application startup"""
 
         app = falcon.App(
-            middleware=falcon.CORSMiddleware(allow_origins="*", allow_credentials="*")
+            middleware=[
+                falcon.CORSMiddleware(allow_origins="*", allow_credentials="*"),
+                RootPathMiddleware(),
+            ]
         )
+
+        def _log_unhandled_exception(req, resp, ex, params):
+            # Falcon's default handler for an uncaught, non-HTTPError exception
+            # returns a bare 500 and logs via its own "falcon" logger -- easy to
+            # lose track of in a busy log unless something greps specifically
+            # for it. Route it through our own logger with an unmistakable tag
+            # so a silent 500 (which htmx won't swap into the DOM either) is
+            # never invisible again.
+            logger.exception(f"UNHANDLED EXCEPTION: {req.method} {req.relative_uri}")
+            resp.status = falcon.HTTP_500
+            resp.content_type = falcon.MEDIA_TEXT
+            resp.text = f"Internal error: {ex}"
+
+        app.add_error_handler(Exception, _log_unhandled_exception)
+
         app.add_route("/", HomeResource())
         app.add_route("/command", CommandResource())
         app.add_route("/goto", GotoResource())
@@ -8343,6 +9266,7 @@ class FrontMain:
         app.add_route("/live", LivePage())
         app.add_route("/live/{mode}", LivePage())
         app.add_route("/mosaic", MosaicResource())
+        app.add_route("/framed_mosaic", FramedMosaicResource())
         app.add_route("/position", TelescopePositionResource())
         app.add_route("/search", SearchObjectResource())
         app.add_route("/settings", SettingsResource())
@@ -8357,6 +9281,7 @@ class FrontMain:
         app.add_route("/schedule/image", ScheduleImageResource())
         app.add_route("/schedule/import", ScheduleImportResource())
         app.add_route("/schedule/mosaic", ScheduleMosaicResource())
+        app.add_route("/schedule/framed_mosaic", ScheduleFramedMosaicResource())
         app.add_route("/schedule/refresh", ScheduleRefreshResource())
         app.add_route("/schedule/startup", ScheduleStartupResource())
         app.add_route("/schedule/shutdown", ScheduleShutdownResource())
@@ -8378,6 +9303,10 @@ class FrontMain:
         app.add_route("/reload", ReloadResource())
         app.add_route("/{telescope_id:int}/", HomeTelescopeResource())
         app.add_route("/{telescope_id:int}/goto", GotoResource())
+        app.add_route(
+            "/api/{telescope_id:int}/force_stop_goto",
+            ForceStopGotoResource(),
+        )
         app.add_route("/{telescope_id:int}/command", CommandResource())
         app.add_route("/{telescope_id:int}/console", ConsoleResource())
         app.add_route("/{telescope_id:int}/image", ImageResource())
@@ -8392,15 +9321,25 @@ class FrontMain:
         app.add_route("/{telescope_id:int}/live/photo", LivePhotoResource())
         app.add_route("/{telescope_id:int}/live/video", LiveVideoResource())
         app.add_route("/{telescope_id:int}/live/video_kick", LiveVideoKickResource())
+        for imaging_path in ("vid", "vid/status", "events", "live/status"):
+            app.add_route(
+                f"/{{telescope_id:int}}/imaging/{imaging_path}",
+                ImagingProxyResource(imaging_path),
+            )
         app.add_route("/{telescope_id:int}/live/zoom", LiveZoomResource())
         app.add_route(
             "/{telescope_id:int}/schedule/exposure", ScheduleExposureResource()
         )
         app.add_route("/{telescope_id:int}/live/focus", LiveFocusResource())
         app.add_route("/{telescope_id:int}/live/gain", LiveGainResource())
+        app.add_route("/{telescope_id:int}/live/wide-cam", LiveWideCamResource())
         app.add_route("/{telescope_id:int}/live/{mode}", LivePage())
         app.add_route("/{telescope_id:int}/mosaic", MosaicResource())
+        app.add_route("/{telescope_id:int}/framed_mosaic", FramedMosaicResource())
         app.add_route("/{telescope_id:int}/planning", PlanningResource())
+        app.add_route("/horizon", HorizonResource())
+        app.add_route("/{telescope_id:int}/horizon", HorizonResource())
+        app.add_route("/horizon/sun", HorizonSunResource())
         app.add_route("/{telescope_id:int}/position", TelescopePositionResource())
         app.add_route("/{telescope_id:int}/search", SearchObjectResource())
         app.add_route("/{telescope_id:int}/settings", SettingsResource())
@@ -8418,6 +9357,10 @@ class FrontMain:
         app.add_route("/{telescope_id:int}/schedule/image", ScheduleImageResource())
         app.add_route("/{telescope_id:int}/schedule/import", ScheduleImportResource())
         app.add_route("/{telescope_id:int}/schedule/mosaic", ScheduleMosaicResource())
+        app.add_route(
+            "/{telescope_id:int}/schedule/framed_mosaic",
+            ScheduleFramedMosaicResource(),
+        )
         app.add_route("/{telescope_id:int}/schedule/startup", ScheduleStartupResource())
         app.add_route(
             "/{telescope_id:int}/schedule/shutdown", ScheduleShutdownResource()
@@ -8446,6 +9389,7 @@ class FrontMain:
         app.add_route(
             "/{telescope_id:int}/guestmode-content", GuestModeContentResource()
         )
+        app.add_route("/{telescope_id:int}/auth-status", AuthStatusResource())
         app.add_route("/{telescope_id:int}/guestmode", GuestModeResource())
         app.add_route("/{telescope_id:int}/support", SupportResource())
         app.add_route("/{telescope_id:int}/system", SystemResource())
@@ -8692,6 +9636,7 @@ class FrontMain:
             VisibilityEventsResource(),
         )
         app.add_route("/config", ConfigResource())
+        app.add_route("/config.json", ConfigJsonResource())
         app.add_route("/pa_refine", BlindPolarAlignResource())
 
         try:

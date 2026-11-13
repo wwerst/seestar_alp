@@ -13,10 +13,11 @@ from watchdog.events import FileSystemEventHandler
 from front.app import FrontMain, get_live_status
 
 from device.app import DeviceMain  # type: ignore
-from device.config import Config  # type: ignore
+from device.config import Config, ConfigError  # type: ignore
 from device.live_tracker_service import LiveTrackerMain  # type: ignore
 from device import log  # type: ignore
 from device import telescope  # type: ignore
+from device.version import Version  # type: ignore
 
 
 import os
@@ -64,7 +65,16 @@ class ConfigChangeHandler(FileSystemEventHandler):
     def on_modified(self, event):
         if event.src_path == self.path:
             # print(f'ConfigChangeHandler event type: {event.event_type}  path : {event.src_path}')
-            Config.load_toml()
+            try:
+                Config.load_toml()
+            except ConfigError as e:
+                # A live edit left config.toml unparseable. Keep running on the
+                # last-good config instead of letting the exception kill the
+                # file-watcher thread; the user's next valid save will reload.
+                log.logger.error(
+                    "Ignoring config reload; config.toml is invalid.\n%s", e
+                )
+                return
             self.alp.reload()
             self.front.reload()
             if self.live is not None:
@@ -80,6 +90,7 @@ if __name__ == "__main__":
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
     # We want to initialize ALP logger
     logger = log.init_logging()
+    logger.info(f"seestar_alp version {Version.app_version()}")
 
     logger.info("Starting ALP web server")
     main = AppRunner(logger, "ALP", DeviceMain)
@@ -137,7 +148,7 @@ if __name__ == "__main__":
         )
 
     n.notify("READY=1")
-    print("Startup Complete")
+    print(f"Startup Complete (seestar_alp {Version.app_version()})")
 
     # telescope.telescopes()
 

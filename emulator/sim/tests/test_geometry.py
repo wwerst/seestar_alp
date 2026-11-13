@@ -1,0 +1,116 @@
+import json
+from sim.geometry import SENSOR, frame_format, frame_nbytes, load_frame_format
+
+
+def test_s50_is_1920x1080():
+    assert SENSOR["S50"] == (1920, 1080)
+    assert SENSOR["S50P"] == (3856, 2180)
+
+
+def test_frame_format_defaults():
+    fmt = frame_format("S50")
+    assert (fmt.width, fmt.height) == (1920, 1080)
+    assert fmt.dtype == "<u2"
+    assert fmt.stride_bytes == 1920 * 2
+    assert frame_nbytes(fmt) == 1920 * 2 * 1080  # 4,147,200
+
+
+def test_frame_format_plate_scale_matches_real_solve():
+    # Real solve fov 1.265deg x 0.711deg at 1920x1080 -> ~2.37 arcsec/px
+    fmt = frame_format("S50")
+    assert abs(fmt.plate_scale_arcsec - 2.37) < 0.1
+
+
+def test_per_model_keyed_overlay_recomputes_stride(tmp_path):
+    """Test Fix 1: overlay width without stride_bytes must recompute stride."""
+    cfg_file = tmp_path / "frame_format.json"
+    cfg_file.write_text(json.dumps({"S50": {"width": 3856, "height": 2180}}))
+    fmt = load_frame_format(str(cfg_file), "S50")
+    assert fmt.width == 3856
+    assert fmt.height == 2180
+    assert fmt.stride_bytes == 3856 * 2, (
+        "stride_bytes must be recomputed from overlaid width"
+    )
+
+
+def test_explicit_stride_bytes_wins(tmp_path):
+    """Test Fix 1: explicit stride_bytes in overlay takes precedence."""
+    cfg_file = tmp_path / "frame_format.json"
+    cfg_file.write_text(json.dumps({"S50": {"width": 3856, "stride_bytes": 8000}}))
+    fmt = load_frame_format(str(cfg_file), "S50")
+    assert fmt.width == 3856
+    assert fmt.stride_bytes == 8000, "explicit stride_bytes must not be overridden"
+
+
+def test_flat_overlay_recomputes_stride(tmp_path):
+    """Test Fix 1: flat (non-keyed) overlay with width must recompute stride."""
+    cfg_file = tmp_path / "frame_format.json"
+    cfg_file.write_text(json.dumps({"width": 3856}))
+    fmt = load_frame_format(str(cfg_file), "S50")
+    assert fmt.width == 3856
+    assert fmt.stride_bytes == 3856 * 2, (
+        "stride_bytes must be recomputed from flat overlay width"
+    )
+
+
+def test_missing_file_returns_defaults(tmp_path):
+    """Test that missing config file returns default frame format."""
+    nonexistent = tmp_path / "nonexistent.json"
+    fmt = load_frame_format(str(nonexistent), "S50")
+    assert fmt.width == 1920
+    assert fmt.height == 1080
+    assert fmt.stride_bytes == 1920 * 2
+
+
+def test_malformed_json_returns_defaults(tmp_path):
+    """Test Fix 2: malformed JSON falls back to defaults instead of crashing."""
+    cfg_file = tmp_path / "bad.json"
+    cfg_file.write_text("not json{")
+    fmt = load_frame_format(str(cfg_file), "S50")
+    assert fmt.width == 1920
+    assert fmt.height == 1080
+    assert fmt.stride_bytes == 1920 * 2
+
+
+def test_s50p_plate_scale_is_inside_the_scale_bounds_the_firmware_passes_to_solve_field():
+    # The 9.75 aarch64 imager calls solve-field with -L 2.22 -H 2.71 (arcsec/px)
+    # for the S50 Pro (2.9 um pixels, 260 mm focal length).  A rendered frame
+    # outside that window can never be solved, so every goto/polar-align on the
+    # S50P emulator would fail with "solve failed".
+    fmt = frame_format("S50P")
+    assert 2.22 <= fmt.plate_scale_arcsec <= 2.71
+    assert fmt.focal_len_mm == 260.0
+
+
+def test_dense_star_fields_are_capped_for_the_aarch64_models_only():
+    # Capping keeps plate-solve time bounded on dense fields; the 32-bit S50 lanes
+    # must keep rendering every star they always have.
+    assert frame_format("S50P").max_stars == 80
+    assert frame_format("S50").max_stars == 0
+
+
+def _field_arcmin(fmt):
+    return (
+        fmt.height * fmt.plate_scale_arcsec / 60.0,
+        fmt.width * fmt.plate_scale_arcsec / 60.0,
+    )
+
+
+def test_s30_models_render_their_own_field_of_view_not_the_s50s():
+    # Issue #795: S30 reused the S50's 2.37"/px and S30P the discarded 1.18"/px
+    # guess, so mosaics rendered a field 1.7x / 3.2x too small.  The rendered
+    # field must agree (within a few percent) with the planner's per-model FoV
+    # in front/public/seestar_models.js (short axis, long axis in arcmin).
+    planner = {"S30": (73.2, 130.2), "S30P": (134.6, 239.2)}
+    for model, (short_arcmin, long_arcmin) in planner.items():
+        got_short, got_long = _field_arcmin(frame_format(model))
+        assert abs(got_short / short_arcmin - 1) < 0.03, model
+        assert abs(got_long / long_arcmin - 1) < 0.03, model
+
+
+def test_s30_plate_scales_follow_from_focal_length_and_2_9um_pixels():
+    for model, focal in {"S30": 150.0, "S30P": 160.0}.items():
+        fmt = frame_format(model)
+        assert fmt.focal_len_mm == focal
+        expected = 2.9e-3 / focal * 206264.806
+        assert abs(fmt.plate_scale_arcsec - expected) < 0.01, model

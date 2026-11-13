@@ -1,4 +1,4 @@
-<script src="/public/fit_import.js"></script>
+<script src="{{ root_path }}/public/fit_import.js"></script>
     <div class="card border-primary mb-3">
         <div class="card-body">
             <div class="mb-3 row">
@@ -37,7 +37,7 @@
                     <label for="ra" class="form-label">Right Ascension</label>
                     <input type="text" class="form-control" id="ra" name="ra" aria-describedby="raHelp"
                            value="{{ values.ra }}" required>
-                    <div id="raHelp" class="form-text">Mosaic center in decimal degrees or minutes (e.g. -1.2 or 6h32m32.5s)</div>
+                    <div id="raHelp" class="form-text">Mosaic center in decimal hours or hours/minutes/seconds (e.g. 1.2 or 6h32m32.5s)</div>
                 </div>
                 <div class="col">
                     <label for="dec" class="form-label">Declination</label>
@@ -117,6 +117,23 @@
 			</div>
 		</div>
 	</div>
+    {% endif %}
+
+    {% if experimental %}
+    <h5 class="card-title mb-2">Stack Mode <span class="badge text-bg-warning">Experimental</span></h5>
+    <div class="card border-primary mb-3">
+        <div class="card-body">
+            <div class="mb-3">
+                <label for="stackType" class="form-label">Stack Mode</label>
+                <select class="form-select" id="stackType" name="stackType">
+                    <option value="DeepSky" {% if values.stack_type == "DeepSky" or not values.stack_type %}selected{% endif %}>Deep Sky (default)</option>
+                    <option value="SolarSystem" {% if values.stack_type == "SolarSystem" %}selected{% endif %}>Planetary (Solar System)</option>
+                    <option value="MilkyWay" {% if values.stack_type == "MilkyWay" %}selected{% endif %}>Milky Way / Wide Angle (S30/S30P/S50P only)</option>
+                </select>
+                <div class="form-text">Deep Sky is standard DSO stacking. Planetary uses lucky-imaging stacking. Milky Way uses the wide angle camera (S30/S30P/S50P only).</div>
+            </div>
+        </div>
+    </div>
     {% endif %}
 
     <h5 class="card-title mb-2">Exposure Settings</h5>

@@ -1,14 +1,44 @@
 import os
+import subprocess
+import sys
 
+import pytest
 import tomlkit
 
-from device.config import _Config
+from device.config import ConfigError, _Config, _resolve_config_path, stage_file
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
 def make_config():
     cfg = _Config.__new__(_Config)
     cfg.path_to_dat = "/tmp/unused.toml"
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# _resolve_config_path
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_config_path_uses_default_when_no_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("SEESTAR_ALP_CONFIG_PATH", raising=False)
+    result = _resolve_config_path(str(tmp_path))
+    assert result == os.path.abspath(os.path.join(str(tmp_path), "config.toml"))
+
+
+def test_resolve_config_path_uses_override_when_set(tmp_path, monkeypatch):
+    override = tmp_path / "scratch.toml"
+    override.write_text("title = 'x'\n")
+    monkeypatch.setenv("SEESTAR_ALP_CONFIG_PATH", str(override))
+    result = _resolve_config_path(str(tmp_path))
+    assert result == os.path.abspath(str(override))
+
+
+def test_resolve_config_path_raises_when_override_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("SEESTAR_ALP_CONFIG_PATH", str(tmp_path / "does_not_exist.toml"))
+    with pytest.raises(FileNotFoundError):
+        _resolve_config_path(str(tmp_path))
 
 
 def test_str_to_bool_variants():
@@ -142,6 +172,87 @@ def test_str_to_bool_truthy_variants():
     assert _Config.strToBool("on") is True
     assert _Config.strToBool("y") is True
     assert _Config.strToBool("Y") is True
+
+
+# ---------------------------------------------------------------------------
+# load — malformed TOML (Windows backslash path trap)
+# ---------------------------------------------------------------------------
+
+
+# A raw Windows path inside a double-quoted TOML string: the backslash before
+# "U" is read as the start of a \U unicode escape and the parse blows up. This
+# is exactly the crash reported from the Windows standalone build.
+_BAD_WINDOWS_CONFIG = (
+    '[seestar_initialization]\ninterop_pem = "C:\\Users\\me\\seestar_client_key.pem"\n'
+)
+
+
+def test_load_raises_configerror_on_windows_backslash_path(tmp_path):
+    """A config.toml with raw Windows backslashes must raise a clear ConfigError,
+    not an opaque tomlkit ParseError that crashes the whole app at startup."""
+    bad = tmp_path / "config.toml"
+    bad.write_text(_BAD_WINDOWS_CONFIG)
+
+    cfg = make_config()
+    with pytest.raises(ConfigError) as excinfo:
+        cfg.load(str(bad))
+
+    message = str(excinfo.value)
+    # Message must be actionable: name the offending file, where it broke, and
+    # the backslash fix (the whole point of the friendly error).
+    assert str(bad) in message
+    assert "line" in message.lower()
+    assert "backslash" in message.lower()
+
+
+def test_load_leaves_dict_untouched_on_parse_error(tmp_path):
+    """A failed reload must preserve the last-good in-memory config rather than
+    wiping it (which would otherwise let a later save clobber the real file)."""
+    cfg = make_config()
+    cfg.load("", preloaded_dict={"network": {"port": 4242}})
+    good_dict = cfg._dict
+
+    bad = tmp_path / "config.toml"
+    bad.write_text(_BAD_WINDOWS_CONFIG)
+    with pytest.raises(ConfigError):
+        cfg.load(str(bad))
+
+    # Untouched: same object, same contents.
+    assert cfg._dict is good_dict
+    assert cfg._dict["network"]["port"] == 4242
+
+
+def test_startup_exits_cleanly_on_malformed_config(tmp_path):
+    """Importing device.config with a malformed file (the module-level
+    ``Config = _Config()`` startup path) must exit non-zero with an actionable
+    message, not dump a raw tomlkit traceback. This guards the exact crash
+    reported from the Windows standalone build."""
+    bad = tmp_path / "config.toml"
+    bad.write_text(_BAD_WINDOWS_CONFIG)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import device.config"],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "SEESTAR_ALP_CONFIG_PATH": str(bad)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert str(bad) in result.stderr
+    assert "backslash" in result.stderr.lower()
+
+
+def test_config_example_still_parses():
+    """The shipped config.toml.example must never contain the backslash trap."""
+    example = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "device",
+        "config.toml.example",
+    )
+    with open(example) as fp:
+        tomlkit.loads(fp.read())  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -544,3 +655,169 @@ def test_load_from_form_no_seestars_key_in_dict(monkeypatch):
 
     assert len(cfg.seestars) == 1
     assert cfg.seestars[0]["name"] == "Test Scope"
+
+
+# ---------------------------------------------------------------------------
+# horizon settings
+# ---------------------------------------------------------------------------
+
+
+def test_load_horizon_defaults():
+    cfg = make_config()
+    cfg.load("", preloaded_dict={})
+    assert cfg.horizon_file == ""
+    assert cfg.horizon_skip_hidden_targets is False
+    assert cfg.horizon_margin == 0.0
+
+
+def test_load_reads_horizon_settings():
+    cfg = make_config()
+    cfg.load(
+        "",
+        preloaded_dict={
+            "seestar_initialization": {
+                "horizon_file": "/etc/seestar/site.hrz",
+                "horizon_skip_hidden_targets": True,
+                "horizon_margin": 2.5,
+            }
+        },
+    )
+    assert cfg.horizon_file == "/etc/seestar/site.hrz"
+    assert cfg.horizon_skip_hidden_targets is True
+    assert cfg.horizon_margin == 2.5
+
+
+def test_load_from_form_saves_horizon_settings(monkeypatch):
+    cfg = make_loaded_config()
+    monkeypatch.setattr(cfg, "load", lambda path, preloaded_dict=None: None)
+
+    req = FakeRequest(
+        _base_form_media(
+            horizon_file=" /etc/seestar/site.hrz ",
+            horizon_skip_hidden_targets="on",
+            horizon_margin="3",
+        )
+    )
+    cfg.load_from_form(req)
+
+    section = cfg._dict["seestar_initialization"]
+    assert section["horizon_file"] == "/etc/seestar/site.hrz"
+    assert section["horizon_skip_hidden_targets"] is True
+    assert section["horizon_margin"] == 3.0
+
+
+def test_load_from_form_without_horizon_fields_keeps_a_flat_horizon(monkeypatch):
+    # A settings form rendered before the horizon fields existed.
+    cfg = make_loaded_config()
+    monkeypatch.setattr(cfg, "load", lambda path, preloaded_dict=None: None)
+
+    cfg.load_from_form(FakeRequest(_base_form_media()))
+
+    section = cfg._dict["seestar_initialization"]
+    assert section["horizon_file"] == ""
+    assert section["horizon_skip_hidden_targets"] is False
+    assert section["horizon_margin"] == 0.0
+
+
+def test_render_config_html_offers_horizon_settings():
+    cfg = make_config()
+    cfg.load("", preloaded_dict={})
+    html = cfg.render_config_html()
+    assert 'name="horizon_file"' in html
+    assert 'name="horizon_skip_hidden_targets"' in html
+    assert 'name="horizon_margin"' in html
+
+
+def test_load_from_form_saves_site_timezone(monkeypatch):
+    cfg = make_loaded_config()
+    monkeypatch.setattr(cfg, "load", lambda path, preloaded_dict=None: None)
+
+    req = FakeRequest(_base_form_media(init_timezone="  Europe/Paris "))
+    cfg.load_from_form(req)
+
+    assert cfg._dict["seestar_initialization"]["timezone"] == "Europe/Paris"
+
+
+def test_load_from_form_without_timezone_field_saves_empty(monkeypatch):
+    """An older settings form without the field means: this computer's zone."""
+    cfg = make_loaded_config()
+    monkeypatch.setattr(cfg, "load", lambda path, preloaded_dict=None: None)
+
+    req = FakeRequest(_base_form_media())
+    cfg.load_from_form(req)
+
+    assert cfg._dict["seestar_initialization"]["timezone"] == ""
+
+
+def test_site_timezone_setting_loads_and_defaults_to_empty():
+    cfg = make_config()
+    cfg.load("", preloaded_dict={})
+    assert cfg.init_timezone == ""
+    cfg.load(
+        "", preloaded_dict={"seestar_initialization": {"timezone": "Europe/Paris"}}
+    )
+    assert cfg.init_timezone == "Europe/Paris"
+
+
+def test_render_config_html_offers_site_timezone():
+    cfg = make_config()
+    cfg.load(
+        "", preloaded_dict={"seestar_initialization": {"timezone": "Europe/Paris"}}
+    )
+    html = cfg.render_config_html()
+    assert 'name="init_timezone"' in html
+    assert 'value="Europe/Paris"' in html
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("", 0.0),
+        (None, 0.0),
+        ("2.5", 2.5),
+        ("2,5", 2.5),
+        ("5°", 5.0),
+        (" 5 ° ", 5.0),
+        ("90", 90.0),
+    ],
+)
+def test_horizon_margin_from_form_reads_degrees(value, expected):
+    cfg = make_config()
+    cfg.horizon_margin = 3.0
+    assert cfg.horizon_margin_from_form(value) == expected
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", "91", "nan", "inf"])
+def test_horizon_margin_from_form_keeps_the_current_margin(value):
+    cfg = make_config()
+    cfg.horizon_margin = 3.0
+    assert cfg.horizon_margin_from_form(value) == 3.0
+
+
+def test_load_from_form_bad_horizon_margin_saves_the_rest(monkeypatch):
+    """A bad margin no longer raises halfway through the save."""
+    cfg = make_loaded_config()
+    cfg.horizon_margin = 1.5
+    monkeypatch.setattr(cfg, "load", lambda path, preloaded_dict=None: None)
+
+    req = FakeRequest(
+        _base_form_media(horizon_margin="abc", horizon_file=" /etc/site.hrz ")
+    )
+    cfg.load_from_form(req)
+
+    section = cfg._dict["seestar_initialization"]
+    assert section["horizon_margin"] == 1.5
+    assert section["horizon_file"] == "/etc/site.hrz"
+
+
+def test_stage_file_gives_each_writer_a_temporary_file_of_its_own(tmp_path):
+    target = str(tmp_path / "config.toml")
+    first = stage_file(target, "a = 1\n")
+    second = stage_file(target, b"a = 2\n")
+    assert first != second
+    for name in (first, second):
+        assert name.startswith(target + ".") and name.endswith(".tmp")
+    with open(first) as f:
+        assert f.read() == "a = 1\n"
+    with open(second, "rb") as f:
+        assert f.read() == b"a = 2\n"

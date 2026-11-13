@@ -54,7 +54,7 @@ def test_init_logging_creates_rotating_handler_and_disables_stdout(monkeypatch):
     # monkeypatch can undo the patch, poisoning the rest of the session.
     fake_logging = SimpleNamespace(
         basicConfig=lambda **kwargs: None,
-        getLogger=lambda: root_logger,
+        getLogger=lambda *args, **kwargs: root_logger,
         Formatter=logging.Formatter,
         handlers=SimpleNamespace(
             RotatingFileHandler=lambda *args, **kwargs: file_handler
