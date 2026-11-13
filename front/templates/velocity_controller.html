@@ -76,7 +76,7 @@
 </div>
 
 <!-- Chart.js (vendored so the page still works offline on a field Pi) -->
-<script src="/public/chart.umd.min.js"></script>
+<script src="{{ root_path }}/public/chart.umd.min.js"></script>
 
 <script>
 (function(){
@@ -186,7 +186,7 @@
 
   function apiUrl(path, params) {
     const qs = new URLSearchParams(params || {});
-    return `/api/${telescopeId}/velocity_controller/${path}${qs.toString() ? '?' + qs.toString() : ''}`;
+    return `{{ root_path }}/api/${telescopeId}/velocity_controller/${path}${qs.toString() ? '?' + qs.toString() : ''}`;
   }
 
   async function fetchLogs() {

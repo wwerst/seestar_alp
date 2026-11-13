@@ -792,6 +792,22 @@ def test_06f_live_video_kick_endpoint(front_sim_bridge):
     assert r2.status_code == 204
 
 
+def test_06f2_fork_routes_refuse_federation(front_sim_bridge):
+    """Fork session routes are single-telescope only: telescope_id 0 (the
+    federation, which fans out to every scope) gets a 400 JSON refusal, and
+    the video kick is a 204 no-op."""
+    client = front_sim_bridge["client"]
+    for path in (
+        "/api/0/live_tracker/track",
+        "/api/0/calibration/start",
+    ):
+        r = client.simulate_post(path, json={})
+        assert r.status_code == 400, path
+        assert json.loads(r.text)["error"] == "select a single telescope"
+    r = client.simulate_get("/0/live/video_kick")
+    assert r.status_code == 204
+
+
 def test_06g_netstats_endpoint_returns_sane_json(front_sim_bridge):
     """GET /api/{id}/netstats returns 200 with a sane stats envelope.
 
@@ -849,6 +865,7 @@ def test_06h_stream_quality_endpoint_roundtrip(front_sim_bridge, monkeypatch):
         json={"jpeg_quality": "not-a-number"},
     )
     assert r.status_code == 400
+
 
 def test_06b_planning_page_uses_configured_location(front_sim_bridge, monkeypatch):
     monkeypatch.setattr(Config, "init_lat", 44.0612)
@@ -1497,6 +1514,8 @@ def test_28_threaded_server_sse_does_not_block_other_requests():
         httpd.shutdown()
         httpd.server_close()
         server_thread.join(timeout=3)
+
+
 def test_40_framed_mosaic_federation_by_time_reaches_both_devices(
     two_device_federation,
 ):

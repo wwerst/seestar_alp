@@ -5,7 +5,7 @@
      then immediately polls again. -->
 <div id="sun-safety-banner" data-tripped="false"
      style="display:none;"
-     hx-get="/api/sun_safety/status"
+     hx-get="{{ root_path }}/api/sun_safety/status"
      hx-trigger="load, every 5s"
      hx-swap="none"
      hx-on::after-request="window.__sunSafetyHandle(event)">
@@ -95,7 +95,12 @@
   };
 
   window.__sunSafetyDismiss = function () {
-    fetch("/api/sun_safety/dismiss", {method: "POST"})
+    // Prefix at run time, same as main.js's sscRootPath (base.html sets the
+    // root-path data attribute only behind a reverse-proxy sub-path). This
+    // banner is on every page, and the byte-level root-path test only
+    // allows the prefix to change URL attributes, not inline script text.
+    var rootPath = document.documentElement.dataset.rootPath || "";
+    fetch(rootPath + "/api/sun_safety/dismiss", {method: "POST"})
       .then(function (r) { return r.json(); })
       .then(function (data) {
         // Reuse the handler with a synthetic event shape.

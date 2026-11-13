@@ -219,12 +219,12 @@
 </div>
 
 <!-- Chart.js (vendored so the page still works offline on a field Pi) -->
-<script src="/public/chart.umd.min.js"></script>
+<script src="{{ root_path }}/public/chart.umd.min.js"></script>
 <script>
 (function(){
   const wrap = document.querySelector('.lt-wrap');
   const telescopeId = wrap.dataset.telescopeId || '1';
-  const apiRoot = `/api/${telescopeId}/live_tracker`;
+  const apiRoot = `{{ root_path }}/api/${telescopeId}/live_tracker`;
 
   // --- state ---
   let selectedTarget = null; // {kind, id, display_name}
@@ -317,7 +317,16 @@
         const elr = (t.current_el_rate_degs||0).toFixed(2);
         right = `az${az}° el${el}° · ${distKm.toFixed(1)}km ${(altFt/1000).toFixed(1)}kft ${gsKt.toFixed(0)}kt · ${azr}/${elr}°/s`;
       }
-      row.innerHTML = `<span>${t.display_name || id}</span><span style="opacity:0.6; font-size:11px;">${right}</span>`;
+      // Build with DOM APIs: display_name/id come from the third-party
+      // ADS-B feed, so they must never be parsed as HTML.
+      const nameSpan = document.createElement('span');
+      nameSpan.textContent = String(t.display_name || id);
+      const infoSpan = document.createElement('span');
+      infoSpan.style.opacity = '0.6';
+      infoSpan.style.fontSize = '11px';
+      infoSpan.textContent = right;
+      row.appendChild(nameSpan);
+      row.appendChild(infoSpan);
       row.addEventListener('click', () => {
         selectedTarget = {
           kind: activeTab === 'live' ? 'live' : 'file',
@@ -706,7 +715,7 @@
     if (!fps || !jpeg) return;
     const fpsV = document.getElementById('lt-sq-fps-v');
     const jpegV = document.getElementById('lt-sq-jpeg-v');
-    const url = `/api/${telescopeId}/stream_quality`;
+    const url = `{{ root_path }}/api/${telescopeId}/stream_quality`;
     function fmtFps(v){ v = Number(v); return v > 0 ? v.toFixed(0) + ' fps' : 'uncapped'; }
     function paint(){ fpsV.textContent = fmtFps(fps.value); jpegV.textContent = String(jpeg.value); }
     // Load current values (imager runtime, or configured defaults).

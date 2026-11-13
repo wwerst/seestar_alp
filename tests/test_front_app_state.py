@@ -2056,11 +2056,308 @@ def test_ensure_scenery_video_guard_matrix(monkeypatch):
     assert front_app._ensure_scenery_video(1) is False
     assert seen == []
 
-    # "Offline" string / None from method_sync → treated as not working
-    # (the kick attempt is itself a no-op when the device is unreachable).
-    monkeypatch.setattr(front_app, "method_sync", lambda *a, **k: "Offline")
+    # result == 0 (well-formed success with no View) → idle → kick.
+    monkeypatch.setattr(
+        front_app,
+        "method_sync",
+        lambda *a, **k: {"command": "get_view_state", "status": "success", "result": 0},
+    )
     seen.clear()
     assert front_app._ensure_scenery_video(1) is True
+
+    # A failed read must NOT kick: the view state is unknown, and an online
+    # mount that is star-imaging must not be switched to scenery because one
+    # read failed. Covers "Offline", None, the device-layer timeout string
+    # and a firmware error reply.
+    failed_reads = [
+        "Offline",
+        None,
+        "Error: Exceeded allotted wait time for result",
+        {"command": "get_view_state", "status": "error", "result": "fail"},
+    ]
+    for bad in failed_reads:
+        monkeypatch.setattr(front_app, "method_sync", lambda *a, _b=bad, **k: _b)
+        seen.clear()
+        assert front_app._ensure_scenery_video(1) is False, bad
+        assert seen == [], bad
+
+    # Federation (0) is never kicked and never read.
+    reads = []
+    monkeypatch.setattr(front_app, "method_sync", lambda *a, **k: reads.append(a) or {})
+    seen.clear()
+    assert front_app._ensure_scenery_video(0) is False
+    assert seen == []
+    assert reads == []
+
+
+def test_live_video_kick_error_reply_does_not_kick(monkeypatch):
+    """An online device whose get_view_state returns a firmware error reply
+    must not get a scenery kick from the 2 s video_kick poll."""
+    calls = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        if parameters.get("method") == "get_view_state":
+            return {"Value": {"error": "busy", "code": 1}}
+        return {"Value": "ok"}
+
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.LiveVideoKickResource().on_get(req, resp, telescope_id=1)
+
+    assert "204" in str(resp.status)
+    assert not any(c[0] == "method_async" for c in calls), calls
+
+
+def test_live_video_kick_federation_is_noop_204(monkeypatch):
+    """telescope_id 0 (federation) must not fan a scenery kick out to every
+    scope; the endpoint stays a 204 no-op."""
+    calls = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": {"result": {}}}
+
+    monkeypatch.setattr(front_app, "check_api_state", lambda _tid: True)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+
+    req = _DummyJSONReq()
+    resp = _DummyJSONResp()
+    front_app.LiveVideoKickResource().on_get(req, resp, telescope_id=0)
+
+    assert "204" in str(resp.status)
+    assert calls == []
+
+
+# ---------- fork routes refuse the federation (telescope_id 0) ----------
+
+
+def test_reject_federation_target_helper():
+    resp = _DummyJSONResp()
+    assert front_app._reject_federation_target(resp, 1) is False
+    assert resp.status is None
+    for bad in (0, -1, "x", None):
+        resp = _DummyJSONResp()
+        assert front_app._reject_federation_target(resp, bad) is True
+        assert "400" in str(resp.status)
+        assert json.loads(resp.text) == {"error": "select a single telescope"}
+
+
+def test_live_tracker_track_rejects_federation(monkeypatch):
+    started = []
+    _patch_live_tracker_manager(monkeypatch, started.append)
+    calls = []
+    monkeypatch.setattr(
+        front_app, "do_action_device", lambda *a, **k: calls.append(a) or {}
+    )
+    req = _DummyJSONReq(body={"kind": "file", "id": "sat-123"})
+    resp = _DummyJSONResp()
+    front_app.LiveTrackerTrackResource.on_post(req, resp, telescope_id=0)
+    assert "400" in str(resp.status)
+    assert json.loads(resp.text)["error"] == "select a single telescope"
+    assert started == []
+    assert calls == []
+
+
+def test_calibration_start_rejects_federation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        front_app, "do_action_device", lambda *a, **k: calls.append(a) or {}
+    )
+    req = _DummyJSONReq(body={"targets": []})
+    resp = _DummyJSONResp()
+    front_app.CalibrationStartResource.on_post(req, resp, telescope_id=0)
+    assert "400" in str(resp.status)
+    assert json.loads(resp.text)["error"] == "select a single telescope"
+    assert calls == []
+
+
+def test_fork_nav_links_hidden_for_federation():
+    """The four fork pages are single-telescope only: their nav links are
+    rendered for /1 and hidden for the federation (/0)."""
+    template = front_app.fetch_template("nav.html")
+    base = {
+        "telescopes": [
+            {"device_num": 1, "name": "Seestar Alpha", "ip_address": "10.0.0.2"}
+        ],
+        "client_master": True,
+        "experimental": False,
+        "confirm": False,
+        "uitheme": "dark",
+        "online": True,
+        "segment": "",
+        "partial_path": "",
+        "imager_root": "",
+    }
+    fork_paths = (
+        "velocity_controller",
+        "live_tracker",
+        "calibrate_rotation",
+        "sky_visibility",
+    )
+    html1 = template.render(
+        root="/1",
+        telescope={"device_num": 1, "name": "Seestar Alpha"},
+        telescope_id=1,
+        **base,
+    )
+    for path in fork_paths:
+        assert f"/1/{path}" in html1
+    html0 = template.render(
+        root="/0",
+        telescope={"device_num": 0, "name": "Federation"},
+        telescope_id=0,
+        **base,
+    )
+    for path in fork_paths:
+        assert f"/0/{path}" not in html0
+
+
+# ---------- live-view joystick (/position) sun-safety gate ----------
+
+
+class _FakeJoystickDev:
+    def __init__(self, connected=True, ok=True):
+        self.is_connected = connected
+        self.ra = 1.0
+        self.dec = 2.0
+        self._ok = ok
+        self.moves = []
+
+    def move_scope(self, in_angle, in_speed, in_dur=3):
+        self.moves.append((in_angle, in_speed, in_dur))
+        return self._ok
+
+
+def _patch_joystick(monkeypatch, dev, locked=False, jogging=False):
+    import device.sun_safety as ss
+
+    calls = []
+    jog_queries = []
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        calls.append((action, dev_num, parameters))
+        return {"Value": {"result": 0}}
+
+    def fake_jog(telescope_id=None):
+        jog_queries.append(telescope_id)
+        return jogging
+
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    monkeypatch.setattr(front_app, "method_sync", lambda *a, **k: None)
+    monkeypatch.setattr(front_app.telescope, "seestar_dev", {1: dev})
+    monkeypatch.setattr(ss, "sun_safety_is_locked_out", lambda: locked)
+    monkeypatch.setattr(ss, "sun_safety_jog_in_progress", fake_jog)
+    return calls, jog_queries
+
+
+def _speed_moves(calls):
+    return [
+        c
+        for c in calls
+        if c[0] == "method_sync" and c[2].get("method") == "scope_speed_move"
+    ]
+
+
+def test_position_refuses_motion_during_sun_lockout(monkeypatch):
+    dev = _FakeJoystickDev()
+    calls, _ = _patch_joystick(monkeypatch, dev, locked=True)
+    req = _DummyJSONReq(body={"distance": 50, "angle": 90, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert "200" in str(resp.status)
+    assert dev.moves == []
+    assert _speed_moves(calls) == []
+    assert "lockout" in resp.text
+
+
+def test_position_stop_suppressed_during_sun_jog(monkeypatch):
+    dev = _FakeJoystickDev()
+    calls, jog_queries = _patch_joystick(monkeypatch, dev, jogging=True)
+    req = _DummyJSONReq(body={"distance": 0, "angle": 0, "force": 0})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert _speed_moves(calls) == []
+    assert jog_queries == [1]
+
+
+def test_position_stop_sent_when_no_jog(monkeypatch):
+    dev = _FakeJoystickDev()
+    calls, _ = _patch_joystick(monkeypatch, dev)
+    req = _DummyJSONReq(body={"distance": 0, "angle": 0, "force": 0})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    stops = _speed_moves(calls)
+    assert len(stops) == 1
+    assert stops[0][2]["params"]["speed"] == 0
+
+
+def test_position_motion_routes_through_device_move_scope(monkeypatch):
+    dev = _FakeJoystickDev()
+    calls, _ = _patch_joystick(monkeypatch, dev)
+    req = _DummyJSONReq(body={"distance": 50, "angle": 90.7, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert dev.moves == [(90, min(50 * 14.4 * 1, 1440.0), 3)]
+    assert _speed_moves(calls) == []
+
+
+def test_position_reports_device_guard_refusal(monkeypatch):
+    dev = _FakeJoystickDev(ok=False)
+    calls, _ = _patch_joystick(monkeypatch, dev)
+    req = _DummyJSONReq(body={"distance": 50, "angle": 90, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert len(dev.moves) == 1
+    assert _speed_moves(calls) == []
+    assert "refused" in resp.text
+
+
+def test_position_falls_back_to_method_sync_without_in_process_device(monkeypatch):
+    """A device that is not connected in-process keeps the original raw
+    method_sync path (compatibility fallback)."""
+    dev = _FakeJoystickDev(connected=False)
+    calls, _ = _patch_joystick(monkeypatch, dev)
+    req = _DummyJSONReq(body={"distance": 50, "angle": 90, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(req, resp, telescope_id=1)
+    assert dev.moves == []
+    moves = _speed_moves(calls)
+    assert len(moves) == 1
+    assert moves[0][2]["params"]["angle"] == 90
+
+
+def test_position_device_commands_run_under_the_telescope_lock(monkeypatch):
+    """The page sends the release (stop) without waiting for an in-flight
+    move, so the move (with its sun pre-flight RPC) and the stop both run
+    under one per-telescope lock: the stop then reaches the mount after the
+    move instead of before it."""
+    held = []
+
+    class _Dev(_FakeJoystickDev):
+        def move_scope(self, in_angle, in_speed, in_dur=3):
+            held.append(front_app._joystick_lock_for(1).locked())
+            return super().move_scope(in_angle, in_speed, in_dur)
+
+    def fake_do_action_device(action, dev_num, parameters, is_schedule=False):
+        held.append(front_app._joystick_lock_for(1).locked())
+        return {"Value": {"result": 0}}
+
+    dev = _Dev()
+    _patch_joystick(monkeypatch, dev)
+    monkeypatch.setattr(front_app, "do_action_device", fake_do_action_device)
+    move = _DummyJSONReq(body={"distance": 50, "angle": 90, "force": 1})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(move, resp, telescope_id=1)
+    stop = _DummyJSONReq(body={"distance": 0, "angle": 0, "force": 0})
+    resp = _DummyJSONResp()
+    front_app.TelescopePositionResource().on_post(stop, resp, telescope_id=1)
+    assert len(dev.moves) == 1
+    assert held == [True, True]
+    assert not front_app._joystick_lock_for(1).locked()
 
 
 def test_calibrate_rotation_page_renders_when_streaming_kick_fails(monkeypatch):
@@ -3200,6 +3497,46 @@ def test_live_tracker_has_stream_quality_controls():
     assert "jpeg.addEventListener('change', apply)" in html
 
 
+def test_fork_templates_honor_root_path_prefix():
+    """Fork pages build their asset and API URLs under {{ root_path }}, so
+    they keep working behind a sub-path reverse proxy; with no prefix the
+    URLs are unchanged."""
+    ctx = _minimal_context("live_tracker", online=True)
+    prefixed = front_app.fetch_template("live_tracker.html").render(
+        telescope_id=1, root_path="/ssc", **ctx
+    )
+    assert 'src="/ssc/public/chart.umd.min.js"' in prefixed
+    assert "`/ssc/api/${telescopeId}/live_tracker`" in prefixed
+    assert "`/ssc/api/${telescopeId}/stream_quality`" in prefixed
+    assert "fetch('/ssc/api/' + tid + '/netstats'" in prefixed
+    plain = front_app.fetch_template("live_tracker.html").render(telescope_id=1, **ctx)
+    assert 'src="/public/chart.umd.min.js"' in plain
+    assert "`/api/${telescopeId}/live_tracker`" in plain
+    banner = front_app.fetch_template("partials/sun_safety_banner.html").render(
+        root_path="/ssc"
+    )
+    assert 'hx-get="/ssc/api/sun_safety/status"' in banner
+    # The dismiss call is prefixed at run time from the page's root-path data
+    # attribute (like main.js's sscRootPath), not by Jinja: the banner is on
+    # every page and upstream's byte-level root-path test only lets the
+    # prefix change URL attributes.
+    assert "document.documentElement.dataset.rootPath" in banner
+    assert 'fetch(rootPath + "/api/sun_safety/dismiss"' in banner
+    assert 'fetch("/api/sun_safety/dismiss"' not in banner
+
+
+def test_live_tracker_target_rows_do_not_parse_feed_text_as_html():
+    """Target names come from the third-party ADS-B feed: the list rows are
+    built with textContent, never innerHTML."""
+    html = front_app.fetch_template("live_tracker.html").render(
+        telescope_id=1,
+        **_minimal_context("live_tracker", online=True),
+    )
+    assert "row.innerHTML" not in html
+    assert "nameSpan.textContent = String(t.display_name || id);" in html
+    assert "infoSpan.textContent = right;" in html
+
+
 def test_stream_quality_post_malformed_json_returns_400():
     """A present-but-unparseable body must surface as 400, not masquerade
     as a successful no-op (PR #25 review)."""
@@ -3243,6 +3580,8 @@ def test_stream_quality_post_empty_body_is_noop_echo(monkeypatch):
     payload = json.loads(resp.text)
     assert payload["max_stream_fps"] == 8.0
     assert payload["jpeg_quality"] == 60
+
+
 # --- check_needs_auth ---
 
 

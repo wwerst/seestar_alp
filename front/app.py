@@ -3913,6 +3913,47 @@ class LiveZoomResource(BaseResource):
         self.send_text(req, resp, telescope_id, "done")
 
 
+def _reject_federation_target(resp, telescope_id):
+    """Refuse a fork session/motion request aimed at the federation.
+
+    ``telescope_id`` 0 is the federation device: an Alpaca action sent to it
+    fans out to every connected scope (``Seestar_Federation``), so a
+    live-tracker, calibration or visibility session started there would
+    broadcast scenery kicks, tracking changes and jogs to all mounts. When
+    ``telescope_id`` is not a positive integer this sets a 400 JSON response
+    and returns True; the caller must return immediately. Stop routes are
+    deliberately not gated: a stop must always pass.
+    """
+    try:
+        tid = int(telescope_id)
+    except (TypeError, ValueError):
+        tid = 0
+    if tid > 0:
+        return False
+    resp.status = falcon.HTTP_400
+    resp.content_type = "application/json"
+    resp.text = json.dumps({"error": "select a single telescope"})
+    return True
+
+
+def _read_view_state(telescope_id):
+    """Issue a fresh ``get_view_state`` and classify the reply.
+
+    Returns ``(read_ok, working)``. ``read_ok`` is False when the read failed:
+    ``method_sync`` returned a non-dict (``None``, ``"Offline"``, a device
+    timeout ``"Error: ..."`` string) or a firmware error reply
+    (``{"status": "error", ...}``). A well-formed dict counts as a good read
+    even with no ``View`` key: idle firmware replies may omit it.
+    """
+    status = method_sync("get_view_state", telescope_id, id=42)
+    if not isinstance(status, dict) or status.get("status") == "error":
+        return False, False
+    view = pydash.get(status, "View")
+    if not isinstance(view, dict):
+        return True, False
+    return True, view.get("state") == "working"
+
+
 def _view_state_is_working(telescope_id):
     """Return True when the mount is already in an active view.
 
@@ -3923,11 +3964,7 @@ def _view_state_is_working(telescope_id):
     stream — so calling this is also how the fork video pages keep the
     imaging state machine tracking reality.
     """
-    status = method_sync("get_view_state", telescope_id, id=42)
-    view = pydash.get(status, "View")
-    if not isinstance(view, dict):
-        return False
-    return view.get("state") == "working"
+    return _read_view_state(telescope_id)[1]
 
 
 def _ensure_scenery_video(telescope_id):
@@ -3941,9 +3978,20 @@ def _ensure_scenery_video(telescope_id):
     tear it down. A mount already streaming scenery is likewise
     ``"working"``, so the kick is skipped and repeated calls are no-ops.
 
+    A failed read (offline, timeout string, firmware error reply) skips the
+    kick: the state is unknown, and an online mount that is star-imaging
+    must not be switched to scenery because one read failed. The federation
+    id (0) is never kicked, since the kick would fan out to every scope.
+
     Returns ``True`` if a scenery kick was issued, ``False`` otherwise.
     """
-    if _view_state_is_working(telescope_id):
+    try:
+        if int(telescope_id) <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    read_ok, working = _read_view_state(telescope_id)
+    if not read_ok or working:
         return False
     do_action_device(
         "method_async",
@@ -5449,6 +5497,8 @@ class LiveStreamQualityResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.seestar_imaging import SeestarImaging
 
         # An omitted/empty body means "no changes" (the echo below still
@@ -5517,6 +5567,8 @@ class LiveTrackerTrackResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.live_tracker import (
             AtomicOffsets,
             LiveTrackSession,
@@ -5629,6 +5681,8 @@ class LiveTrackerStopResource:
 class LiveTrackerOffsetsResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.live_tracker import get_manager
 
         try:
@@ -5671,6 +5725,8 @@ class LiveTrackerOffsetsResource:
 class LiveTrackerResetResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.live_tracker import get_manager
 
         try:
@@ -6116,6 +6172,8 @@ class CalibrationStartResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.alpaca_client import AlpacaClient
         from device.calibration_targets import (
             CalibrationTargetSpec,
@@ -6580,6 +6638,8 @@ def _calibration_post_command(req, resp, telescope_id, cmd_name, apply_fn):
 class CalibrationNudgeResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         try:
             body = req.media or {}
         except Exception:
@@ -6609,6 +6669,8 @@ class CalibrationNudgeResource:
 class CalibrationSightResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         _calibration_post_command(
             req,
             resp,
@@ -6621,6 +6683,8 @@ class CalibrationSightResource:
 class CalibrationSkipResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         _calibration_post_command(
             req,
             resp,
@@ -6633,6 +6697,8 @@ class CalibrationSkipResource:
 class CalibrationCommitResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         _calibration_post_command(
             req,
             resp,
@@ -6715,6 +6781,8 @@ class CalibrateMotionStartResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.calibrate_motion import (
             CalibrateMotionSession,
             get_calibrate_motion_manager,
@@ -6802,6 +6870,8 @@ class CalibrateMotionStateResource:
 class CalibrateMotionSetTargetResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         try:
             body = req.media or {}
         except Exception:
@@ -6865,6 +6935,8 @@ def _clamp_finite(x: float, lo: float, hi: float) -> float:
 class CalibrateMotionNudgeResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         try:
             body = req.media or {}
         except Exception:
@@ -6910,6 +6982,8 @@ class CalibrateMotionJogResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         try:
             body = req.media or {}
         except Exception:
@@ -6953,6 +7027,8 @@ class CalibrateMotionJogResource:
 class CalibrateMotionFreezeResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         session = _motion_session_or_404(req, resp, telescope_id)
         if session is None:
             return
@@ -7058,6 +7134,8 @@ class CalibrateNighttimeAvailabilityResource:
 class CalibrateNighttimeStartResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.alpaca_client import AlpacaClient
         from device.nighttime_calibration import (
             NighttimeCalibrationSession,
@@ -7162,6 +7240,8 @@ class CalibrateNighttimeCaptureResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         try:
             body = req.media or {}
         except Exception:
@@ -7216,6 +7296,8 @@ class CalibrateNighttimeCaptureResource:
 class CalibrateNighttimeSkipResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         session = _nighttime_session_or_404(req, resp, telescope_id)
         if session is None:
             return
@@ -7230,6 +7312,8 @@ class CalibrateNighttimeRemoveResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         try:
             body = req.media or {}
         except Exception:
@@ -7264,6 +7348,8 @@ class CalibrateNighttimeRemoveResource:
 class CalibrateNighttimeApplyResource:
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         session = _nighttime_session_or_404(req, resp, telescope_id)
         if session is None:
             return
@@ -7502,6 +7588,8 @@ class CalibrateNighttimeAutoStartResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.alpaca_client import AlpacaClient
         from device.nighttime_calibration import (
             NighttimeAutoRunner,
@@ -7841,6 +7929,8 @@ class VisibilityStartResource:
 
     @staticmethod
     def on_post(req, resp, telescope_id=1):
+        if _reject_federation_target(resp, telescope_id):
+            return
         from device.alpaca_client import AlpacaClient
         from device.sky_grid import make_default_grid
         from device.visibility_mapper import (
@@ -8558,6 +8648,74 @@ class StellariumResource:
 #         resp.text = ra_dec_j2000
 
 
+def _sun_safety_locked_out():
+    """True while the sun-safety emergency lockout is active. Never raises.
+
+    ``sun_safety_is_locked_out`` is already non-raising and returns False
+    when no monitor is installed; the import is guarded so an older device
+    module without it keeps the previous (device-guarded) behaviour.
+    """
+    try:
+        from device.sun_safety import sun_safety_is_locked_out
+    except ImportError:
+        return False
+    return sun_safety_is_locked_out()
+
+
+def _sun_safety_jog_in_progress_for(telescope_id):
+    """True while the monitor's emergency jog runs on ``telescope_id``.
+
+    The federation (0, or an unparseable id) fans out to every scope, so it
+    matches any jog (``None``). Never raises.
+    """
+    try:
+        from device.sun_safety import sun_safety_jog_in_progress
+    except ImportError:
+        return False
+    try:
+        tid = int(telescope_id)
+    except (TypeError, ValueError):
+        tid = 0
+    return sun_safety_jog_in_progress(tid if tid > 0 else None)
+
+
+def _joystick_move_device(telescope_id):
+    """Return the in-process device whose ``move_scope`` drives the joystick.
+
+    That is the connected ``Seestar`` for a single telescope, or the
+    federation for id 0 (its ``move_scope`` fans out to each connected
+    ``Seestar.move_scope``). Returns None when there is no such in-process
+    object (front end talking to a remote device server, device not yet
+    started or not connected, or no ``move_scope``); the caller then keeps
+    the original raw ``method_sync`` path. Never raises.
+    """
+    try:
+        tid = int(telescope_id)
+        if tid > 0:
+            dev = telescope.seestar_dev.get(tid)
+            if dev is None or not getattr(dev, "is_connected", False):
+                return None
+        else:
+            if not telescope.seestar_dev:
+                return None
+            dev = getattr(telescope, "seestar_federation", None)
+        if dev is None or not callable(getattr(dev, "move_scope", None)):
+            return None
+        return dev
+    except Exception:
+        return None
+
+
+_joystick_locks = {}
+_joystick_locks_guard = threading.Lock()
+
+
+def _joystick_lock_for(telescope_id):
+    """Per-telescope lock that serializes the joystick's device commands."""
+    with _joystick_locks_guard:
+        return _joystick_locks.setdefault(str(telescope_id), threading.Lock())
+
+
 class TelescopePositionResource(BaseResource):
     def on_post(self, req, resp, telescope_id=1):
         form = req.media
@@ -8566,26 +8724,66 @@ class TelescopePositionResource(BaseResource):
         distance = form.get("distance", 0)
         angle = form.get("angle", 0)
         force = form.get("force", 0)
-        if distance == 0:
-            do_action_device(
-                "method_sync",
-                telescope_id,
-                {
-                    "method": "scope_speed_move",
-                    "params": {"speed": 0, "angle": 0, "dur_sec": 3},
-                },
-            )
-        else:
-            speed = min(distance * 14.4 * force, 1440.0)
-            # print("speed", speed)
-            do_action_device(
-                "method_sync",
-                telescope_id,
-                {
-                    "method": "scope_speed_move",
-                    "params": {"speed": speed, "angle": int(angle), "dur_sec": 3},
-                },
-            )
+        refused = None
+        read_back = False
+        # Keep this telescope's joystick commands in arrival order. The page
+        # sends the release (stop) without waiting for an in-flight move, and
+        # a move now spends an extra RPC in the sun pre-flight; without the
+        # lock the stop could reach the mount first and the move would then
+        # run for its full dur_sec after the joystick was released.
+        with _joystick_lock_for(telescope_id):
+            if distance == 0:
+                # A stop must normally always pass, except while the sun-safety
+                # monitor's emergency jog-away is executing: a stop then would
+                # truncate the jog (the jog's own dur_sec bounds the motion).
+                # The federation (0) fans out to every scope, including the one
+                # being jogged, so it is matched conservatively (None).
+                if _sun_safety_jog_in_progress_for(telescope_id):
+                    refused = "stop suppressed: sun-safety jog in progress"
+                else:
+                    do_action_device(
+                        "method_sync",
+                        telescope_id,
+                        {
+                            "method": "scope_speed_move",
+                            "params": {"speed": 0, "angle": 0, "dur_sec": 3},
+                        },
+                    )
+            elif _sun_safety_locked_out():
+                # Cheap in-process check, polled every 250 ms by the joystick:
+                # no device RPC while the emergency lockout holds the mount.
+                refused = "move refused: sun-safety emergency lockout active"
+            else:
+                speed = min(distance * 14.4 * force, 1440.0)
+                # print("speed", speed)
+                read_back = True
+                mover = _joystick_move_device(telescope_id)
+                if mover is not None:
+                    # Seestar.move_scope applies the lockout check, the goto
+                    # check and the current-pointing / jog-path sun pre-flight.
+                    try:
+                        ok = mover.move_scope(int(angle), speed, 3)
+                    except Exception as exc:
+                        logger.warning(f"position: move_scope failed: {exc}")
+                        ok = False
+                    if ok is False:
+                        refused = "move refused by the device motion guard"
+                else:
+                    # Fallback for devices without an in-process move_scope
+                    # (remote/federation front ends): the original raw command.
+                    do_action_device(
+                        "method_sync",
+                        telescope_id,
+                        {
+                            "method": "scope_speed_move",
+                            "params": {
+                                "speed": speed,
+                                "angle": int(angle),
+                                "dur_sec": 3,
+                            },
+                        },
+                    )
+        if read_back:
             method_sync("scope_get_equ_coord", telescope_id, id=420)
             # do_action_device('scope_speed_move', telescope_id, {
             #     "speed": int(distance * 5), "angle": angle, "dur_sec": 1
@@ -8596,6 +8794,8 @@ class TelescopePositionResource(BaseResource):
         resp.status = falcon.HTTP_200
         resp.content_type = "application/text"
         resp.text = f'<div class="row"><div class="col">RA</div><div class="col">{dev.ra}</div></div> <div class="row"><div class="col">Dec</div><div class="col">{dev.dec}</div></div>'
+        if refused:
+            resp.text += f' <div class="row"><div class="col">{refused}</div></div>'
 
 
 class ToggleUIThemeResource:

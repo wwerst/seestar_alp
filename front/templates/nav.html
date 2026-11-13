@@ -61,6 +61,8 @@
 						<li>
 							<a class="dropdown-item" href="{{ root }}/stats">Stats</a>
 						</li>
+						{# Fork pages drive a single mount; hide them for the federation (0). #}
+						{% if (telescope or {}).device_num|string != "0" %}
 						<li>
 							<a class="dropdown-item" href="{{ root }}/velocity_controller">Velocity Controller</a>
 						</li>
@@ -73,6 +75,7 @@
 						<li>
 							<a class="dropdown-item" href="{{ root }}/sky_visibility">Sky Visibility Map</a>
 						</li>
+						{% endif %}
             {% if platform == "raspberry_pi" %}
             <li>
               <a class="dropdown-item" href="{{ root }}/platform-rpi">Platform</a>

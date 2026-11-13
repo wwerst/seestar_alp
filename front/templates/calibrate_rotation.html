@@ -313,8 +313,8 @@
 (function(){
   const wrap = document.querySelector('.cal-wrap');
   const telescopeId = wrap.dataset.telescopeId || '1';
-  const apiRoot = `/api/${telescopeId}/calibration`;
-  const motionRoot = `/api/${telescopeId}/calibrate_motion`;
+  const apiRoot = `{{ root_path }}/api/${telescopeId}/calibration`;
+  const motionRoot = `{{ root_path }}/api/${telescopeId}/calibrate_motion`;
 
   // Seestar S50 imager FOV. Public spec ≈ 1.27° × 0.71°. The motion
   // primitive treats this as the native angular extent of the live
@@ -1255,7 +1255,7 @@
 
   // ---- nighttime calibration (item 6) ----
 
-  const nightRoot = `/api/${telescopeId}/calibrate_nighttime`;
+  const nightRoot = `{{ root_path }}/api/${telescopeId}/calibrate_nighttime`;
   const nightAutoRoot = `${nightRoot}/auto`;
   const nightEls = {
     toggleDay: document.getElementById('cal-mode-day'),

@@ -203,7 +203,7 @@
 <script>
 (function () {
   const tid = {{ telescope_id }};
-  const apiRoot = `/api/${tid}/calibrate_visibility`;
+  const apiRoot = `{{ root_path }}/api/${tid}/calibrate_visibility`;
   const canvas = document.getElementById('svm-canvas');
   const ctx = canvas.getContext('2d');
   const startBtn = document.getElementById('svm-start');

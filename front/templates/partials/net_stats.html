@@ -53,7 +53,7 @@
 
   async function poll(){
     try {
-      var r = await fetch('/api/' + tid + '/netstats', {cache: 'no-store'});
+      var r = await fetch('{{ root_path }}/api/' + tid + '/netstats', {cache: 'no-store'});
       if (!r.ok) return;
       var j = await r.json();
       var v = j.video || {};
