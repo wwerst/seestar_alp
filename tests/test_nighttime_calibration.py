@@ -744,6 +744,302 @@ def test_refit_failure_clears_stale_solution(tmp_path, monkeypatch):
         session.apply()
 
 
+class _GatedPlateSolver:
+    """Plate solver whose N-th ``solve`` call blocks until ``gates[N]`` is
+    set. ``started[N]`` is set when call N begins, so a test can line up
+    a skip / stop / second capture while call N is still in flight."""
+
+    def __init__(self, result: SolveResult, n_calls: int = 2):
+        self.result = result
+        self.gates = [threading.Event() for _ in range(n_calls)]
+        self.started = [threading.Event() for _ in range(n_calls)]
+        self._calls = 0
+        self._lock = threading.Lock()
+
+    def solve(self, image_path):
+        with self._lock:
+            idx = self._calls
+            self._calls += 1
+        self.started[idx].set()
+        assert self.gates[idx].wait(5.0), f"gate {idx} never released"
+        return self.result
+
+
+def _gated_solve_result() -> SolveResult:
+    return SolveResult(
+        ra_deg=100.0,
+        dec_deg=30.0,
+        fov_x_deg=1.27,
+        fov_y_deg=0.71,
+        position_angle_deg=0.0,
+    )
+
+
+def test_late_solve_after_skip_is_dropped_and_keeps_next_pending(tmp_path, monkeypatch):
+    """A solve that finishes after the operator skipped it must not be
+    appended, and must not clear the pending slot of the capture that was
+    queued after the skip."""
+    import device.nighttime_calibration as nc
+
+    monkeypatch.setattr(
+        nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec)
+    )
+    solver = _GatedPlateSolver(_gated_solve_result())
+    session = _make_session(tmp_path, solver)
+
+    session.capture_sighting(encoder_az_deg=100.0, encoder_el_deg=30.0)
+    first_thread = session._solve_thread
+    assert solver.started[0].wait(5.0)
+    session.skip_pending()
+    assert session.status().pending is None
+
+    session.capture_sighting(encoder_az_deg=120.0, encoder_el_deg=35.0)
+    assert solver.started[1].wait(5.0)
+
+    # Let the skipped solve finish late.
+    solver.gates[0].set()
+    first_thread.join(5.0)
+    assert not first_thread.is_alive()
+
+    st = session.status()
+    assert st.n_accepted == 0, "skipped solve must not be accepted"
+    assert st.pending is not None, "second capture's pending slot was wiped"
+    assert st.pending["status"] == "solving"
+    assert st.pending["encoder_az_deg"] == pytest.approx(120.0)
+
+    # The second capture still completes normally.
+    solver.gates[1].set()
+    assert _wait_for(lambda: session.status().pending is None, timeout_s=5.0)
+    st = session.status()
+    assert st.n_accepted == 1
+    assert st.sightings[0]["encoder_az_deg"] == pytest.approx(120.0)
+
+
+def test_late_solve_after_stop_is_dropped_and_phase_stays_stopped(
+    tmp_path, monkeypatch
+):
+    import device.nighttime_calibration as nc
+
+    monkeypatch.setattr(
+        nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec)
+    )
+    solver = _GatedPlateSolver(_gated_solve_result(), n_calls=1)
+    session = _make_session(tmp_path, solver)
+
+    session.capture_sighting(encoder_az_deg=100.0, encoder_el_deg=30.0)
+    worker = session._solve_thread
+    assert solver.started[0].wait(5.0)
+    session.stop()
+
+    solver.gates[0].set()
+    worker.join(5.0)
+    assert not worker.is_alive()
+
+    st = session.status()
+    assert st.phase == "stopped"
+    assert st.n_accepted == 0
+    assert st.fit is None
+
+
+def test_concurrent_refit_does_not_store_stale_solution(tmp_path, monkeypatch):
+    """A refit of an older sightings list that finishes after a newer
+    refit must not overwrite the newer solution."""
+    import device.nighttime_calibration as nc
+    from device.nighttime_calibration import NighttimeSighting
+
+    session = _make_session(tmp_path, FakePlateSolver())
+    with session._lock:
+        for az, el in [(60.0, 35.0), (180.0, 45.0), (300.0, 35.0)]:
+            session._sightings.append(
+                NighttimeSighting(
+                    encoder_az_deg=az,
+                    encoder_el_deg=el,
+                    true_ra_deg=0.0,
+                    true_dec_deg=0.0,
+                    true_az_deg=az,
+                    true_el_deg=el,
+                    fov_x_deg=1.27,
+                    fov_y_deg=0.71,
+                    position_angle_deg=0.0,
+                    image_path="",
+                    t_unix=0.0,
+                )
+            )
+        session._sightings_gen += 1
+
+    real_solve = solve_rotation_from_pairs
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    def _gated_solve(pairs, **kw):
+        calls.append(len(pairs))
+        if len(calls) == 1:
+            first_started.set()
+            assert release_first.wait(5.0)
+        return real_solve(pairs, **kw)
+
+    monkeypatch.setattr(nc, "solve_rotation_from_pairs", _gated_solve)
+
+    stale = threading.Thread(target=session._refit_locked, daemon=True)
+    stale.start()
+    assert first_started.wait(5.0)
+
+    # Newer refit (2 sightings) runs to completion while the first is held.
+    session.remove_sighting(0)
+    assert len(session.status().fit["per_record"]) == 2
+
+    release_first.set()
+    stale.join(5.0)
+    assert not stale.is_alive()
+
+    assert calls == [3, 2]
+    st = session.status()
+    assert st.n_accepted == 2
+    assert len(st.fit["per_record"]) == 2, "stale 3-sighting fit overwrote newer"
+
+
+def _session_with_sightings(tmp_path, monkeypatch, dirs):
+    """Session whose captures of ``dirs`` (az, el) have all been accepted
+    and refitted. ``radec_to_topocentric_azel`` is identity-patched."""
+    import device.nighttime_calibration as nc
+
+    monkeypatch.setattr(
+        nc, "radec_to_topocentric_azel", lambda ra, dec, t, s: (ra, dec)
+    )
+    canned = {}
+    captures = []
+    for i, (az, el) in enumerate(dirs):
+        img = tmp_path / f"img{i}.jpg"
+        img.write_text("dummy")
+        canned[str(img)] = SolveResult(
+            ra_deg=az,
+            dec_deg=el,
+            fov_x_deg=1.27,
+            fov_y_deg=0.71,
+            position_angle_deg=0.0,
+        )
+        captures.append((img, az, el))
+    session = _make_session(tmp_path, FakePlateSolver(canned))
+    for img, az, el in captures:
+        session.capture_sighting(img, az, el)
+        assert _wait_for(lambda: session.status().pending is None, timeout_s=5.0)
+    return session
+
+
+_FOUR_DIRS = [(60.0, 35.0), (150.0, 45.0), (240.0, 40.0), (320.0, 50.0)]
+
+
+def test_apply_refused_while_refit_lags_new_sighting(tmp_path, monkeypatch):
+    """Between the worker appending a sighting and its refit storing the
+    new solution, apply() must refuse (not persist the previous fit stamped
+    with the larger n_sightings). Once the refit lands, apply() succeeds."""
+    import device.nighttime_calibration as nc
+
+    session = _session_with_sightings(tmp_path, monkeypatch, _FOUR_DIRS[:3])
+    assert session.status().fit is not None
+    assert len(session.status().fit["per_record"]) == 3
+
+    real_solve = solve_rotation_from_pairs
+    refit_started = threading.Event()
+    release_refit = threading.Event()
+
+    def _gated_solve(pairs, **kw):
+        refit_started.set()
+        assert release_refit.wait(5.0), "refit gate never released"
+        return real_solve(pairs, **kw)
+
+    monkeypatch.setattr(nc, "solve_rotation_from_pairs", _gated_solve)
+
+    img = tmp_path / "img3.jpg"  # the helper canned only the first 3
+    img.write_text("dummy")
+    session.plate_solver.add(
+        img,
+        SolveResult(
+            ra_deg=_FOUR_DIRS[3][0],
+            dec_deg=_FOUR_DIRS[3][1],
+            fov_x_deg=1.27,
+            fov_y_deg=0.71,
+            position_angle_deg=0.0,
+        ),
+    )
+    session.capture_sighting(img, *_FOUR_DIRS[3])
+    worker = session._solve_thread
+    assert refit_started.wait(5.0)
+
+    # Window: 4th sighting appended, refit still running, old 3-fit stored.
+    st = session.status()
+    assert st.n_accepted == 4
+    assert len(st.fit["per_record"]) == 3
+    out = session.out_path
+    with pytest.raises(ValueError, match="still updating.*retry"):
+        session.apply()
+    assert not out.exists(), "lagging fit must not be persisted"
+
+    release_refit.set()
+    worker.join(5.0)
+    assert not worker.is_alive()
+    assert session.status().pending is None
+
+    session.apply()
+    payload = json.loads(out.read_text())
+    assert payload["n_sightings"] == 4
+    assert len(payload["sightings"]) == 4
+    assert len(payload["fit_per_record"]) == 4
+
+
+def test_apply_allowed_after_remove_sighting(tmp_path, monkeypatch):
+    session = _session_with_sightings(tmp_path, monkeypatch, _FOUR_DIRS)
+    session.apply()
+    session.remove_sighting(0)
+    session.apply()
+    payload = json.loads(session.out_path.read_text())
+    assert payload["n_sightings"] == 3
+    assert len(payload["fit_per_record"]) == 3
+
+
+def test_apply_allowed_after_refit_failure_then_recovery(tmp_path, monkeypatch):
+    """A refit failure clears the solution (apply refuses with 'no
+    solution'); the next successful refit must re-enable apply rather than
+    leave the generation counters out of step."""
+    import device.nighttime_calibration as nc
+
+    session = _session_with_sightings(tmp_path, monkeypatch, _FOUR_DIRS)
+    real_solve = solve_rotation_from_pairs
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("synthetic solver failure")
+
+    monkeypatch.setattr(nc, "solve_rotation_from_pairs", _boom)
+    session.remove_sighting(3)  # gen bump + failing refit
+    with pytest.raises(ValueError, match="no solution"):
+        session.apply()
+
+    monkeypatch.setattr(nc, "solve_rotation_from_pairs", real_solve)
+    session._refit_locked()
+    session.apply()
+    payload = json.loads(session.out_path.read_text())
+    assert payload["n_sightings"] == 3
+
+
+def test_apply_allowed_after_list_emptied_and_rebuilt(tmp_path, monkeypatch):
+    """Removing every sighting (the empty-list refit path) and then
+    capturing again must still allow a later apply."""
+    session = _session_with_sightings(tmp_path, monkeypatch, _FOUR_DIRS[:3])
+    for _ in range(3):
+        session.remove_sighting(0)
+    st = session.status()
+    assert st.n_accepted == 0
+    assert st.fit is None
+
+    for i, (az, el) in enumerate(_FOUR_DIRS[:3]):
+        session.capture_sighting(tmp_path / f"img{i}.jpg", az, el)
+        assert _wait_for(lambda: session.status().pending is None, timeout_s=5.0)
+    session.apply()
+    payload = json.loads(session.out_path.read_text())
+    assert payload["n_sightings"] == 3
+
+
 # ---------- auto-calibration ----------------------------------------
 
 

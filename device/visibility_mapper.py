@@ -332,7 +332,13 @@ class VisibilityMapper:
         if self.grid.kind == "healpix":
             # HEALPix drops below-horizon pixels, and which survive depends
             # on the session's site/time — so array index is NOT stable.
-            self._restore_cells_by_key(cells)
+            # Observations are made at each cell's alt/az (fixed for the
+            # session), and the obstructions being mapped (trees, roofs)
+            # are fixed in alt/az, not RA/Dec. So match saved cells to the
+            # current ones by alt/az. Snapshots without alt/az fall back to
+            # the older RA/Dec key match.
+            if not self._restore_cells_by_altaz(cells):
+                self._restore_cells_by_key(cells)
         else:
             # alt/az band grids keep every cell (index is stable), so an
             # index-keyed restore lands each posterior on the same sky.
@@ -345,6 +351,90 @@ class VisibilityMapper:
             if not isinstance(cd, dict):
                 continue
             self._restore_one_cell(i, cd)
+
+    def _restore_cells_by_altaz(self, cells: list) -> bool:
+        """Restore HEALPix posteriors by nearest saved alt/az.
+
+        Each current cell takes the posterior of the saved cell whose
+        persisted ``(az_deg, alt_deg)`` is nearest by great-circle
+        distance, if that is within half the HEALPix pixel spacing. The
+        resume is refused (fresh priors) when fewer than
+        ``RESUME_MIN_KEY_FRACTION`` of the current cells find a match.
+
+        Returns ``False`` without restoring anything when the snapshot has
+        no usable alt/az (or the grid has no ``nside``), so the caller can
+        fall back to the RA/Dec key match. Returns ``True`` when it handled
+        the snapshot, whether or not it restored any cell.
+        """
+        if not self.grid.nside or self._n == 0:
+            return False
+        saved_cds: list[dict] = []
+        saved_az: list[float] = []
+        saved_alt: list[float] = []
+        for cd in cells:
+            if not isinstance(cd, dict):
+                continue
+            try:
+                az = float(cd.get("az_deg"))
+                alt = float(cd.get("alt_deg"))
+            except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(az) and math.isfinite(alt)):
+                continue
+            saved_cds.append(cd)
+            saved_az.append(az)
+            saved_alt.append(alt)
+        if not saved_cds:
+            return False
+
+        def _unit(az_deg: np.ndarray, alt_deg: np.ndarray) -> np.ndarray:
+            az_r = np.radians(az_deg)
+            alt_r = np.radians(alt_deg)
+            return np.stack(
+                [
+                    np.cos(alt_r) * np.sin(az_r),
+                    np.cos(alt_r) * np.cos(az_r),
+                    np.sin(alt_r),
+                ],
+                axis=1,
+            )
+
+        saved_vec = _unit(
+            np.asarray(saved_az, dtype=np.float64),
+            np.asarray(saved_alt, dtype=np.float64),
+        )
+        cur_vec = _unit(self._az, self._alt)
+        # HEALPix pixels all have the same area 4π / (12·nside²); its
+        # square root is the typical centre-to-centre spacing.
+        spacing_deg = math.degrees(
+            math.sqrt(4.0 * math.pi / (12.0 * float(self.grid.nside) ** 2))
+        )
+        tol_deg = 0.5 * spacing_deg
+        min_dot = math.cos(math.radians(tol_deg))
+        match: list[Optional[int]] = [None] * self._n
+        chunk = 512  # bound the (chunk × n_saved) dot-product matrix
+        for start in range(0, self._n, chunk):
+            dots = cur_vec[start : start + chunk] @ saved_vec.T
+            best = np.argmax(dots, axis=1)
+            for k, j in enumerate(best):
+                if dots[k, j] >= min_dot:
+                    match[start + k] = int(j)
+        n_match = sum(1 for j in match if j is not None)
+        if n_match < RESUME_MIN_KEY_FRACTION * self._n:
+            logger.info(
+                "visibility map resume refused for telescope %s: only %d/%d "
+                "healpix cells align by alt/az within %.1f deg; starting fresh "
+                "from priors.",
+                self.telescope_id,
+                n_match,
+                self._n,
+                tol_deg,
+            )
+            return True
+        for i, j in enumerate(match):
+            if j is not None:
+                self._restore_one_cell(i, saved_cds[j])
+        return True
 
     def _restore_cells_by_key(self, cells: list) -> None:
         saved: dict[str, dict] = {}

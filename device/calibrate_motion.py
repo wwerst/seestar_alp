@@ -55,7 +55,7 @@ from device.streaming_controller import (
     TickInfo,
     track,
 )
-from device.velocity_controller import PositionLogger
+from device.velocity_controller import PositionLogger, measure_altaz_timed
 from scripts.trajectory.observer import build_site
 
 
@@ -472,9 +472,22 @@ class CalibrateMotionSession:
         try:
             try:
                 tracker: CumulativeAzTracker | None
+                # Restore the persisted cable-wrap (cumulative az) state; the
+                # loader needs the current wrapped encoder az to validate it.
+                # Keep the fresh-tracker fallback on failure, but log it:
+                # track() saves the fresh state over the file on exit.
                 try:
-                    tracker = CumulativeAzTracker.load_or_fresh()
-                except Exception:
+                    _el_now, az_now_wrapped, _ = measure_altaz_timed(cli, loc)
+                    tracker = CumulativeAzTracker.load_or_fresh(
+                        current_wrapped_az_deg=az_now_wrapped
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "could not load persisted cable-wrap state (%s); "
+                        "starting a fresh cumulative-az tracker, which will be "
+                        "saved over the state file when the session ends",
+                        exc,
+                    )
                     tracker = CumulativeAzTracker()
 
                 with self._lock:

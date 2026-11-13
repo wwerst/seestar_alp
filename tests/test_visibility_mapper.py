@@ -751,23 +751,27 @@ def test_persistence_skips_garbage(tmp_path):
     assert load_snapshot(p) is None
 
 
-def _healpix_grid(radec, *, min_alt_deg=10.0):
+def _healpix_grid(radec, *, min_alt_deg=10.0, altaz=None):
     """Build a synthetic HEALPix-kind grid with explicit RA/Dec on each
     cell (no astropy_healpix dependency). The horizon cut renumbers array
-    indices per session, so two sessions can carry the same RA/Dec points
-    in a different index order — exactly the case the key-based restore
-    must handle."""
+    indices per session, so two sessions can carry the same points in a
+    different index order — exactly the case the resume must handle.
+
+    ``altaz`` optionally gives each cell's ``(az_deg, alt_deg)``; the
+    default spaces cells 40° apart in az at alt 45°."""
     from device.sky_grid import SkyCell, SkyGrid
 
+    if altaz is None:
+        altaz = [(float((i * 40) % 360), 45.0) for i in range(len(radec))]
     cells = [
         SkyCell(
             idx=i,
-            az_deg=float((i * 40) % 360),
-            alt_deg=45.0,
+            az_deg=float(az),
+            alt_deg=float(alt),
             ra_deg=float(ra),
             dec_deg=float(dec),
         )
-        for i, (ra, dec) in enumerate(radec)
+        for i, ((ra, dec), (az, alt)) in enumerate(zip(radec, altaz))
     ]
     return SkyGrid(
         cells=cells,
@@ -789,16 +793,38 @@ def _hp_mapper(tid, grid, tmp_path):
     )
 
 
+def _strip_altaz_from_snapshot(tmp_path, tid):
+    """Rewrite a saved snapshot without per-cell az/alt, mimicking an old
+    snapshot that only the RA/Dec key path can align."""
+    p = visibility_map_path(tmp_path, tid)
+    snap = load_snapshot(p)
+    for cd in snap["cells"]:
+        cd.pop("az_deg", None)
+        cd.pop("alt_deg", None)
+    save_snapshot(
+        p,
+        telescope_id=tid,
+        grid_kind=snap["grid_kind"],
+        min_alt_deg=snap["min_alt_deg"],
+        cells=snap["cells"],
+        started_at=snap["started_at"],
+        elapsed_s=snap["elapsed_s"],
+        n_observations=snap["n_observations"],
+    )
+
+
 def test_healpix_resume_matches_by_radec_key(tmp_path):
-    """HEALPix resume must align cells by their stable RA/Dec key, not by
-    array index. The horizon cut renumbers indices between sessions, so an
-    index-based restore would paste a posterior onto the wrong sky."""
+    """Fallback for snapshots without per-cell alt/az: HEALPix resume
+    aligns cells by their RA/Dec key, not by array index. The horizon cut
+    renumbers indices between sessions, so an index-based restore would
+    paste a posterior onto the wrong cell."""
     grid1 = _healpix_grid([(10.0, 20.0), (30.0, 40.0), (50.0, 60.0)])
     m1 = _hp_mapper(5, grid1, tmp_path)
     # Distinctive posterior on the (30, 40) cell, which is index 1 here.
     m1._alpha[1] = 9.0
     m1._beta[1] = 1.0
     m1._persist()
+    _strip_altaz_from_snapshot(tmp_path, 5)
 
     # Session 2: same (30,40) and (50,60) points but re-ordered — (30,40)
     # is now index 0 — plus one new point and one dropped.
@@ -826,12 +852,50 @@ def test_healpix_resume_refused_when_grids_disjoint(tmp_path):
     m1._beta[0] = 1.0
     m1._persist()
 
-    # No RA/Dec overlap with grid1 → 0 keys align → refuse, start fresh.
-    grid2 = _healpix_grid([(100.0, 10.0), (120.0, 15.0), (140.0, 20.0)])
+    # No alt/az (and no RA/Dec) overlap with grid1 → nothing aligns →
+    # refuse, start fresh.
+    grid2 = _healpix_grid(
+        [(100.0, 10.0), (120.0, 15.0), (140.0, 20.0)],
+        altaz=[(200.0, 20.0), (240.0, 20.0), (280.0, 20.0)],
+    )
     m2 = _hp_mapper(6, grid2, tmp_path)
     for i in range(len(grid2.cells)):
         assert m2._alpha[i] == pytest.approx(m2._prior_alpha[i])
         assert m2._beta[i] == pytest.approx(m2._prior_beta[i])
+
+
+def test_healpix_resume_keeps_posterior_at_same_altaz_after_sky_rotates(
+    tmp_path,
+):
+    """Obstructions (trees, roofs) are fixed in alt/az. A later session sees
+    different RA/Dec at each alt/az because the sky has rotated, so the
+    resume must keep each posterior at the same alt/az, not follow the
+    RA/Dec it was observed at."""
+    altaz = [(0.0, 45.0), (40.0, 45.0), (80.0, 45.0)]
+    grid1 = _healpix_grid(
+        [(10.0, 20.0), (30.0, 40.0), (50.0, 60.0)],
+        altaz=altaz,
+    )
+    m1 = _hp_mapper(8, grid1, tmp_path)
+    # Obstructed patch at alt/az (40, 45), index 1 here.
+    m1._alpha[1] = 1.0
+    m1._beta[1] = 9.0
+    m1._persist()
+
+    # Hours later: the same alt/az centres (re-ordered) now carry
+    # different RA/Dec. In particular RA/Dec (30, 40) has moved to the
+    # cell at alt/az (80, 45).
+    grid2 = _healpix_grid(
+        [(30.0, 40.0), (90.0, 20.0), (110.0, 40.0)],
+        altaz=[(80.0, 45.0), (40.0, 45.0), (0.0, 45.0)],
+    )
+    m2 = _hp_mapper(8, grid2, tmp_path)
+
+    # The obstruction stays at alt/az (40, 45): grid2 index 1.
+    assert m2._alpha[1] == pytest.approx(1.0)
+    assert m2._beta[1] == pytest.approx(9.0)
+    # Not pasted onto the cell that now holds RA/Dec (30, 40).
+    assert m2._beta[0] != pytest.approx(9.0)
 
 
 def test_persistence_resume_picks_up_priors(tmp_path):

@@ -665,3 +665,81 @@ def test_positions_to_rows_includes_means_and_stds():
         # With 2 reads per position, stdev is defined.
         assert row["n"] == 2
         assert row["x_std"] is not None
+
+
+# ---------- CLI sun pre-flight (scripts/auto_level.py) ----------------
+
+
+def _pin_sun(monkeypatch, az_deg, alt_deg):
+    """Pin the sun and a real (non 0/0) site so is_sun_safe evaluates."""
+    from device import sun_safety as ss
+    from device.config import Config
+
+    monkeypatch.setattr(Config, "init_lat", 34.0)
+    monkeypatch.setattr(Config, "init_long", -118.0)
+    monkeypatch.setattr(ss, "compute_sun_altaz", lambda **_kw: (az_deg, alt_deg))
+
+
+def test_sun_check_el_band_refuses_sun_near_sweep_elevation(monkeypatch):
+    from scripts.auto_level import sun_check_el_band
+
+    # Sun at alt 25°: the sweep at alt 10° (band 5..15° with the margin)
+    # passes 10° from it at the sun's azimuth, whatever the encoder origin.
+    _pin_sun(monkeypatch, 123.0, 25.0)
+    safe, reason = sun_check_el_band(10.0, 10.0)
+    assert safe is False
+    assert "sun_avoidance" in reason
+
+
+def test_sun_check_el_band_allows_sun_far_above_band(monkeypatch):
+    from scripts.auto_level import sun_check_el_band
+
+    _pin_sun(monkeypatch, 123.0, 70.0)
+    safe, reason = sun_check_el_band(10.0, 20.0)
+    assert safe is True
+    assert reason == ""
+
+
+def test_sun_check_el_band_covers_elevations_between_endpoints(monkeypatch):
+    from scripts.auto_level import sun_check_el_band
+
+    # Sun at alt 40°: both endpoints (10° and 70°) are 30° away, but the
+    # move between them crosses 40°.
+    _pin_sun(monkeypatch, 200.0, 40.0)
+    safe, _ = sun_check_el_band(10.0, 70.0, margin_deg=0.0)
+    assert safe is False
+
+
+def test_sun_check_el_band_fails_closed_on_error(monkeypatch):
+    from device import sun_safety as ss
+    from scripts.auto_level import sun_check_el_band
+
+    def _boom(**_kw):
+        raise RuntimeError("ephem exploded")
+
+    monkeypatch.setattr(ss, "compute_sun_altaz", _boom)
+    safe, reason = sun_check_el_band(10.0, 10.0)
+    assert safe is False
+    assert "ephem exploded" in reason
+
+
+def test_auto_level_sweep_refused_before_any_motion_when_sun_unsafe(monkeypatch):
+    import argparse
+
+    import scripts.auto_level as al
+
+    _pin_sun(monkeypatch, 90.0, 20.0)
+    monkeypatch.setattr(al, "ensure_scenery_mode", lambda cli: None)
+    monkeypatch.setattr(al, "set_tracking", lambda cli, enabled: None)
+    monkeypatch.setattr(al.vc, "measure_altaz", lambda cli, loc: (10.0, 0.0))
+    moves = []
+
+    def _fake_move_to_ff(*a, **kw):
+        moves.append(kw)
+        raise AssertionError("move_to_ff must not run when the sun is unsafe")
+
+    monkeypatch.setattr(al.vc, "move_to_ff", _fake_move_to_ff)
+    args = argparse.Namespace(no_az_limits=True, alt=None)
+    rc = al._main_body(args, object(), None, None, None, [None])
+    assert rc == 2
+    assert moves == []

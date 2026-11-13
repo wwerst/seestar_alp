@@ -59,7 +59,9 @@ from device.rotation_calibration import (
     RotationSolution,
     Sighting,
     decide_clear_or_keep,
+    _topo_to_mount_azel,
     inspect_prior,
+    mount_frame_euler_deg,
     parse_calibrated_at,  # re-exported for CLI callers / tests
     predict_mount_azel,
     solve_rotation,
@@ -123,6 +125,65 @@ def _wrap_pm180(deg: float) -> float:
 
 def _print(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def _prior_seed_kwargs(prior_frame: MountFrame | None) -> dict[str, float]:
+    """``solve_rotation`` seed kwargs from a kept prior frame.
+
+    With fewer than 3 sightings the fit is yaw-only and pitch/roll stay at
+    the seeds; without this a kept prior's tilt would be replaced by 0.
+    Empty (zero seeds) when there is no prior or its angles can't be
+    recovered.
+    """
+    euler = mount_frame_euler_deg(prior_frame)
+    if euler is None:
+        return {}
+    yaw, pitch, roll = euler
+    return {"yaw_seed_deg": yaw, "pitch_seed_deg": pitch, "roll_seed_deg": roll}
+
+
+def _sun_safe_sky(
+    sky_az_deg: float,
+    sky_el_deg: float,
+    site: ObserverSite | None,
+) -> tuple[bool, str]:
+    """Sun pre-flight for a sky ``(az, el)``. Fails closed: any error in
+    the check counts as unsafe."""
+    from device import sun_safety
+
+    kwargs = {}
+    if site is not None:
+        kwargs = {"lat_deg": site.lat_deg, "lon_deg": site.lon_deg}
+    try:
+        return sun_safety.is_sun_safe(
+            float(sky_az_deg) % 360.0, float(sky_el_deg), **kwargs
+        )
+    except Exception as exc:  # noqa: BLE001 — refuse when unverifiable
+        return False, f"sun_avoidance: sun check failed ({exc}); refusing"
+
+
+def _sun_safe_mount(
+    mount_az_deg: float,
+    mount_el_deg: float,
+    mount_frame: MountFrame | None,
+    site: ObserverSite | None,
+) -> tuple[bool, str]:
+    """Sun pre-flight for a mount-frame encoder target, rotated to the sky
+    through ``mount_frame`` (identity when ``None``, i.e. encoder az/el
+    taken as sky az/el, the same assumption the initial slew makes)."""
+    try:
+        if mount_frame is None:
+            sky_az, sky_el = float(mount_az_deg) % 360.0, float(mount_el_deg)
+        else:
+            # topo_to_mount is a rotation; its transpose maps mount → topo.
+            sky_az, sky_el = _topo_to_mount_azel(
+                float(mount_az_deg),
+                float(mount_el_deg),
+                mount_frame.topo_to_mount.T,
+            )
+    except Exception as exc:  # noqa: BLE001 — refuse when unverifiable
+        return False, f"sun_avoidance: frame conversion failed ({exc}); refusing"
+    return _sun_safe_sky(sky_az, sky_el, site)
 
 
 def _read_encoder(cli: AlpacaClient) -> tuple[float, float]:
@@ -265,9 +326,15 @@ def _nudge_loop(
     *,
     dry_run: bool,
     no_move: bool,
+    mount_frame: MountFrame | None = None,
+    site: ObserverSite | None = None,
 ) -> tuple[float, float] | None:
     """Run the interactive REPL; return (encoder_az, encoder_el) on
-    'ok', None on 'skip'. Raises SystemExit on 'quit'."""
+    'ok', None on 'skip'. Raises SystemExit on 'quit'.
+
+    Each nudge target is sun-checked (rotated to the sky through
+    ``mount_frame``) before the mount moves; an unsafe nudge is refused
+    and the target left unchanged."""
     loc = EarthLocation.from_geodetic(0, 0, 0)
     cur_el, cur_az = target_el_deg, target_az_deg
     if not no_move and not dry_run:
@@ -320,10 +387,14 @@ def _nudge_loop(
         except ValueError:
             _print("  need a number, e.g. 'h +0.5'")
             continue
-        if parts[0] == "h":
-            target_az_deg += delta
-        else:
-            target_el_deg += delta
+        new_az = target_az_deg + (delta if parts[0] == "h" else 0.0)
+        new_el = target_el_deg + (delta if parts[0] == "v" else 0.0)
+        if not (no_move or dry_run):
+            safe, reason = _sun_safe_mount(new_az, new_el, mount_frame, site)
+            if not safe:
+                _print(f"  [refused] {reason}; target unchanged")
+                continue
+        target_az_deg, target_el_deg = new_az, new_el
         _print(f"  target az={target_az_deg:+.3f}° el={target_el_deg:+.3f}°")
         if no_move or dry_run:
             continue
@@ -772,6 +843,9 @@ def _main_live(args: argparse.Namespace) -> int:
     # have ≥2). Drives `_initial_slew` so landmark #2 lands close to
     # the correct encoder position even if the prior was identity.
     working_frame = prior_frame
+    # Seed every fit from the kept prior so the yaw-only fits (< 3
+    # sightings) keep its pitch/roll instead of resetting them to 0.
+    seed_kwargs = _prior_seed_kwargs(prior_frame)
 
     sightings: list[Sighting] = []
     for i, (lm, true_az, true_el, slant) in enumerate(chosen, start=1):
@@ -783,6 +857,13 @@ def _main_live(args: argparse.Namespace) -> int:
         _print(
             f"  lighting: {'LIT (L-864/L-810/etc.)' if lm.lit else 'UNLIT — daylight only'}"
         )
+        if not (args.dry_run or args.no_move):
+            # Sun pre-flight on the landmark's true sky (az, el), as the
+            # web session does before its pre-slew.
+            safe, reason = _sun_safe_sky(true_az, true_el, site)
+            if not safe:
+                _print(f"  [refused] {reason}; skipping {lm.oas} (no slew)")
+                continue
         target_az, target_el = _initial_slew(
             cli,
             site,
@@ -799,6 +880,8 @@ def _main_live(args: argparse.Namespace) -> int:
             target_el,
             dry_run=args.dry_run,
             no_move=args.no_move,
+            mount_frame=working_frame,
+            site=site,
         )
         if rec is None:
             _print("  skipped.")
@@ -820,7 +903,7 @@ def _main_live(args: argparse.Namespace) -> int:
         # 3-DOF once we have ≥2. Print residuals so the user can judge
         # whether the sighting landed on the beacon or on a nearby
         # bright object (outliers show up as >1° el residual).
-        interim = solve_rotation(sightings, site)
+        interim = solve_rotation(sightings, site, **seed_kwargs)
         _print(
             f"  [progressive fit n={len(sightings)}, "
             f"dof={'yaw' if len(sightings) == 1 else '3'}] "
@@ -854,7 +937,7 @@ def _main_live(args: argparse.Namespace) -> int:
         )
         _print(f"[calibrate] sightings saved to {args.save_sightings}")
 
-    sol = solve_rotation(sightings, site)
+    sol = solve_rotation(sightings, site, **seed_kwargs)
     _report_and_write(sol, site, args)
     return 0
 
@@ -876,7 +959,14 @@ def _main_replay(args: argparse.Namespace) -> int:
         f"lon={site.lon_deg:+.6f}° alt={site.alt_m:.1f} m "
         f"(from env vars / defaults)"
     )
-    sol = solve_rotation(sightings, site)
+    # Replay has no clear-or-keep prompt; seed from the prior on disk only
+    # when --keep-prior asks for it.
+    seed_kwargs = (
+        _prior_seed_kwargs(_load_prior_frame(args.out, site))
+        if args.keep_prior
+        else {}
+    )
+    sol = solve_rotation(sightings, site, **seed_kwargs)
     _report_and_write(sol, site, args)
     return 0
 
